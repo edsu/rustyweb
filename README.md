@@ -4,8 +4,9 @@
 with the support of Claude Code. Like any piece of software it may contain
 bugs, and while the software was designed through several iterations and
 abandoned prototypes, the developer's understanding of how it operates at a low
-level may be limited. See the DESIGN.md document for the overall approach that
-was used. Technical reviews of the code and design are always welcome!*
+level may be limited. See the [DESIGN.md](DESIGN.md) document for the overall
+approach that was used. Technical reviews of the code and design are always
+welcome!*
 
 ---
 
