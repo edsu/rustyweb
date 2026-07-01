@@ -153,6 +153,94 @@ async fn files_route_unknown_id_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+// ── Replay contract ─────────────────────────────────────────────────────────
+//
+// wabac.js replays a WACZ by reading it over HTTP from /files/{id} with range
+// requests. Actual rendering needs a browser, but these tests assert the
+// server-side contract wabac depends on: the bytes we serve are exactly the
+// WACZ on disk, ranges return the correct slice, the served archive is
+// replayable content (its internal CDX resolves a page to a 200), and the
+// viewer wires up <replay-web-page> so the service worker loads.
+
+#[tokio::test]
+async fn served_wacz_is_byte_identical_to_disk() {
+    let tmp = make_index(&["a.wacz"]);
+    let manifest = rustyweb_lib::collections::CollectionManifest::open(tmp.path()).unwrap();
+    let id = manifest.collections[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let req = Request::get(format!("/files/{id}")).body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let served = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+    let on_disk = std::fs::read(fixture("a.wacz")).unwrap();
+    assert_eq!(served.len(), on_disk.len(), "served length should match file");
+    assert_eq!(served.as_ref(), on_disk.as_slice(), "served bytes must equal the WACZ on disk");
+}
+
+#[tokio::test]
+async fn served_range_matches_the_file_slice() {
+    let tmp = make_index(&["a.wacz"]);
+    let manifest = rustyweb_lib::collections::CollectionManifest::open(tmp.path()).unwrap();
+    let id = manifest.collections[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    // Request an interior slice and verify the exact bytes, not just the length.
+    let req = Request::get(format!("/files/{id}"))
+        .header("range", "bytes=100-199")
+        .body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        resp.headers().get("content-range").unwrap(),
+        &format!("bytes 100-199/{}", std::fs::metadata(fixture("a.wacz")).unwrap().len()),
+    );
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+    let on_disk = std::fs::read(fixture("a.wacz")).unwrap();
+    assert_eq!(body.as_ref(), &on_disk[100..=199], "range must return the exact file slice");
+}
+
+#[tokio::test]
+async fn served_wacz_cdx_resolves_a_replayable_page() {
+    let tmp = make_index(&["a.wacz"]);
+    let manifest = rustyweb_lib::collections::CollectionManifest::open(tmp.path()).unwrap();
+    let id = manifest.collections[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    // Pull the whole WACZ through the HTTP endpoint the browser would use...
+    let req = Request::get(format!("/files/{id}")).body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let served = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+    // ...write it out and confirm its embedded CDX (what wabac reads) resolves
+    // a real page. a.wacz's seed is a 301; the storymaps URL is the 200 target.
+    let served_path = tmp.path().join("served.wacz");
+    std::fs::write(&served_path, &served).unwrap();
+
+    let records = rustyweb_lib::wacz::search_cdx(&served_path, REAL_URL).unwrap();
+    let page = records.iter().find(|r| r.status == 200 && r.mime.contains("html"));
+    assert!(page.is_some(), "served WACZ should contain a replayable 200 HTML page for {REAL_URL}");
+}
+
+#[tokio::test]
+async fn viewer_wires_up_replay_web_page() {
+    let tmp = TempDir::new().unwrap();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    let req = Request::get("/replay/viewer").body(Body::empty()).unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(html.contains("replay-web-page"), "viewer must mount the component");
+    // Absolute replaybase is what makes the service worker resolve to
+    // /replay/sw.js rather than /replay/replay/sw.js — the bug we hit.
+    assert!(html.contains("replaybase"), "viewer must set replaybase");
+    assert!(html.contains("/replay/"), "replaybase should be the absolute /replay/ path");
+    assert!(html.contains("rwp-url-change"), "viewer should track navigation for the banner");
+}
+
 // ── Static assets ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
