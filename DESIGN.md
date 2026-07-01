@@ -58,11 +58,13 @@ rustyweb/
 rustyweb index      [--index-dir <DIR>] [--name <NAME>] <PATH>...
 rustyweb serve      [--index-dir <DIR>] [--bind <ADDR>]
 rustyweb search-url [--index-dir <DIR>] <URL>
+rustyweb verify     [--index-dir <DIR>]
 ```
 
-- `index`: accepts `.wacz` files or directories (recursive scan). Extracts page HTML for full-text indexing, reads `datapackage.json` for collection metadata, updates `collections.json`. Default index dir: `./index`.
+- `index`: accepts `.wacz` files or directories (recursive scan). Extracts page HTML for full-text indexing, reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. Default index dir: `./index`.
 - `serve`: opens Tantivy read-only, starts Axum. Defaults: `127.0.0.1:8080`.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging — does not require the CDX to be separately indexed.
+- `verify`: re-hashes every WACZ in `collections.json` and compares against the stored SHA-256, reporting each collection as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
 
 ---
 

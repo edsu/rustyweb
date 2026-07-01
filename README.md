@@ -71,17 +71,23 @@ refresh collections.
 rustyweb index      [--index-dir <DIR>] [--name <NAME>] <PATH>...
 rustyweb serve      [--index-dir <DIR>] [--bind <ADDR>]
 rustyweb search-url [--index-dir <DIR>] <URL>
+rustyweb verify     [--index-dir <DIR>]
 ```
 
 - **`index`** — accepts `.wacz` files or directories (scanned for `.wacz`).
   Extracts page HTML for full-text search, reads `datapackage.json` for
-  collection metadata, and records everything in `{index-dir}/collections.json`.
-  Defaults to `./index`.
+  collection metadata, and records everything in `{index-dir}/collections.json`
+  — including the SHA-256 of each WACZ. Defaults to `./index`.
 - **`serve`** — opens the index read-only and starts the HTTP server. Defaults
   to `127.0.0.1:8080`.
 - **`search-url`** — a debugging aid: reads the CDX index *inside* each WACZ and
   prints the records matching a URL. No separate CDX store is maintained; the
   WACZ's own index is authoritative.
+- **`verify`** — re-hashes every registered WACZ and compares against the
+  SHA-256 recorded at index time, reporting each as `OK`, `MODIFIED`, or
+  `MISSING`. Exits non-zero if any collection fails, so it works in a cron job
+  or CI. This is rustyweb's fixity check — a small guard against the archive
+  quietly bit-rotting or being tampered with.
 
 ## Why "rustyweb"?
 

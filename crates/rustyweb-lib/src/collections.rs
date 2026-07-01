@@ -130,6 +130,24 @@ mod tests {
     }
 
     #[test]
+    fn file_sha256_detects_content_change() {
+        // The fixity primitive behind `rustyweb verify`: the same bytes hash to
+        // the same digest, and a single changed byte changes the digest.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+
+        let h1 = file_sha256(&path).unwrap();
+        let h2 = file_sha256(&path).unwrap();
+        assert_eq!(h1, h2, "unchanged file should hash identically");
+        assert_eq!(h1.len(), 64, "sha-256 hex is 64 chars");
+
+        std::fs::write(&path, b"hello worlx").unwrap();
+        let h3 = file_sha256(&path).unwrap();
+        assert_ne!(h1, h3, "a changed byte must change the digest");
+    }
+
+    #[test]
     fn manifest_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let mut m = CollectionManifest::open(tmp.path()).unwrap();

@@ -94,6 +94,12 @@ enum Commands {
         #[arg(short, long, default_value = "index")]
         index_dir: PathBuf,
     },
+    /// Verify the fixity of indexed WACZ files by re-hashing each one.
+    Verify {
+        /// Index directory created by `rustyweb index`.
+        #[arg(short, long, default_value = "index")]
+        index_dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -154,9 +160,69 @@ async fn main() -> Result<()> {
         Commands::SearchUrl { url, index_dir } => {
             run_search_url(&url, &index_dir)?;
         }
+
+        Commands::Verify { index_dir } => {
+            let all_ok = run_verify(&index_dir)?;
+            if !all_ok {
+                std::process::exit(1);
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Re-hash every WACZ registered in the manifest and compare against the SHA-256
+/// recorded at index time. Reports each collection as OK / MODIFIED / MISSING
+/// and returns `false` if any collection failed its fixity check.
+fn run_verify(index_dir: &std::path::Path) -> Result<bool> {
+    use rustyweb_lib::collections::{file_sha256, CollectionManifest};
+
+    let manifest = CollectionManifest::open(index_dir)?;
+    if manifest.collections.is_empty() {
+        println!("No collections registered in {}", index_dir.display());
+        return Ok(true);
+    }
+
+    let mut ok = 0usize;
+    let mut missing = 0usize;
+    let mut modified = 0usize;
+
+    for col in &manifest.collections {
+        if !col.path.exists() {
+            println!("MISSING   {} ({})", col.name, col.path.display());
+            missing += 1;
+            continue;
+        }
+        match file_sha256(&col.path) {
+            Ok(hash) if hash == col.sha256 => {
+                println!("OK        {} ({})", col.name, col.path.display());
+                ok += 1;
+            }
+            Ok(hash) => {
+                println!(
+                    "MODIFIED  {} ({}) — expected {}… got {}…",
+                    col.name,
+                    col.path.display(),
+                    short_hash(&col.sha256),
+                    short_hash(&hash),
+                );
+                modified += 1;
+            }
+            Err(e) => {
+                println!("ERROR     {} ({}) — {e}", col.name, col.path.display());
+                missing += 1;
+            }
+        }
+    }
+
+    println!("\n{ok} OK, {missing} missing, {modified} modified");
+    Ok(missing == 0 && modified == 0)
+}
+
+/// First 8 characters of a hex hash for compact display.
+fn short_hash(hash: &str) -> &str {
+    hash.get(..8).unwrap_or(hash)
 }
 
 fn run_search_url(url: &str, index_dir: &std::path::Path) -> Result<()> {
