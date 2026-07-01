@@ -364,6 +364,24 @@ async fn collection_page_unknown_id_404() {
 }
 
 #[tokio::test]
+async fn can_index_while_server_holds_the_index() {
+    // A running server opens the index read-only (no write lock), so indexing
+    // must be able to proceed concurrently.
+    let tmp = make_index(&["simple.wacz"]);
+    let _app = rustyweb_lib::server::router(tmp.path()).unwrap(); // held, like a live server
+
+    // This previously failed with a Tantivy LockBusy error.
+    rustyweb_lib::index::index_path(&fixture("pdf-doc.wacz"), tmp.path(), None).unwrap();
+
+    // The newly indexed content is searchable.
+    let idx = rustyweb_lib::search::SearchIndex::open_read_only(
+        tmp.path().join("full_text").as_path(),
+    )
+    .unwrap();
+    assert!(!idx.search("\"flux capacitor\"", 10).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn homepage_empty_collections() {
     let tmp = TempDir::new().unwrap();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();

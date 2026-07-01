@@ -17,22 +17,44 @@ const FIELD_BODY: &str = "body";
 
 pub struct SearchIndex {
     index: Index,
-    writer: IndexWriter,
+    /// Present only when opened for writing. The server opens read-only so it
+    /// does not hold Tantivy's exclusive write lock, letting `index` run while
+    /// the server is serving.
+    writer: Option<IndexWriter>,
 }
 
 impl SearchIndex {
+    /// Open the index for writing (indexing). Creates it if needed and acquires
+    /// Tantivy's exclusive write lock for the lifetime of this value.
     pub fn open(index_dir: &Path) -> Result<Self> {
+        let index = Self::open_index(index_dir)?;
+        let writer = index.writer(50_000_000)?;
+        Ok(Self { index, writer: Some(writer) })
+    }
+
+    /// Open the index read-only (searching). Does not create a writer, so it
+    /// does not take the write lock; indexing can proceed concurrently.
+    pub fn open_read_only(index_dir: &Path) -> Result<Self> {
+        let index = Self::open_index(index_dir)?;
+        Ok(Self { index, writer: None })
+    }
+
+    fn open_index(index_dir: &Path) -> Result<Index> {
         std::fs::create_dir_all(index_dir)?;
         let schema = build_schema();
-        let index = if index_dir.join("meta.json").exists() {
+        if index_dir.join("meta.json").exists() {
             Index::open_in_dir(index_dir)
-                .with_context(|| format!("opening Tantivy index at {}", index_dir.display()))?
+                .with_context(|| format!("opening Tantivy index at {}", index_dir.display()))
         } else {
-            Index::create_in_dir(index_dir, schema.clone())
-                .with_context(|| format!("creating Tantivy index at {}", index_dir.display()))?
-        };
-        let writer = index.writer(50_000_000)?;
-        Ok(Self { index, writer })
+            Index::create_in_dir(index_dir, schema)
+                .with_context(|| format!("creating Tantivy index at {}", index_dir.display()))
+        }
+    }
+
+    fn writer_mut(&mut self) -> &mut IndexWriter {
+        self.writer
+            .as_mut()
+            .expect("SearchIndex opened read-only; no writer available")
     }
 
     /// Remove all documents (pages and the collection doc) belonging to a
@@ -44,8 +66,7 @@ impl SearchIndex {
     /// `index_collection()`, then `commit()` - the fresh documents survive.
     pub fn delete_collection(&mut self, collection_id: &str) {
         let field = self.index.schema().get_field(FIELD_COLLECTION_ID).unwrap();
-        self.writer
-            .delete_term(Term::from_field_text(field, collection_id));
+        self.writer_mut().delete_term(Term::from_field_text(field, collection_id));
     }
 
     /// Index a single HTML page from an archive.
@@ -67,7 +88,7 @@ impl SearchIndex {
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), timestamp);
         doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), title);
         doc.add_text(schema.get_field(FIELD_BODY).unwrap(), body);
-        self.writer.add_document(doc)?;
+        self.writer_mut().add_document(doc)?;
         Ok(())
     }
 
@@ -88,12 +109,12 @@ impl SearchIndex {
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), collection_name);
         doc.add_text(schema.get_field(FIELD_BODY).unwrap(), body);
-        self.writer.add_document(doc)?;
+        self.writer_mut().add_document(doc)?;
         Ok(())
     }
 
     pub fn commit(&mut self) -> Result<()> {
-        self.writer.commit()?;
+        self.writer_mut().commit()?;
         Ok(())
     }
 

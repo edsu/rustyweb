@@ -33,7 +33,9 @@ struct AppState {
 // ── Router ────────────────────────────────────────────────────────────────────
 
 pub fn router(index_dir: &Path) -> Result<Router> {
-    let search = SearchIndex::open(index_dir.join("full_text").as_path())?;
+    // Read-only: the server never writes, so it must not hold the write lock,
+    // which would block `rustyweb index` from running while serving.
+    let search = SearchIndex::open_read_only(index_dir.join("full_text").as_path())?;
     let state = Arc::new(AppState {
         search,
         index_dir: index_dir.to_path_buf(),
