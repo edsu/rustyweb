@@ -45,8 +45,6 @@ where
             return self.0.format_event(ctx, writer, event);
         };
 
-        // Buffer without inner ANSI so the inner reset codes don't break our
-        // full-line color, then wrap the finished line.
         let mut buf = String::new();
         self.0.format_event(ctx, Writer::new(&mut buf), event)?;
         let line = buf.trim_end_matches('\n');
@@ -63,9 +61,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index one or more WARC / WACZ files.
+    /// Index one or more WACZ files.
     Index {
-        /// Files or directories to index.
+        /// WACZ files or directories to index.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
@@ -87,15 +85,9 @@ enum Commands {
         #[arg(short, long, default_value = "index")]
         index_dir: PathBuf,
     },
-    /// Verify integrity of indexed collections by re-hashing each file.
-    Check {
-        /// Index directory created by `rustyweb index`.
-        #[arg(short, long, default_value = "index")]
-        index_dir: PathBuf,
-    },
-    /// Look up a URL in the index and print any matching CDX records.
-    Lookup {
-        /// URL to look up (exact, fuzzy, and prefix fallbacks are tried).
+    /// Search indexed WACZ files for CDX records matching a URL.
+    SearchUrl {
+        /// URL to search for (exact match against archived URLs).
         url: String,
 
         /// Index directory created by `rustyweb index`.
@@ -159,77 +151,17 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Check { index_dir } => {
-            run_check(&index_dir)?;
-        }
-
-        Commands::Lookup { url, index_dir } => {
-            run_lookup(&url, &index_dir)?;
+        Commands::SearchUrl { url, index_dir } => {
+            run_search_url(&url, &index_dir)?;
         }
     }
 
     Ok(())
 }
 
-fn run_lookup(url: &str, index_dir: &std::path::Path) -> Result<()> {
-    use rustyweb_lib::cdx::{CdxStore, MatchType, normalize_url_fuzzy};
-
-    let store = CdxStore::open(&index_dir.join("cdx"))?;
-
-    // 1. Exact match.
-    let mut records = store.query(url, MatchType::Exact, None, None, 100)?;
-    let mut match_kind = "exact";
-
-    // 2. Fuzzy: strip tracking params, sort remaining.
-    if records.is_empty() {
-        let fuzzy = normalize_url_fuzzy(url);
-        if fuzzy != url {
-            records = store.query(&fuzzy, MatchType::Exact, None, None, 100)?;
-            match_kind = "fuzzy (tracking params stripped)";
-        }
-    }
-
-    // 3. Prefix: strip query string entirely.
-    if records.is_empty() {
-        if let Ok(mut stripped) = url::Url::parse(url) {
-            if stripped.query().is_some() {
-                stripped.set_query(None);
-                records = store.query(stripped.as_str(), MatchType::Prefix, None, None, 100)?;
-                match_kind = "prefix (query string stripped)";
-            }
-        }
-    }
-
-    if records.is_empty() {
-        println!("Not found: {url}");
-        return Ok(());
-    }
-
-    println!("Found {} record(s) via {} match for: {url}\n", records.len(), match_kind);
-    for r in &records {
-        println!("  timestamp:     {}", r.timestamp);
-        println!("  url:           {}", r.original_url);
-        println!("  status:        {}", r.status);
-        println!("  mime:          {}", r.mimetype);
-        println!("  length:        {} bytes (compressed)", r.length);
-        println!("  digest:        {}", r.digest);
-        // warc_path may be "outer.wacz\x1einner.warc.gz" — display both parts.
-        if let Some((outer, inner)) = r.warc_path.split_once('\x1e') {
-            println!("  wacz:          {}", outer);
-            println!("  inner_warc:    {}", inner);
-        } else {
-            println!("  warc_path:     {}", r.warc_path);
-        }
-        println!("  warc_offset:   {}", r.warc_offset);
-        println!("  record_length: {}", r.warc_record_length);
-        println!();
-    }
-
-    Ok(())
-}
-
-fn run_check(index_dir: &std::path::Path) -> Result<()> {
-    use rustyweb_lib::collections::{CollectionManifest, file_sha256};
+fn run_search_url(url: &str, index_dir: &std::path::Path) -> Result<()> {
+    use rustyweb_lib::collections::CollectionManifest;
+    use rustyweb_lib::wacz::search_cdx;
 
     let manifest = CollectionManifest::open(index_dir)?;
     if manifest.collections.is_empty() {
@@ -237,45 +169,33 @@ fn run_check(index_dir: &std::path::Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut ok = 0usize;
-    let mut missing = 0usize;
-    let mut modified = 0usize;
-
+    let mut found_any = false;
     for col in &manifest.collections {
         if !col.path.exists() {
-            println!("MISSING  {} ({})", col.name, col.path.display());
-            missing += 1;
+            eprintln!("warning: {} not found at {}", col.name, col.path.display());
             continue;
         }
-        match file_sha256(&col.path) {
-            Ok(hash) if hash == col.sha256 => {
-                println!("OK       {} ({})", col.name, col.path.display());
-                ok += 1;
-            }
-            Ok(hash) => {
-                println!(
-                    "MODIFIED {} ({}) — expected {} got {}",
-                    col.name,
-                    col.path.display(),
-                    &col.sha256[..8],
-                    &hash[..8]
-                );
-                modified += 1;
-            }
-            Err(e) => {
-                println!("ERROR    {} ({}) — {e}", col.name, col.path.display());
-                missing += 1;
-            }
+        let records = search_cdx(&col.path, url)?;
+        if records.is_empty() {
+            continue;
+        }
+        found_any = true;
+        println!("Collection: {} ({})", col.name, col.path.display());
+        for r in &records {
+            println!("  url:       {}", r.url);
+            println!("  timestamp: {}", r.timestamp);
+            println!("  status:    {}", r.status);
+            println!("  mime:      {}", r.mime);
+            println!("  filename:  {}", r.filename);
+            println!("  offset:    {}", r.offset);
+            println!("  length:    {}", r.length);
+            println!();
         }
     }
 
-    println!(
-        "\n{} OK, {} missing, {} modified",
-        ok, missing, modified
-    );
-
-    if missing > 0 || modified > 0 {
-        std::process::exit(1);
+    if !found_any {
+        println!("Not found: {url}");
     }
+
     Ok(())
 }

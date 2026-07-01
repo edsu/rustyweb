@@ -4,8 +4,12 @@ use anyhow::{Context, Result};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Schema, Value, STORED, STRING, TEXT};
-use tantivy::{Index, IndexWriter, TantivyDocument};
+use tantivy::snippet::SnippetGenerator;
+use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
+const FIELD_DOC_TYPE: &str = "doc_type";
+const FIELD_COLLECTION_ID: &str = "collection_id";
+const FIELD_COLLECTION_NAME: &str = "collection_name";
 const FIELD_URL: &str = "url";
 const FIELD_TS: &str = "timestamp";
 const FIELD_TITLE: &str = "title";
@@ -31,19 +35,59 @@ impl SearchIndex {
         Ok(Self { index, writer })
     }
 
-    pub fn add_document(&mut self, url: &str, timestamp: &str, title: &str, body: &str) -> Result<()> {
+    /// Remove all documents (pages and the collection doc) belonging to a
+    /// collection.  Call this before re-indexing a collection so that
+    /// re-indexing is an upsert rather than an append.
+    ///
+    /// Tantivy applies a delete only to documents committed before it, so the
+    /// caller should `delete_collection()` first, then `index_page()` /
+    /// `index_collection()`, then `commit()` — the fresh documents survive.
+    pub fn delete_collection(&mut self, collection_id: &str) {
+        let field = self.index.schema().get_field(FIELD_COLLECTION_ID).unwrap();
+        self.writer
+            .delete_term(Term::from_field_text(field, collection_id));
+    }
+
+    /// Index a single HTML page from an archive.
+    pub fn index_page(
+        &mut self,
+        url: &str,
+        timestamp: &str,
+        title: &str,
+        body: &str,
+        collection_id: &str,
+        collection_name: &str,
+    ) -> Result<()> {
         let schema = self.index.schema();
-        let url_f = schema.get_field(FIELD_URL).unwrap();
-        let ts_f = schema.get_field(FIELD_TS).unwrap();
-        let title_f = schema.get_field(FIELD_TITLE).unwrap();
-        let body_f = schema.get_field(FIELD_BODY).unwrap();
-
         let mut doc = TantivyDocument::default();
-        doc.add_text(url_f, url);
-        doc.add_text(ts_f, timestamp);
-        doc.add_text(title_f, title);
-        doc.add_text(body_f, body);
+        doc.add_text(schema.get_field(FIELD_DOC_TYPE).unwrap(), "page");
+        doc.add_text(schema.get_field(FIELD_COLLECTION_ID).unwrap(), collection_id);
+        doc.add_text(schema.get_field(FIELD_COLLECTION_NAME).unwrap(), collection_name);
+        doc.add_text(schema.get_field(FIELD_URL).unwrap(), url);
+        doc.add_text(schema.get_field(FIELD_TS).unwrap(), timestamp);
+        doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), title);
+        doc.add_text(schema.get_field(FIELD_BODY).unwrap(), body);
+        self.writer.add_document(doc)?;
+        Ok(())
+    }
 
+    /// Index a collection-level document so the collection itself is searchable.
+    /// `body` should be the concatenation of the description and seed page titles/URLs.
+    pub fn index_collection(
+        &mut self,
+        collection_id: &str,
+        collection_name: &str,
+        body: &str,
+    ) -> Result<()> {
+        let schema = self.index.schema();
+        let mut doc = TantivyDocument::default();
+        doc.add_text(schema.get_field(FIELD_DOC_TYPE).unwrap(), "collection");
+        doc.add_text(schema.get_field(FIELD_COLLECTION_ID).unwrap(), collection_id);
+        doc.add_text(schema.get_field(FIELD_COLLECTION_NAME).unwrap(), collection_name);
+        doc.add_text(schema.get_field(FIELD_URL).unwrap(), "");
+        doc.add_text(schema.get_field(FIELD_TS).unwrap(), "");
+        doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), collection_name);
+        doc.add_text(schema.get_field(FIELD_BODY).unwrap(), body);
         self.writer.add_document(doc)?;
         Ok(())
     }
@@ -60,6 +104,9 @@ impl SearchIndex {
 
         let title_f = schema.get_field(FIELD_TITLE).unwrap();
         let body_f = schema.get_field(FIELD_BODY).unwrap();
+        let doc_type_f = schema.get_field(FIELD_DOC_TYPE).unwrap();
+        let coll_id_f = schema.get_field(FIELD_COLLECTION_ID).unwrap();
+        let coll_name_f = schema.get_field(FIELD_COLLECTION_NAME).unwrap();
         let url_f = schema.get_field(FIELD_URL).unwrap();
         let ts_f = schema.get_field(FIELD_TS).unwrap();
 
@@ -68,13 +115,21 @@ impl SearchIndex {
         let collector = TopDocs::with_limit(limit).order_by_score();
         let top_docs = searcher.search(&query, &collector)?;
 
+        let snippet_gen = SnippetGenerator::create(&searcher, &query, body_f)?;
+
         let mut results = Vec::with_capacity(top_docs.len());
         for (_score, addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(addr)?;
-            let url = get_text(&doc, url_f);
-            let timestamp = get_text(&doc, ts_f);
-            let title = get_text(&doc, title_f);
-            results.push(SearchResult { url, timestamp, title });
+            let snippet = snippet_gen.snippet_from_doc(&doc);
+            results.push(SearchResult {
+                doc_type: get_text(&doc, doc_type_f),
+                collection_id: get_text(&doc, coll_id_f),
+                collection_name: get_text(&doc, coll_name_f),
+                url: get_text(&doc, url_f),
+                timestamp: get_text(&doc, ts_f),
+                title: get_text(&doc, title_f),
+                snippet: snippet.to_html(),
+            });
         }
 
         Ok(results)
@@ -83,17 +138,24 @@ impl SearchIndex {
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    pub doc_type: String,
+    pub collection_id: String,
+    pub collection_name: String,
     pub url: String,
     pub timestamp: String,
     pub title: String,
+    pub snippet: String,
 }
 
 fn build_schema() -> Schema {
     let mut builder = Schema::builder();
+    builder.add_text_field(FIELD_DOC_TYPE, STRING | STORED);
+    builder.add_text_field(FIELD_COLLECTION_ID, STRING | STORED);
+    builder.add_text_field(FIELD_COLLECTION_NAME, STRING | STORED);
     builder.add_text_field(FIELD_URL, STRING | STORED);
     builder.add_text_field(FIELD_TS, STRING | STORED);
     builder.add_text_field(FIELD_TITLE, TEXT | STORED);
-    builder.add_text_field(FIELD_BODY, TEXT);
+    builder.add_text_field(FIELD_BODY, TEXT | STORED);
     builder.build()
 }
 
@@ -125,7 +187,6 @@ pub fn extract_html_text(html: &[u8]) -> (String, String) {
     let mut body_parts: Vec<String> = Vec::new();
 
     if let Some(body) = doc.select(&body_sel).next() {
-        // Collect IDs of all nodes inside skip elements (script/style/noscript).
         let mut skip_ids = std::collections::HashSet::new();
         for skip_el in body.select(&skip_sel) {
             skip_ids.insert(skip_el.id());
@@ -133,8 +194,6 @@ pub fn extract_html_text(html: &[u8]) -> (String, String) {
                 skip_ids.insert(desc.id());
             }
         }
-
-        // Walk descendants; yield text nodes that are not in skip set.
         for node in body.descendants() {
             if skip_ids.contains(&node.id()) {
                 continue;
@@ -170,17 +229,59 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
 
-        idx.add_document(
+        idx.index_page(
             "http://example.com/",
             "20240115120000",
             "Example Page",
             "This is some interesting content about Rust programming",
+            "abc12345",
+            "My Collection",
         ).unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("Rust programming", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].url, "http://example.com/");
+        assert_eq!(results[0].collection_id, "abc12345");
+        assert_eq!(results[0].doc_type, "page");
+    }
+
+    #[test]
+    fn collection_document_is_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+
+        idx.index_collection(
+            "abc12345",
+            "My Archive",
+            "A collection about digital preservation and web archiving",
+        ).unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.search("digital preservation", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_type, "collection");
+        assert_eq!(results[0].collection_id, "abc12345");
+    }
+
+    #[test]
+    fn search_returns_snippet() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+
+        idx.index_page(
+            "http://example.com/",
+            "20240115120000",
+            "Example",
+            "The quick brown fox jumps over the lazy dog near the riverbank",
+            "abc12345",
+            "Test",
+        ).unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.search("fox", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].snippet.contains("fox"), "snippet should contain matched term: {}", results[0].snippet);
     }
 
     #[test]

@@ -3,22 +3,21 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use tracing::debug;
+use tracing::{debug, info};
 
-use crate::cdx::{CdxRecord, CdxStore, encode_post_url};
-use crate::collections::{Collection, CollectionKind, CollectionManifest, collection_id, file_sha256};
+use crate::collections::{Collection, CollectionManifest, collection_id, file_sha256};
 use crate::search::{SearchIndex, extract_html_text};
 use crate::warc::{WarcRecord, iter_records};
+use crate::wacz::{extract_warc_from_wacz, iter_warc_paths, read_datapackage};
 
-/// Index a WARC or WACZ file (or a directory of them) into the given index directory.
-/// Idempotent: re-indexing the same file overwrites existing keys.
+/// Index a WACZ file (or a directory of WACZ files) into the given index directory.
+/// Idempotent: re-indexing the same file overwrites the existing manifest entry and
+/// re-adds documents to Tantivy.
 /// `name` sets the collection display name; defaults to the file's stem.
 pub fn index_path(path: &Path, index_dir: &Path, name: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(index_dir)
         .with_context(|| format!("creating index dir {}", index_dir.display()))?;
 
-    let store = CdxStore::open(index_dir.join("cdx").as_path())
-        .with_context(|| format!("opening CDX store at {}", index_dir.display()))?;
     let search = Mutex::new(
         SearchIndex::open(index_dir.join("full_text").as_path())
             .with_context(|| format!("opening search index at {}", index_dir.display()))?,
@@ -27,186 +26,153 @@ pub fn index_path(path: &Path, index_dir: &Path, name: Option<&str>) -> Result<(
     let paths: Vec<_> = if path.is_dir() {
         std::fs::read_dir(path)?
             .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("wacz"))
             .collect()
     } else {
         vec![path.to_path_buf()]
     };
 
-    let counts: Vec<u64> = paths
-        .par_iter()
-        .map(|p| index_single(p, &store, &search))
-        .collect::<Result<Vec<_>>>()?;
-
-    search.into_inner().unwrap().commit()?;
-
-    // Update the collections manifest with one entry per indexed file.
     let mut manifest = CollectionManifest::open(index_dir)?;
-    for (p, &count) in paths.iter().zip(counts.iter()) {
+
+    // Process each WACZ file (potentially in parallel across files if multiple).
+    // Within each WACZ, WARC entries are processed in parallel.
+    for p in &paths {
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if ext != "wacz" {
+            debug!("skipping non-WACZ file: {}", p.display());
+            continue;
+        }
+
         let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
         let collection_name = name
             .map(|n| n.to_string())
             .unwrap_or_else(|| file_display_name(&abs));
         let id = collection_id(&abs);
+
+        // Drop any prior documents for this collection so re-indexing upserts
+        // instead of appending duplicates.
+        search.lock().unwrap().delete_collection(&id);
+
+        index_wacz(&abs, &id, &collection_name, &search)?;
+
+        // Read metadata from WACZ datapackage.json.
+        let meta = read_datapackage(&abs).unwrap_or_default();
+        let display_name = meta.title.as_deref().unwrap_or(&collection_name).to_string();
+
+        // Index the collection itself as a searchable document.
+        let coll_body = build_collection_body(&meta);
+        search
+            .lock()
+            .unwrap()
+            .index_collection(&id, &display_name, &coll_body)?;
+
         let sha = file_sha256(&abs)
             .with_context(|| format!("computing sha256 of {}", abs.display()))?;
-        let file_size = std::fs::metadata(&abs)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let kind = CollectionKind::from_path(&abs);
+        let file_size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
         let date_indexed = chrono::Utc::now()
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         manifest.upsert(Collection {
             id,
             path: abs,
-            name: collection_name,
-            kind,
+            name: display_name,
             date_indexed,
-            record_count: count,
             file_size,
             sha256: sha,
+            description: meta.description,
+            crawl_date: meta.created,
+            seed_pages: meta.seed_pages,
         });
     }
+
+    search.into_inner().unwrap().commit()?;
     manifest.save()?;
 
     Ok(())
 }
 
-/// Dispatch based on extension, return number of CDX records written.
-fn index_single(path: &Path, store: &CdxStore, search: &Mutex<SearchIndex>) -> Result<u64> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    match ext.as_str() {
-        "warc" | "gz" => index_warc(path, path, None, store, search),
-        "wacz" => index_wacz(path, store, search),
-        _ => {
-            debug!("skipping unsupported file type: {}", path.display());
-            Ok(0)
-        }
+/// Build the body text for a collection-level Tantivy document from its metadata.
+fn build_collection_body(meta: &crate::wacz::WaczMetadata) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(desc) = &meta.description {
+        parts.push(desc.clone());
     }
+    for page in &meta.seed_pages {
+        if let Some(title) = &page.title {
+            parts.push(title.clone());
+        }
+        parts.push(page.url.clone());
+    }
+    parts.join(" ")
 }
 
-/// Parse every response/request record in a WARC file and insert a CDX entry.
-///
-/// `read_from` is the physical file to parse (may be a tempfile for WACZ-extracted WARCs).
-/// `record_path` is the path stored in CDX records (the original WARC or parent WACZ path).
-/// `inner_warc` is set for WACZ inner WARCs: the zip entry name, e.g.
-/// `"archive/rec-XXXX.warc.gz"`. When set the stored `warc_path` is
-/// `"{wacz_abs_path}\x1e{inner_warc}"` so the server can extract the right file.
-///
-/// Returns the number of CDX records written.
-fn index_warc(
-    read_from: &Path,
-    record_path: &Path,
-    inner_warc: Option<&str>,
-    store: &CdxStore,
+/// Index all WARC entries inside a WACZ file into the Tantivy full-text index.
+fn index_wacz(
+    wacz_path: &Path,
+    collection_id: &str,
+    collection_name: &str,
+    search: &Mutex<SearchIndex>,
+) -> Result<()> {
+    let warc_paths: Vec<_> = iter_warc_paths(wacz_path)?
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("listing WARC entries in {}", wacz_path.display()))?;
+
+    let page_count: u64 = warc_paths
+        .par_iter()
+        .map(|entry_name| {
+            let tmp = extract_warc_from_wacz(wacz_path, entry_name)
+                .with_context(|| format!("extracting {} from {}", entry_name, wacz_path.display()))?;
+            index_warc_for_search(tmp.path(), collection_id, collection_name, search)
+        })
+        .try_reduce(|| 0u64, |a, b| Ok(a + b))?;
+
+    info!(pages = page_count, wacz = %wacz_path.display(), "indexed pages from WACZ");
+    Ok(())
+}
+
+/// Parse an extracted WARC file and add HTML pages to the Tantivy index.
+/// Returns the number of HTML pages indexed.
+fn index_warc_for_search(
+    warc_path: &Path,
+    collection_id: &str,
+    collection_name: &str,
     search: &Mutex<SearchIndex>,
 ) -> Result<u64> {
-    // Always store an absolute path so the server can match it against the manifest.
-    let abs = record_path
-        .canonicalize()
-        .unwrap_or_else(|_| record_path.to_path_buf());
-    let record_path_str = match inner_warc {
-        Some(inner) => format!("{}\x1e{}", abs.to_string_lossy(), inner),
-        None => abs.to_string_lossy().into_owned(),
-    };
-
-    let all: Vec<WarcRecord> = iter_records(read_from)
-        .with_context(|| format!("reading {}", read_from.display()))?
-        .collect::<Result<Vec<_>>>()
-        .with_context(|| format!("parsing records from {}", read_from.display()))?;
-
-    // Build a map from record_id → request record (for POST body lookup).
-    let requests: std::collections::HashMap<String, &WarcRecord> = all
-        .iter()
-        .filter(|r| r.warc_type.eq_ignore_ascii_case("request"))
-        .map(|r| (r.record_id.clone(), r))
-        .collect();
+    let records: Vec<WarcRecord> = iter_records(warc_path)
+        .with_context(|| format!("reading {}", warc_path.display()))?
+        .collect::<Result<Vec<_>>>()?;
 
     let mut count = 0u64;
-    for record in &all {
+    for record in &records {
         if !record.warc_type.eq_ignore_ascii_case("response") {
             continue;
         }
         if record.target_uri.is_empty() || record.target_uri.starts_with("dns:") {
             continue;
         }
-
-        let paired_request = record
-            .concurrent_to
-            .as_deref()
-            .and_then(|id| requests.get(id));
-
-        let cdx = warc_record_to_cdx(record, paired_request, &record_path_str);
-        store.insert(&cdx)?;
-        count += 1;
-
-        let mime = cdx.mimetype.to_ascii_lowercase();
-        if mime.contains("html") && !record.payload.is_empty() {
-            let (title, body) = extract_html_text(&record.payload);
-            if !title.is_empty() || !body.is_empty() {
-                search
-                    .lock()
-                    .unwrap()
-                    .add_document(&record.target_uri, &record.timestamp, &title, &body)?;
-            }
+        let mime = record.content_type.to_ascii_lowercase();
+        if !mime.contains("html") || record.payload.is_empty() {
+            continue;
         }
+        let (title, body) = extract_html_text(&record.payload);
+        if title.is_empty() && body.is_empty() {
+            continue;
+        }
+        search.lock().unwrap().index_page(
+            &record.target_uri,
+            &record.timestamp,
+            &title,
+            &body,
+            collection_id,
+            collection_name,
+        )?;
+        count += 1;
     }
 
     Ok(count)
 }
 
-/// Convert a WARC response record (+ optional paired request) into a CDX entry.
-fn warc_record_to_cdx(
-    resp: &WarcRecord,
-    req: Option<&&WarcRecord>,
-    warc_path: &str,
-) -> CdxRecord {
-    let method = req
-        .map(|r| http_method(&r.payload))
-        .unwrap_or_else(|| "GET".to_string());
-
-    let original_url = if method == "GET" {
-        resp.target_uri.clone()
-    } else {
-        let post_body = req.map(|r| r.payload.as_slice()).unwrap_or(&[]);
-        let ct = req
-            .map(|r| r.content_type.as_str())
-            .unwrap_or("application/x-www-form-urlencoded");
-        encode_post_url(&resp.target_uri, ct, post_body)
-    };
-
-    CdxRecord {
-        original_url,
-        timestamp: resp.timestamp.clone(),
-        mimetype: mime_without_params(&resp.content_type),
-        status: resp.http_status.unwrap_or(0),
-        digest: resp.digest.clone(),
-        length: resp.record_length,
-        warc_path: warc_path.to_string(),
-        warc_offset: resp.offset,
-        warc_record_length: resp.record_length,
-    }
-}
-
-fn http_method(payload: &[u8]) -> String {
-    let line_end = payload
-        .iter()
-        .position(|&b| b == b'\r' || b == b'\n')
-        .unwrap_or(payload.len());
-    let line = std::str::from_utf8(&payload[..line_end]).unwrap_or("");
-    line.split_whitespace()
-        .next()
-        .unwrap_or("GET")
-        .to_string()
-}
-
 /// Strip archive extensions to get a clean display name.
-/// `simple.warc.gz` → `simple`, `my-archive.wacz` → `my-archive`.
 fn file_display_name(path: &Path) -> String {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
     for suffix in &[".warc.gz", ".warc", ".wacz"] {
@@ -220,28 +186,6 @@ fn file_display_name(path: &Path) -> String {
         .to_string()
 }
 
-fn mime_without_params(ct: &str) -> String {
-    ct.split(';').next().unwrap_or(ct).trim().to_string()
-}
-
-/// Index a WACZ file by extracting its inner WARC archives and indexing each.
-/// Stores the original WACZ path (not the tempfile path) in CDX records.
-fn index_wacz(path: &Path, store: &CdxStore, search: &Mutex<SearchIndex>) -> Result<u64> {
-    use crate::wacz::{extract_warc_from_wacz, iter_warc_paths};
-
-    let mut total = 0u64;
-    for entry_name_result in iter_warc_paths(path)? {
-        let entry_name = entry_name_result?;
-        let tmp = extract_warc_from_wacz(path, &entry_name)
-            .with_context(|| format!("extracting {} from {}", entry_name, path.display()))?;
-        // read_from = tempfile, record_path = wacz, inner_warc = zip entry name
-        total += index_warc(tmp.path(), path, Some(&entry_name), store, search)?;
-    }
-    Ok(total)
-}
-
-// ── tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,50 +198,14 @@ mod tests {
     }
 
     #[test]
-    fn index_warc_produces_cdx_entry() {
+    fn index_path_wacz_writes_manifest() {
         let tmp = TempDir::new().unwrap();
-        let store = CdxStore::open(tmp.path().join("cdx").as_path()).unwrap();
-        let search = Mutex::new(SearchIndex::open(tmp.path().join("ft").as_path()).unwrap());
-
-        let fix = fixture("simple.warc.gz");
-        index_warc(&fix, &fix, None, &store, &search).unwrap();
-
-        let results = store
-            .query("http://example.com/", crate::cdx::MatchType::Exact, None, None, 10)
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        let rec = &results[0];
-        assert_eq!(rec.status, 200);
-        assert_eq!(rec.timestamp.len(), 14);
-        assert!(!rec.warc_path.is_empty());
-    }
-
-    #[test]
-    fn index_warc_html_is_searchable() {
-        let tmp = TempDir::new().unwrap();
-        let store = CdxStore::open(tmp.path().join("cdx").as_path()).unwrap();
-        let search = Mutex::new(SearchIndex::open(tmp.path().join("ft").as_path()).unwrap());
-
-        let fix = fixture("simple.warc.gz");
-        index_warc(&fix, &fix, None, &store, &search).unwrap();
-        search.into_inner().unwrap().commit().unwrap();
-
-        let idx = crate::search::SearchIndex::open(tmp.path().join("ft").as_path()).unwrap();
-        let results = idx.search("example", 10).unwrap();
-        assert!(!results.is_empty(), "should find HTML content");
-    }
-
-    #[test]
-    fn index_path_writes_manifest() {
-        let tmp = TempDir::new().unwrap();
-        index_path(&fixture("simple.warc.gz"), tmp.path(), Some("my-collection")).unwrap();
+        index_path(&fixture("simple.wacz"), tmp.path(), Some("my-collection")).unwrap();
 
         let manifest = CollectionManifest::open(tmp.path()).unwrap();
         assert_eq!(manifest.collections.len(), 1);
         let col = &manifest.collections[0];
         assert_eq!(col.name, "my-collection");
-        assert_eq!(col.record_count, 1); // simple.warc.gz has one response record
         assert!(!col.sha256.is_empty());
         assert!(col.file_size > 0);
     }
@@ -305,41 +213,68 @@ mod tests {
     #[test]
     fn index_path_name_defaults_to_stem() {
         let tmp = TempDir::new().unwrap();
-        index_path(&fixture("simple.warc.gz"), tmp.path(), None).unwrap();
+        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
 
         let manifest = CollectionManifest::open(tmp.path()).unwrap();
         assert_eq!(manifest.collections[0].name, "simple");
     }
 
     #[test]
-    fn wacz_records_use_wacz_path() {
+    fn index_wacz_html_is_searchable() {
         let tmp = TempDir::new().unwrap();
-        let store = CdxStore::open(tmp.path().join("cdx").as_path()).unwrap();
-        let search = Mutex::new(SearchIndex::open(tmp.path().join("ft").as_path()).unwrap());
+        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
 
-        let fix = fixture("simple.wacz");
-        index_wacz(&fix, &store, &search).unwrap();
+        let idx = crate::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
+        let results = idx.search("example", 10).unwrap();
+        assert!(!results.is_empty(), "should find HTML content from WACZ");
+        assert_eq!(results[0].collection_name, "simple");
+    }
 
-        // warc_path in CDX records should be "{wacz_abs_path}\x1e{inner_warc_name}"
-        let results = store
-            .query("http://example.com/", crate::cdx::MatchType::Exact, None, None, 10)
-            .unwrap();
-        assert!(!results.is_empty());
-        let warc_path = &results[0].warc_path;
-        let (outer, inner) = warc_path.split_once('\x1e').expect("should have separator");
+    #[test]
+    fn index_wacz_stores_seed_pages_in_manifest() {
+        let tmp = TempDir::new().unwrap();
+        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
+
+        let manifest = CollectionManifest::open(tmp.path()).unwrap();
+        let col = &manifest.collections[0];
         assert!(
-            outer.ends_with("simple.wacz"),
-            "outer path should be the wacz path, got: {outer}"
+            !col.seed_pages.is_empty(),
+            "simple.wacz has pages in pages.jsonl"
         );
+        assert_eq!(col.seed_pages[0].url, "http://example.com/");
+    }
+
+    #[test]
+    fn index_wacz_collection_is_searchable() {
+        let tmp = TempDir::new().unwrap();
+        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
+
+        let idx = crate::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
+        // The seed page URL "http://example.com/" is part of the collection body.
+        let results = idx.search("example.com", 10).unwrap();
         assert!(
-            inner.ends_with(".warc.gz"),
-            "inner path should be a warc.gz entry name, got: {inner}"
+            results.iter().any(|r| r.doc_type == "collection"),
+            "collection document should be searchable"
         );
     }
 
     #[test]
-    fn mime_stripping() {
-        assert_eq!(mime_without_params("text/html; charset=utf-8"), "text/html");
-        assert_eq!(mime_without_params("application/json"), "application/json");
+    fn reindexing_does_not_duplicate_documents() {
+        let tmp = TempDir::new().unwrap();
+        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
+        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
+
+        let idx = crate::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
+        let results = idx.search("example", 50).unwrap();
+        let pages = results.iter().filter(|r| r.doc_type == "page").count();
+        assert_eq!(pages, 1, "re-indexing should upsert, not duplicate pages");
+    }
+
+    #[test]
+    fn mime_display_name_strips_extension() {
+        let p = Path::new("/data/my-archive.wacz");
+        assert_eq!(file_display_name(p), "my-archive");
+        let p2 = Path::new("/data/my.warc.gz");
+        assert_eq!(file_display_name(p2), "my");
     }
 }

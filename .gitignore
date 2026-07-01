@@ -1,0 +1,19 @@
+# Rust build output
+/target
+
+# Local search index created by `rustyweb index`
+/index
+
+# Local test archives and unpacked WACZ scratch (large, not part of the repo)
+/archive
+/a
+
+# Scratch captures and screenshots
+*.har
+*.png
+test.txt
+
+# Node / Playwright tooling (not used)
+/node_modules
+/package.json
+/package-lock.json

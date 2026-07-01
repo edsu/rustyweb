@@ -4,87 +4,103 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Replay</title>
+  <script src="ui.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { height: 100%; }
-    iframe { width: 100%; height: 100%; border: none; display: block; }
-    #error { padding: 2rem; font-family: sans-serif; color: #c00; }
+    body { display: flex; flex-direction: column; font-family: sans-serif; }
+
+    #banner {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.5rem 0.9rem;
+      background: #1a1a2e;
+      color: #eee;
+      font-size: 0.85rem;
+      border-bottom: 1px solid #000;
+    }
+    #banner a.home {
+      color: #fff;
+      font-weight: bold;
+      text-decoration: none;
+      font-size: 1rem;
+    }
+    #banner a.home:hover { text-decoration: underline; }
+    #collection-name {
+      background: #16213e;
+      padding: 0.15rem 0.5rem;
+      border-radius: 3px;
+      color: #9ecbff;
+      white-space: nowrap;
+    }
+    #current-url {
+      color: #bbb;
+      font-family: monospace;
+      font-size: 0.8rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+      min-width: 0;
+    }
+
+    #replay-container { flex: 1 1 auto; position: relative; min-height: 0; }
+    replay-web-page { display: block; width: 100%; height: 100%; }
+    #error { padding: 2rem; color: #c00; }
   </style>
 </head>
 <body>
-  <iframe id="replay_iframe"></iframe>
+  <div id="banner">
+    <a class="home" href="/">rustyweb</a>
+    <span id="collection-name"></span>
+    <span id="current-url"></span>
+  </div>
+  <div id="replay-container"></div>
+
   <script>
-    (async function () {
+    (function () {
       const params = new URLSearchParams(window.location.search);
       const source = params.get('source'); // e.g. /files/a926c132
-      const url    = params.get('url');
+      const url    = params.get('url') || '';
       const ts     = params.get('ts') || '';
+      const name   = params.get('name') || '';
 
-      if (!source || !url) {
+      if (!source) {
         document.body.innerHTML =
-          '<div id="error">Missing <code>source</code> or <code>url</code> parameters.</div>';
+          '<div id="error">Missing <code>source</code> parameter.</div>';
         return;
       }
 
-      // Derive collection ID from source path (/files/{id} → {id})
-      // collName must equal the URL path segment after /replay/ so the SW's getColl() lookup matches.
-      const collId        = source.split('/').pop();
-      const archivePrefix = `/replay/${collId}/`;
-      const collName      = collId;
+      const collId = source.split('/').pop();
 
-      try {
-        await navigator.serviceWorker.register(
-          '/replay/sw.js?replayPrefix=',
-          { scope: '/replay/' }
-        );
+      document.getElementById('collection-name').textContent = name || collId;
+      document.getElementById('current-url').textContent = url;
 
-        await navigator.serviceWorker.ready;
+      // Mount the ReplayWebPage component in WACZ-direct mode: it reads the
+      // WACZ from `source` (our /files/{id} byte-range endpoint), extracts the
+      // internal CDX into IndexedDB, and serves all resources client-side.
+      const rp = document.createElement('replay-web-page');
+      rp.setAttribute('source', source);
+      rp.setAttribute('coll', collId);
+      rp.setAttribute('embed', 'replayonly');
+      // Absolute base so the SW resolves to /replay/sw.js regardless of the
+      // page path. The default "./replay/" would resolve relative to
+      // /replay/viewer → /replay/replay/sw.js (404).
+      rp.setAttribute('replaybase', '/replay/');
+      rp.setAttribute('swName', 'sw.js');
+      if (url) rp.setAttribute('url', url);
+      if (ts)  rp.setAttribute('ts', ts);
+      document.getElementById('replay-container').appendChild(rp);
 
-        // Wait for the SW to confirm the collection is ready.
-        const collReady = new Promise(resolve => {
-          navigator.serviceWorker.addEventListener('message', function handler(e) {
-            if (e.data.msg_type === 'collAdded' && e.data.name === collName) {
-              navigator.serviceWorker.removeEventListener('message', handler);
-              resolve();
-            }
-          });
-        });
-
-        const msg = {
-          msg_type: 'addColl',
-          name: collName,
-          type: 'live',
-          file: { sourceUrl: 'proxy:' },
-          skipExisting: true,
-          extraConfig: {
-            prefix: '',
-            isLive: false,
-            baseUrl: archivePrefix,
-            baseUrlAppendReplay: true,
-            noPostToGet: true,
-            archivePrefix: archivePrefix,
-            archiveMod: 'ir_',
-            injectScripts: [],
-          },
-        };
-
-        const ctrl = navigator.serviceWorker.controller;
-        if (ctrl) {
-          ctrl.postMessage(msg);
-        } else {
-          navigator.serviceWorker.addEventListener('controllerchange', () => {
-            navigator.serviceWorker.controller.postMessage(msg);
-          });
+      // Keep the banner URL in sync as the user navigates within the archive.
+      window.addEventListener('rwp-url-change', function (e) {
+        const newUrl = e.detail && e.detail.url;
+        if (newUrl) {
+          document.getElementById('current-url').textContent = newUrl;
         }
-
-        await collReady;
-
-        document.getElementById('replay_iframe').src =
-          `${archivePrefix}${ts}mp_/${url}`;
-      } catch (e) {
-        document.body.innerHTML =
-          `<div id="error">Replay error: ${e.message}</div>`;
-      }
+      });
     })();
   </script>
 </body>

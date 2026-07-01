@@ -1,14 +1,216 @@
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
+
+use crate::collections::SeedPage;
+
+/// Metadata extracted from a WACZ file's `datapackage.json` and `pages/pages.jsonl`.
+#[derive(Debug, Default)]
+pub struct WaczMetadata {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub created: Option<String>,
+    pub seed_pages: Vec<SeedPage>,
+}
+
+/// A single record from a WACZ CDX index (`indexes/index.cdx[.gz]`).
+#[derive(Debug)]
+pub struct CdxjRecord {
+    pub url: String,
+    pub timestamp: String,
+    pub mime: String,
+    pub status: u16,
+    pub filename: String,
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// Read `datapackage.json` and `pages/pages.jsonl` from a WACZ file and return
+/// collected metadata.  Missing or unrecognised fields are silently ignored so
+/// that the function works with minimal / non-standard WACZ files.
+pub fn read_datapackage(wacz_path: &Path) -> Result<WaczMetadata> {
+    let file = std::fs::File::open(wacz_path)
+        .with_context(|| format!("opening WACZ {}", wacz_path.display()))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading ZIP {}", wacz_path.display()))?;
+
+    // --- datapackage.json -------------------------------------------------
+    #[derive(Deserialize, Default)]
+    struct DataPackage {
+        title: Option<String>,
+        description: Option<String>,
+        created: Option<String>,
+    }
+
+    let mut meta = WaczMetadata::default();
+
+    if let Ok(mut entry) = zip.by_name("datapackage.json") {
+        let mut buf = String::new();
+        entry.read_to_string(&mut buf)?;
+        if let Ok(dp) = serde_json::from_str::<DataPackage>(&buf) {
+            meta.title = dp.title;
+            meta.description = dp.description;
+            meta.created = dp.created;
+        }
+    }
+
+    // --- pages/pages.jsonl ------------------------------------------------
+    // First line is a header object; subsequent lines are page entries.
+    if let Ok(mut entry) = zip.by_name("pages/pages.jsonl") {
+        let mut buf = String::new();
+        entry.read_to_string(&mut buf)?;
+
+        for line in buf.lines().skip(1) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            #[derive(Deserialize)]
+            struct PageEntry {
+                url: Option<String>,
+                title: Option<String>,
+                ts: Option<String>,
+            }
+            if let Ok(p) = serde_json::from_str::<PageEntry>(line) {
+                if let Some(url) = p.url {
+                    meta.seed_pages.push(SeedPage {
+                        url,
+                        title: p.title,
+                        ts: p.ts.unwrap_or_default(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(meta)
+}
+
+/// Search a WACZ file's CDX index for records matching `url` (exact URL match).
+///
+/// Handles both:
+/// - CDXJ format: `{surt} {timestamp} {json}`
+/// - NDJSON format: `{json}` where the JSON object has a `"url"` field
+///
+/// The index file may be compressed (`.cdx.gz`) or plain (`.cdx`).
+pub fn search_cdx(wacz_path: &Path, url: &str) -> Result<Vec<CdxjRecord>> {
+    let file = std::fs::File::open(wacz_path)
+        .with_context(|| format!("opening WACZ {}", wacz_path.display()))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading ZIP {}", wacz_path.display()))?;
+
+    // Find the CDX entry (may be .cdx or .cdx.gz, may be in a subdirectory).
+    let cdx_name = find_cdx_entry(&mut zip)?;
+    let Some(cdx_name) = cdx_name else {
+        return Ok(Vec::new());
+    };
+
+    let mut entry = zip.by_name(&cdx_name)?;
+    let mut raw = Vec::new();
+    entry.read_to_end(&mut raw)?;
+
+    // Decompress if gzipped.
+    let text = if cdx_name.ends_with(".gz") {
+        let mut decoder = flate2::read::GzDecoder::new(raw.as_slice());
+        let mut out = String::new();
+        decoder.read_to_string(&mut out)?;
+        out
+    } else {
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+
+    let mut results = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rec) = parse_cdx_line(line) {
+            if rec.url == url {
+                results.push(rec);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn find_cdx_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<Option<String>> {
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i)?;
+        let name = entry.name().to_string();
+        if name.starts_with("indexes/")
+            && (name.ends_with(".cdx.gz") || name.ends_with(".cdx"))
+        {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+// WACZ CDX JSON quotes some numeric fields as strings (e.g. `"length":"715"`)
+// and leaves others as numbers (`"length":715`), depending on the tool that
+// wrote it. Deserialize the varying fields as `Value` and coerce below so a
+// single quoted number doesn't cause the whole record to be dropped.
+#[derive(Deserialize)]
+struct CdxJson {
+    url: Option<String>,
+    ts: Option<String>,
+    mime: Option<String>,
+    status: Option<serde_json::Value>,
+    filename: Option<String>,
+    offset: Option<serde_json::Value>,
+    length: Option<serde_json::Value>,
+}
+
+fn coerce_u64(v: &Option<serde_json::Value>) -> u64 {
+    match v {
+        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+        Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn parse_cdx_line(line: &str) -> Option<CdxjRecord> {
+    let (ts, json_str) = if line.starts_with('{') {
+        // NDJSON format: the whole line is the JSON object.
+        ("", line)
+    } else {
+        // CDXJ format: "{surt} {timestamp} {json}"
+        let mut parts = line.splitn(3, ' ');
+        let _surt = parts.next()?;
+        let ts = parts.next()?;
+        let json = parts.next()?;
+        (ts, json)
+    };
+
+    let obj: CdxJson = serde_json::from_str(json_str).ok()?;
+    let url = obj.url?;
+    let timestamp = if !ts.is_empty() {
+        ts.to_string()
+    } else {
+        obj.ts.unwrap_or_default()
+    };
+    let status = match &obj.status {
+        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0) as u16,
+        Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+        _ => 0,
+    };
+
+    Some(CdxjRecord {
+        url,
+        timestamp,
+        mime: obj.mime.unwrap_or_default(),
+        status,
+        filename: obj.filename.unwrap_or_default(),
+        offset: coerce_u64(&obj.offset),
+        length: coerce_u64(&obj.length),
+    })
+}
 
 /// Iterate over the paths of WARC archives embedded inside a WACZ file.
-///
-/// WACZ is a ZIP archive; WARC files live under the `archive/` prefix.
-/// The paths returned are the ZIP entry names (e.g. `archive/data.warc.gz`);
-/// callers that need absolute paths should resolve them relative to the
-/// WACZ file itself — but since the WARC data is *inside* the ZIP, callers
-/// will extract each WARC to a temp file first (see `extract_warc_from_wacz`).
 pub fn iter_warc_paths(wacz_path: &Path) -> Result<impl Iterator<Item = Result<String>>> {
     let file = std::fs::File::open(wacz_path)
         .with_context(|| format!("opening WACZ {}", wacz_path.display()))?;
@@ -27,9 +229,7 @@ pub fn iter_warc_paths(wacz_path: &Path) -> Result<impl Iterator<Item = Result<S
     Ok(names.into_iter().map(Ok))
 }
 
-/// Extract a single named WARC entry from a WACZ ZIP into a temp file and
-/// return the path.  The caller owns the `NamedTempFile` and must keep it
-/// alive as long as the WARC data is needed.
+/// Extract a single named WARC entry from a WACZ ZIP into a temp file.
 pub fn extract_warc_from_wacz(
     wacz_path: &Path,
     entry_name: &str,
@@ -85,5 +285,63 @@ mod tests {
         let tmp = extract_warc_from_wacz(&fixture("simple.wacz"), first).unwrap();
         assert!(tmp.path().exists());
         assert!(tmp.path().metadata().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn read_datapackage_from_simple_wacz() {
+        let meta = read_datapackage(&fixture("simple.wacz")).unwrap();
+        // simple.wacz has a pages/pages.jsonl with one page entry
+        assert!(
+            !meta.seed_pages.is_empty(),
+            "should have at least one seed page"
+        );
+        assert_eq!(meta.seed_pages[0].url, "http://example.com/");
+        assert_eq!(meta.seed_pages[0].title.as_deref(), Some("Example"));
+    }
+
+    #[test]
+    fn search_cdx_finds_url_in_ndjson_wacz() {
+        let records = search_cdx(&fixture("simple.wacz"), "http://example.com/").unwrap();
+        assert!(!records.is_empty(), "should find CDX entry for example.com");
+        assert_eq!(records[0].url, "http://example.com/");
+        assert_eq!(records[0].status, 200);
+    }
+
+    #[test]
+    fn search_cdx_finds_url_in_cdxj_wacz() {
+        // github-bitcoin-mining.wacz uses CDXJ format
+        let records = search_cdx(
+            &fixture("github-bitcoin-mining.wacz"),
+            "https://github.com/DocNow/hydrator/pull/78/files",
+        )
+        .unwrap();
+        assert!(!records.is_empty(), "should find CDX entry");
+    }
+
+    #[test]
+    fn search_cdx_handles_string_typed_numeric_fields() {
+        // a.wacz stores offset/length/status as quoted strings in its CDX
+        // (e.g. "length":"715"); make sure we still parse those records.
+        let records = search_cdx(
+            &fixture("a.wacz"),
+            "https://storymaps.arcgis.com/stories/278e1b5c18a3474082e583e889705179",
+        )
+        .unwrap();
+        assert!(!records.is_empty(), "should parse string-typed CDX fields");
+        assert_eq!(records[0].status, 200);
+        assert!(records[0].length > 0, "length should coerce from string");
+    }
+
+    #[test]
+    fn search_cdx_finds_redirect_record() {
+        let records = search_cdx(&fixture("a.wacz"), "https://arcg.is/1zLCSC4").unwrap();
+        let redirect = records.iter().find(|r| r.status == 301);
+        assert!(redirect.is_some(), "arcg.is shortener should be a 301 redirect");
+    }
+
+    #[test]
+    fn search_cdx_no_match() {
+        let records = search_cdx(&fixture("simple.wacz"), "http://notexist.example/").unwrap();
+        assert!(records.is_empty());
     }
 }

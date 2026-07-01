@@ -2,7 +2,6 @@ use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use flate2::read::GzDecoder;
 
 /// A parsed WARC record with HTTP response fields extracted.
 #[derive(Debug, Clone)]
@@ -19,21 +18,6 @@ pub struct WarcRecord {
     pub http_headers: Vec<(String, String)>, // original HTTP response headers (response records only)
     pub offset: u64,       // compressed byte offset in .warc.gz; file offset in .warc
     pub record_length: u64, // compressed member size for .warc.gz
-}
-
-/// Parse a raw WARC record buffer — possibly a gzip member — and return the record.
-/// Used by the `ir_` replay endpoint to extract the HTTP response from a WARC slice.
-pub fn parse_warc_bytes(data: &[u8]) -> Result<Option<WarcRecord>> {
-    let bytes = if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-        let mut gz = GzDecoder::new(std::io::Cursor::new(data));
-        let mut decompressed = Vec::new();
-        gz.read_to_end(&mut decompressed).context("decompressing WARC gzip member")?;
-        decompressed
-    } else {
-        data.to_vec()
-    };
-    let mut reader = BufReader::new(std::io::Cursor::new(&bytes));
-    parse_one_warc_record(&mut reader, 0, data.len() as u64)
 }
 
 /// Iterate over records in a `.warc` or `.warc.gz` file.

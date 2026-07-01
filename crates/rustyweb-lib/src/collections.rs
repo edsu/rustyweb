@@ -4,32 +4,11 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum CollectionKind {
-    Wacz,
-    Warc,
-}
-
-impl CollectionKind {
-    pub fn from_path(path: &Path) -> Self {
-        match path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "wacz" => CollectionKind::Wacz,
-            _ => CollectionKind::Warc,
-        }
-    }
-
-    pub fn content_type(&self) -> &'static str {
-        match self {
-            CollectionKind::Wacz => "application/zip",
-            CollectionKind::Warc => "application/warc",
-        }
-    }
+pub struct SeedPage {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub ts: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,11 +16,15 @@ pub struct Collection {
     pub id: String,
     pub path: PathBuf,
     pub name: String,
-    pub kind: CollectionKind,
     pub date_indexed: String,
-    pub record_count: u64,
     pub file_size: u64,
     pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crawl_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed_pages: Vec<SeedPage>,
 }
 
 impl Collection {
@@ -87,10 +70,6 @@ impl CollectionManifest {
 
     pub fn find_by_id(&self, id: &str) -> Option<&Collection> {
         self.collections.iter().find(|c| c.id == id)
-    }
-
-    pub fn find_by_path(&self, path: &Path) -> Option<&Collection> {
-        self.collections.iter().find(|c| c.path == path)
     }
 }
 
@@ -160,19 +139,20 @@ mod tests {
             id: "abc12345".to_string(),
             path: PathBuf::from("/data/test.wacz"),
             name: "test".to_string(),
-            kind: CollectionKind::Wacz,
             date_indexed: "2026-07-01T00:00:00Z".to_string(),
-            record_count: 10,
             file_size: 1024,
             sha256: "deadbeef".to_string(),
+            description: Some("A test collection".to_string()),
+            crawl_date: None,
+            seed_pages: vec![],
         };
-        m.upsert(col.clone());
+        m.upsert(col);
         m.save().unwrap();
 
         let m2 = CollectionManifest::open(tmp.path()).unwrap();
         assert_eq!(m2.collections.len(), 1);
         assert_eq!(m2.collections[0].id, "abc12345");
-        assert_eq!(m2.collections[0].record_count, 10);
+        assert_eq!(m2.collections[0].description.as_deref(), Some("A test collection"));
     }
 
     #[test]
@@ -184,24 +164,26 @@ mod tests {
             id: "abc12345".to_string(),
             path: PathBuf::from("/data/test.wacz"),
             name: "test".to_string(),
-            kind: CollectionKind::Wacz,
             date_indexed: "2026-07-01T00:00:00Z".to_string(),
-            record_count: 10,
             file_size: 1024,
             sha256: "deadbeef".to_string(),
+            description: None,
+            crawl_date: None,
+            seed_pages: vec![],
         };
         m.upsert(col);
         m.upsert(Collection {
             id: "abc12345".to_string(),
             path: PathBuf::from("/data/test.wacz"),
-            name: "test".to_string(),
-            kind: CollectionKind::Wacz,
+            name: "test-updated".to_string(),
             date_indexed: "2026-07-02T00:00:00Z".to_string(),
-            record_count: 20,
-            file_size: 1024,
+            file_size: 2048,
             sha256: "cafebabe".to_string(),
+            description: Some("updated".to_string()),
+            crawl_date: None,
+            seed_pages: vec![],
         });
         assert_eq!(m.collections.len(), 1);
-        assert_eq!(m.collections[0].record_count, 20);
+        assert_eq!(m.collections[0].name, "test-updated");
     }
 }
