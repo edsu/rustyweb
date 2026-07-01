@@ -359,6 +359,25 @@ fn index_real_wacz_has_correct_url() {
 }
 
 #[test]
+fn index_pdf_text_is_searchable() {
+    // pdf-doc.wacz wraps a real PDF (generated from text) as an
+    // application/pdf response. Its body text ("flux capacitor ...") exists
+    // only inside the PDF, so a hit proves PDF extraction ran during indexing.
+    let tmp = make_index(&["pdf-doc.wacz"]);
+    let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
+    let results = idx.search("\"flux capacitor\"", 10).unwrap();
+    assert!(!results.is_empty(), "PDF text should be searchable");
+    let hit = &results[0];
+    assert_eq!(hit.doc_type, "page");
+    assert_eq!(hit.url, "http://example.com/report.pdf");
+    assert!(
+        hit.snippet.to_lowercase().contains("flux"),
+        "snippet should highlight matched PDF text: {}",
+        hit.snippet
+    );
+}
+
+#[test]
 fn index_real_wacz_indexes_rendered_text() {
     // The storymaps page is a Next.js SPA: its raw HTML body is nearly empty, so
     // before urn:text indexing only the title was searchable. Browsertrix's

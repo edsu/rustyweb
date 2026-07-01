@@ -1,6 +1,11 @@
 # rustyweb
 
-**Note bene**: *this tool has been written with Claude Code. Like any piece of software it may contain bugs, and while the software was designed through several iterations and abandoned prototypes, the developer's understanding of how it operates at a low level may be limited. See the DESIGN.md document for the overall approach that was used. Technical reviews of the code and design are always welcome!*
+**Note bene**: *rustyweb is alpha software and has been written extensively
+with the support of Claude Code. Like any piece of software it may contain
+bugs, and while the software was designed through several iterations and
+abandoned prototypes, the developer's understanding of how it operates at a low
+level may be limited. See the DESIGN.md document for the overall approach that
+was used. Technical reviews of the code and design are always welcome!*
 
 ---
 
@@ -85,9 +90,10 @@ rustyweb verify     [--index-dir <DIR>]
 ```
 
 - **`index`** - accepts `.wacz` files or directories (scanned for `.wacz`).
-  Extracts page HTML for full-text search, reads `datapackage.json` for
-  collection metadata, and records everything in `{index-dir}/collections.json`,
-  including the SHA-256 of each WACZ. Defaults to `./index`.
+  Extracts searchable text from each page (HTML, Browsertrix's rendered
+  `urn:text` records, and PDFs), reads `datapackage.json` for collection
+  metadata, and records everything in `{index-dir}/collections.json`, including
+  the SHA-256 of each WACZ. Defaults to `./index`.
 - **`serve`** - opens the index read-only and starts the HTTP server. Defaults
   to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and

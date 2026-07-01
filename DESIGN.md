@@ -205,14 +205,23 @@ Input WACZ
        ├── Read datapackage.json ──► WaczMetadata (title, description, crawl date, seed pages)
        │    └── Index as collection document in Tantivy
        │    └── Write to collections.json
-       └── Iterate archive/*.warc.gz members
-            └── For each HTML response record:
-                 ├── Extract title (<title> tag)
-                 ├── Extract body text (scraper, strips script/style/noscript)
-                 └── Write page document to Tantivy (url, timestamp, title, body, collection_id)
+       └── Iterate archive/*.warc(.gz) members, collecting per record:
+            ├── HTML response        ──► title (<title>) + scraped body text
+            ├── urn:text: resource   ──► fully rendered (post-JS) page text
+            └── application/pdf resp ──► extracted PDF text (title from filename)
+                 │
+                 └── Merge into one document per URL (body prefers rendered
+                     text, then PDF text, then scraped HTML; title from HTML)
+                     └── Write page document to Tantivy
+                         (doc_type, url, timestamp, title, body, collection_id, collection_name)
 ```
 
-Parallelism: Rayon parallel iterator over the WARC member list within each WACZ.
+Records are collected across all inner WARCs before merging, because a page's
+rendered `urn:text` often lives in a different WARC than its HTML response.
+Collapsing to one document per URL also deduplicates repeat captures.
+
+Parallelism: Rayon parallel iterator over the WARC member list within each WACZ;
+merge and Tantivy writes happen once per WACZ.
 
 ---
 

@@ -247,6 +247,25 @@ fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
             continue;
         }
         let mime = record.content_type.to_ascii_lowercase();
+
+        // PDF responses: extract the text and index it as the page body, with a
+        // title derived from the URL's filename.
+        if mime.contains("pdf") {
+            if !record.payload.is_empty() {
+                if let Some(text) = crate::pdf::extract_pdf_text(&record.payload) {
+                    out.push(RawRecord::Html {
+                        url: uri.to_string(),
+                        timestamp: record.timestamp.clone(),
+                        title: pdf_title_from_url(uri),
+                        body: text,
+                    });
+                } else {
+                    debug!(url = uri, "PDF text extraction yielded nothing; skipping");
+                }
+            }
+            continue;
+        }
+
         if !mime.contains("html") || record.payload.is_empty() {
             continue;
         }
@@ -263,6 +282,17 @@ fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
     }
 
     Ok(out)
+}
+
+/// Derive a page title for a PDF from the last path segment of its URL
+/// (e.g. `https://x.org/docs/report.pdf` -> `report.pdf`), falling back to the
+/// full URL when there is no usable segment.
+fn pdf_title_from_url(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.rsplit('/')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(url)
+        .to_string()
 }
 
 /// Strip archive extensions to get a clean display name.
