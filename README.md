@@ -106,19 +106,23 @@ refresh collections.
 
 ### Remote WACZ files
 
-A WACZ can also live at an `http(s)` URL:
+A WACZ can also live at an `http(s)` URL. For example, this one is hosted on S3:
 
 ```sh
-./target/release/rustyweb index https://example.org/archives/site.wacz
+rustyweb index https://edsu-webarchives.s3.amazonaws.com/docnow.wacz
+rustyweb serve
 ```
 
 Indexing downloads the WACZ once to read its text and metadata, but records the
 URL as the collection's source. At replay time the browser reads the remote WACZ
 directly (via HTTP range requests) - rustyweb does not proxy the bytes. For that
 to work the remote host must serve the WACZ with **HTTP range support and CORS**
-allowing rustyweb's origin. (This is also why S3 and other object stores work
-without special support: expose the object as a range- and CORS-capable HTTPS
-URL, e.g. a presigned URL, and index that.)
+allowing rustyweb's origin. The bucket above is configured that way
+(`Accept-Ranges: bytes` and `Access-Control-Allow-Origin: *`).
+
+This is also why S3 and other object stores work without any special support in
+rustyweb: expose the object as a range- and CORS-capable HTTPS URL (a public
+object like the one above, or a presigned URL) and index that.
 
 ## Command line
 
