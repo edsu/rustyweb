@@ -13,6 +13,7 @@ use rust_embed::RustEmbed;
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 use tower_http::compression::CompressionLayer;
+use tower_http::trace::TraceLayer;
 
 use crate::cdx::{CdxStore, MatchType, normalize_url_fuzzy};
 use crate::collections::{Collection, CollectionManifest};
@@ -54,6 +55,36 @@ pub fn router(index_dir: &Path) -> Result<Router> {
         .route("/replay/", get(replay_index))
         .route("/replay/{*path}", get(replay_handler))
         .layer(CompressionLayer::new())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<Body>| {
+                    let ip = req.extensions()
+                        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                        .map(|ci| ci.0.ip().to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    tracing::info_span!(
+                        "request",
+                        method = %req.method(),
+                        uri = %req.uri(),
+                        client_ip = %ip,
+                    )
+                })
+                .on_response(|res: &Response, latency: std::time::Duration, _span: &tracing::Span| {
+                    let ct = res.headers()
+                        .get(axum::http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("-");
+                    let status = res.status().as_u16();
+                    let ms = latency.as_millis();
+                    if status >= 500 {
+                        tracing::error!(status, content_type = ct, latency_ms = ms);
+                    } else if status >= 400 {
+                        tracing::warn!(status, content_type = ct, latency_ms = ms);
+                    } else {
+                        tracing::info!(status, content_type = ct, latency_ms = ms);
+                    }
+                }),
+        )
         .with_state(state);
 
     Ok(app)
@@ -63,7 +94,11 @@ pub async fn serve(bind: &str, index_dir: &Path) -> Result<()> {
     let app = router(index_dir)?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("listening on {bind}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -191,8 +226,9 @@ async fn search_page(
                 .ok()
                 .and_then(|records| records.into_iter().next())
                 .map(|rec| {
+                    let (outer, _) = split_warc_path(&rec.warc_path);
                     let col_id = crate::collections::collection_id(
-                        std::path::Path::new(&rec.warc_path),
+                        std::path::Path::new(outer),
                     );
                     (col_id, rec.timestamp.clone())
                 })
@@ -374,6 +410,7 @@ fn parse_byte_range(range: &str, file_size: u64) -> Option<(u64, u64)> {
 async fn replay_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(path): axum::extract::Path<String>,
+    axum::extract::RawQuery(outer_query): axum::extract::RawQuery,
 ) -> impl IntoResponse {
     // If the path looks like a wabac.js archive request, dispatch to the archive handler.
     // Archive requests have the form: {id}/{ts}{modifier_}/{url}
@@ -382,7 +419,7 @@ async fn replay_handler(
         let id = &path[..slash];
         let rest = &path[slash + 1..];
         if has_archive_modifier(rest) {
-            return ir_resource_inner(&state, id, rest);
+            return ir_resource_inner(&state, id, rest, outer_query.as_deref());
         }
     }
     serve_embedded_asset(&path)
@@ -396,7 +433,7 @@ fn has_archive_modifier(rest: &str) -> bool {
     })
 }
 
-fn ir_resource_inner(state: &AppState, id: &str, rest: &str) -> Response {
+fn ir_resource_inner(state: &AppState, id: &str, rest: &str, outer_query: Option<&str>) -> Response {
     // rest = "{ts}{modifier_}/{url}"  e.g. "20230327164112oe_///www.w3.org/…"
     // Find the modifier: scan for _/ and walk back over lowercase letters.
     let Some(underscore_pos) = rest.find("_/") else {
@@ -413,7 +450,7 @@ fn ir_resource_inner(state: &AppState, id: &str, rest: &str) -> Response {
     //   - "//host/path"        → Chrome may normalise "modifier///host" → "modifier/host"
     //                            so raw_url may arrive as "//host/path" OR "host/path"
     // Normalise to an absolute URL and try both schemes if needed.
-    let as_https = if raw_url.starts_with("https://") || raw_url.starts_with("http://") {
+    let mut as_https = if raw_url.starts_with("https://") || raw_url.starts_with("http://") {
         raw_url.to_string()
     } else if raw_url.starts_with("//") {
         format!("https:{raw_url}")
@@ -422,8 +459,19 @@ fn ir_resource_inner(state: &AppState, id: &str, rest: &str) -> Response {
         format!("https://{raw_url}")
     };
 
+    // The inner URL's query string (e.g. ?w=50) arrives as the OUTER HTTP query
+    // string, because HTTP treats the first `?` as the query delimiter.  Axum's
+    // {*path} wildcard captures only the path component, so we must re-attach it.
+    if let Some(q) = outer_query {
+        if !q.is_empty() && !as_https.contains('?') {
+            as_https.push('?');
+            as_https.push_str(q);
+        }
+    }
+
     // Query all timestamps — sub-resources are often archived at a different
     // time than the page that requested them, so we find the closest match.
+    let mut from_prefix = false;
     let records = {
         let mut r = state.cdx.query(&as_https, MatchType::Exact, None, None, 100)
             .unwrap_or_default();
@@ -433,24 +481,58 @@ fn ir_resource_inner(state: &AppState, id: &str, rest: &str) -> Response {
             r = state.cdx.query(&as_http, MatchType::Exact, None, None, 100)
                 .unwrap_or_default();
         }
+        // Fuzzy fallback: strip tracking/noise query params and retry.
+        if r.is_empty() {
+            let fuzzy = normalize_url_fuzzy(&as_https);
+            if fuzzy != as_https {
+                r = state.cdx.query(&fuzzy, MatchType::Exact, None, None, 100)
+                    .unwrap_or_default();
+            }
+        }
+        // Last resort: prefix match on the bare URL path without any query string.
+        // Handles CDN image URLs where ?w=N varies per request but the archive
+        // only has certain sizes (e.g. ?w=20, ?w=800 but not ?w=50).
+        if r.is_empty() {
+            if let Ok(mut stripped) = url::Url::parse(&as_https) {
+                if stripped.query().is_some() {
+                    stripped.set_query(None);
+                    r = state.cdx.query(stripped.as_str(), MatchType::Prefix, None, None, 100)
+                        .unwrap_or_default();
+                    if !r.is_empty() {
+                        from_prefix = true;
+                    }
+                }
+            }
+        }
         r
     };
 
-    // Find the CDX record belonging to this collection, choosing the one whose
-    // timestamp is closest to the requested timestamp.
-    let Some(record) = records
-        .iter()
-        .filter(|r| {
-            crate::collections::collection_id(std::path::Path::new(&r.warc_path)) == id
-        })
-        .min_by_key(|r| ts_distance(&r.timestamp, ts))
-        .cloned()
-    else {
+    // Find the CDX record belonging to this collection.
+    // warc_path may be composite "wacz_path\x1einner_warc" — use only the outer
+    // part for the collection-id hash.
+    //
+    // For exact/fuzzy matches, pick the record with the closest timestamp.
+    // For prefix matches (quality variants like ?w=20 vs ?w=800), pick the
+    // largest content size — that's the best-quality proxy available.
+    let col_filter = |r: &&crate::cdx::CdxRecord| {
+        let (outer, _) = split_warc_path(&r.warc_path);
+        crate::collections::collection_id(std::path::Path::new(outer)) == id
+    };
+    let Some(record) = (if from_prefix {
+        records.iter().filter(col_filter)
+            .max_by_key(|r| (r.length, u64::MAX - ts_distance(&r.timestamp, ts)))
+            .cloned()
+    } else {
+        records.iter().filter(col_filter)
+            .min_by_key(|r| ts_distance(&r.timestamp, ts))
+            .cloned()
+    }) else {
         return (StatusCode::NOT_FOUND, "URL not in this collection").into_response();
     };
 
     // Build a minimal Collection from the CDX record — no manifest entry required.
-    let warc_path = std::path::PathBuf::from(&record.warc_path);
+    let (outer_path_str, inner_warc) = split_warc_path(&record.warc_path);
+    let warc_path = std::path::PathBuf::from(outer_path_str);
     let kind = crate::collections::CollectionKind::from_path(&warc_path);
     let col = crate::collections::Collection {
         id: id.to_string(),
@@ -466,7 +548,7 @@ fn ir_resource_inner(state: &AppState, id: &str, rest: &str) -> Response {
         return (StatusCode::NOT_FOUND, "archive not on disk").into_response();
     }
 
-    let raw = match read_record_from_collection(&col, record.warc_offset, record.warc_record_length)
+    let raw = match read_record_from_collection(&col, inner_warc, record.warc_offset, record.warc_record_length)
     {
         Ok(b) => b,
         Err(e) => return error_response(e),
@@ -502,6 +584,19 @@ fn ir_resource_inner(state: &AppState, id: &str, rest: &str) -> Response {
                 if SKIP.contains(&name.to_ascii_lowercase().as_str()) {
                     continue;
                 }
+                // Rewrite redirect Location headers so the browser stays in the archive.
+                // The original Location is an absolute live URL; point it back to our
+                // replay endpoint so the follow goes through ir_resource_inner again.
+                if name.eq_ignore_ascii_case("location") && (300..400).contains(&status) {
+                    let loc = value.trim();
+                    if loc.starts_with("http://") || loc.starts_with("https://") {
+                        builder = builder.header(
+                            "location",
+                            format!("/replay/{id}/{ts}ir_/{loc}"),
+                        );
+                        continue;
+                    }
+                }
                 builder = builder.header(name.as_str(), value.as_str());
             }
 
@@ -519,9 +614,22 @@ fn ir_resource_inner(state: &AppState, id: &str, rest: &str) -> Response {
     }
 }
 
-/// Read raw WARC record bytes from either a plain WARC or an inner WARC inside a WACZ.
+/// Split a CDX `warc_path` into the outer path and optional inner WARC entry name.
+///
+/// For plain WARC files: `("/path/file.warc.gz", None)`
+/// For WACZ inner WARCs: `("/path/file.wacz", Some("archive/rec-XXXX.warc.gz"))`
+fn split_warc_path(warc_path: &str) -> (&str, Option<&str>) {
+    if let Some(pos) = warc_path.find('\x1e') {
+        (&warc_path[..pos], Some(&warc_path[pos + 1..]))
+    } else {
+        (warc_path, None)
+    }
+}
+
+/// Read raw WARC record bytes from either a plain WARC or a named inner WARC inside a WACZ.
 fn read_record_from_collection(
     col: &Collection,
+    inner_warc: Option<&str>,
     offset: u64,
     length: u64,
 ) -> Result<Vec<u8>> {
@@ -529,26 +637,15 @@ fn read_record_from_collection(
     match col.kind {
         CollectionKind::Warc => read_warc_slice(&col.path, offset, length),
         CollectionKind::Wacz => {
-            use crate::wacz::{extract_warc_from_wacz, iter_warc_paths};
-            for entry_result in iter_warc_paths(&col.path)? {
-                let entry = entry_result?;
-                let tmp = extract_warc_from_wacz(&col.path, &entry)?;
-                let tmp_size = std::fs::metadata(tmp.path())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if offset + length <= tmp_size {
-                    if let Ok(bytes) = read_warc_slice(tmp.path(), offset, length) {
-                        if !bytes.is_empty() {
-                            return Ok(bytes);
-                        }
-                    }
-                }
-            }
-            Err(anyhow::anyhow!(
-                "WARC record at offset {} not found in any inner WARC of {}",
-                offset,
-                col.path.display()
-            ))
+            use crate::wacz::extract_warc_from_wacz;
+            let entry = inner_warc.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CDX record for {} is missing inner WARC name (reindex required)",
+                    col.path.display()
+                )
+            })?;
+            let tmp = extract_warc_from_wacz(&col.path, entry)?;
+            read_warc_slice(tmp.path(), offset, length)
         }
     }
 }

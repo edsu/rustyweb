@@ -81,7 +81,7 @@ fn index_single(path: &Path, store: &CdxStore, search: &Mutex<SearchIndex>) -> R
         .to_ascii_lowercase();
 
     match ext.as_str() {
-        "warc" | "gz" => index_warc(path, path, store, search),
+        "warc" | "gz" => index_warc(path, path, None, store, search),
         "wacz" => index_wacz(path, store, search),
         _ => {
             debug!("skipping unsupported file type: {}", path.display());
@@ -94,20 +94,26 @@ fn index_single(path: &Path, store: &CdxStore, search: &Mutex<SearchIndex>) -> R
 ///
 /// `read_from` is the physical file to parse (may be a tempfile for WACZ-extracted WARCs).
 /// `record_path` is the path stored in CDX records (the original WARC or parent WACZ path).
+/// `inner_warc` is set for WACZ inner WARCs: the zip entry name, e.g.
+/// `"archive/rec-XXXX.warc.gz"`. When set the stored `warc_path` is
+/// `"{wacz_abs_path}\x1e{inner_warc}"` so the server can extract the right file.
 ///
 /// Returns the number of CDX records written.
 fn index_warc(
     read_from: &Path,
     record_path: &Path,
+    inner_warc: Option<&str>,
     store: &CdxStore,
     search: &Mutex<SearchIndex>,
 ) -> Result<u64> {
     // Always store an absolute path so the server can match it against the manifest.
-    let record_path_str = record_path
+    let abs = record_path
         .canonicalize()
-        .unwrap_or_else(|_| record_path.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
+        .unwrap_or_else(|_| record_path.to_path_buf());
+    let record_path_str = match inner_warc {
+        Some(inner) => format!("{}\x1e{}", abs.to_string_lossy(), inner),
+        None => abs.to_string_lossy().into_owned(),
+    };
 
     let all: Vec<WarcRecord> = iter_records(read_from)
         .with_context(|| format!("reading {}", read_from.display()))?
@@ -228,8 +234,8 @@ fn index_wacz(path: &Path, store: &CdxStore, search: &Mutex<SearchIndex>) -> Res
         let entry_name = entry_name_result?;
         let tmp = extract_warc_from_wacz(path, &entry_name)
             .with_context(|| format!("extracting {} from {}", entry_name, path.display()))?;
-        // read_from = tempfile, record_path = original wacz (fixes warc_path bug)
-        total += index_warc(tmp.path(), path, store, search)?;
+        // read_from = tempfile, record_path = wacz, inner_warc = zip entry name
+        total += index_warc(tmp.path(), path, Some(&entry_name), store, search)?;
     }
     Ok(total)
 }
@@ -254,7 +260,7 @@ mod tests {
         let search = Mutex::new(SearchIndex::open(tmp.path().join("ft").as_path()).unwrap());
 
         let fix = fixture("simple.warc.gz");
-        index_warc(&fix, &fix, &store, &search).unwrap();
+        index_warc(&fix, &fix, None, &store, &search).unwrap();
 
         let results = store
             .query("http://example.com/", crate::cdx::MatchType::Exact, None, None, 10)
@@ -274,7 +280,7 @@ mod tests {
         let search = Mutex::new(SearchIndex::open(tmp.path().join("ft").as_path()).unwrap());
 
         let fix = fixture("simple.warc.gz");
-        index_warc(&fix, &fix, &store, &search).unwrap();
+        index_warc(&fix, &fix, None, &store, &search).unwrap();
         search.into_inner().unwrap().commit().unwrap();
 
         let idx = crate::search::SearchIndex::open(tmp.path().join("ft").as_path()).unwrap();
@@ -314,15 +320,20 @@ mod tests {
         let fix = fixture("simple.wacz");
         index_wacz(&fix, &store, &search).unwrap();
 
-        // warc_path in CDX records should be the WACZ path, not a tempfile path
+        // warc_path in CDX records should be "{wacz_abs_path}\x1e{inner_warc_name}"
         let results = store
             .query("http://example.com/", crate::cdx::MatchType::Exact, None, None, 10)
             .unwrap();
         assert!(!results.is_empty());
         let warc_path = &results[0].warc_path;
+        let (outer, inner) = warc_path.split_once('\x1e').expect("should have separator");
         assert!(
-            warc_path.ends_with("simple.wacz"),
-            "warc_path should be the wacz path, got: {warc_path}"
+            outer.ends_with("simple.wacz"),
+            "outer path should be the wacz path, got: {outer}"
+        );
+        assert!(
+            inner.ends_with(".warc.gz"),
+            "inner path should be a warc.gz entry name, got: {inner}"
         );
     }
 

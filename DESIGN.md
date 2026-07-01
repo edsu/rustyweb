@@ -124,14 +124,16 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index [--index-dir <DIR>] [--name <NAME>] [--jobs <N>] <PATH>...
-rustyweb serve [--index-dir <DIR>] [--bind <ADDR>] [--port <PORT>]
-rustyweb check [--index-dir <DIR>]
+rustyweb index  [--index-dir <DIR>] [--name <NAME>] [--jobs <N>] <PATH>...
+rustyweb serve  [--index-dir <DIR>] [--bind <ADDR>] [--port <PORT>]
+rustyweb check  [--index-dir <DIR>]
+rustyweb lookup [--index-dir <DIR>] <URL>
 ```
 
 - `index`: accepts `.warc`, `.warc.gz`, `.wacz`, or directories (recursive scan). Default index dir: `./rustyweb-index`. `--name` sets the collection display name (defaults to filename stem). Updates `collections.json` after indexing.
 - `serve`: opens Fjall + Tantivy read-only, starts Axum server. Defaults: `127.0.0.1:8080`.
 - `check`: reads `collections.json`, re-hashes each registered file, and reports which files are present/missing/modified. Does not run on startup — called explicitly.
+- `lookup`: applies the same three-level CDX lookup (exact → fuzzy → prefix) against the index and prints all matching records with their WARC location. Useful for debugging replay 404s.
 - Incremental indexing is safe: Fjall inserts overwrite duplicate keys; Tantivy uses `surt_url + timestamp` as a deduplication ID.
 
 ---
@@ -319,36 +321,73 @@ WARC files pair `request` + `response` records by `WARC-Concurrent-To` headers. 
 
 ## Fuzzy URL Matching
 
-When a CDX request returns no results, rustyweb falls back to a fuzzy match: strip ephemeral query parameters from the URL, recompute SURT, and do a prefix scan.
+Fuzzy matching happens at two distinct layers in the replay stack, and it is important to understand where each layer operates.
 
-### URL normalization rules
+### Layer 1 — wabac.js client-side (IndexedDB)
 
-| Category | Parameters stripped |
-|---|---|
-| Analytics | `utm_*` (any parameter starting with `utm_`) |
-| Ad tracking | `fbclid`, `gclid`, `msclkid`, `dclid`, `yclid` |
-| Cache-busting | `_`, `cb`, `_cb`, `_ts`, `nocache`, `bust` |
-| JSONP | `_callback`, `_jsonp`, `callback` |
-| Session IDs | `sessionid`, `session_id`, `jsessionid`, `phpsessid` |
+wabac.js **does not call the rustyweb CDX API** for resource lookups during replay. Instead it:
 
-After stripping, remaining params are sorted alphabetically for consistent matching.
+1. Loads the CDX index from inside the WACZ file (the `indexes/` directory) when the collection is first opened.
+2. Stores all CDX records in a browser-side **IndexedDB** database.
+3. On every resource request, performs the CDX lookup locally against that database.
+4. Only after finding a record does it issue a byte-range request to `GET /files/{id}` to retrieve the actual WARC bytes.
 
-Per-domain rules can be added via an optional `rules.yaml` config (modeled on [pywb's rules.yaml](https://github.com/webrecorder/pywb/blob/main/pywb/rules.yaml)).
+The rustyweb `GET /cdx/search/cdx` endpoint is used by the viewer page to find the collection ID and build the initial replay URL — it is **not** used per-resource during replay.
 
-### Fallback logic
+#### wabac.js fuzzy rules
+
+wabac.js ships ~168 built-in fuzzy rules (`src/fuzzymatcher.ts`, `DEFAULT_RULES`). When an exact URL lookup fails:
+
+1. The URL is tested against each rule's `match` regex.
+2. If a rule matches, a `fuzzyCanonUrl` is computed (e.g. strip everything after a query separator).
+3. A **prefix scan** is performed against IndexedDB for all captures starting with that canonical prefix.
+4. Results are **scored** by comparing query parameters numerically and textually (Levenshtein distance); the highest-scoring capture wins.
+
+Key rule for media assets:
+
+```typescript
+// strips query string from common media extensions
+{ match: /(\.(?:js|webm|mp4|gif|jpg|png|css|json|m3u8))\?.*/i, replace: "$1", maxResults: 2 }
+```
+
+**Gap**: this rule lists `.jpg` but not `.jpeg`. URLs ending in `.jpeg?w=50` receive no client-side fuzzy treatment and fall through to the network (and therefore to the rustyweb backend).
+
+### Layer 2 — rustyweb `ir_resource_inner` backend
+
+When the wabac.js service worker cannot find a resource in its local IndexedDB, or when byte-range serving fails, the browser falls through to the network. For URLs that wabac.js has already rewritten to the form `http://host/replay/{id}/{ts}{mod}/{url}`, this means rustyweb's `replay_handler` receives the request.
+
+#### Query-string capture problem
+
+HTTP parses the first `?` as the query string delimiter. A browser request for:
 
 ```
-fn cdx_lookup(url, params, fjall) -> Vec<CdxRecord> {
-    let results = fjall_query(to_surt(url), params);
-    if !results.is_empty() { return results; }
-
-    let normalized = normalize_url_fuzzy(url);
-    if normalized != url {
-        return fjall_query(to_surt(&normalized), &prefix_params);
-    }
-    vec![]
-}
+GET /replay/8efb2ac7/20260609213407im_/https://cdn.example.com/img.jpeg?w=50
 ```
+
+arrives at Axum with:
+- **path** `{*path}` = `8efb2ac7/20260609213407im_/https://cdn.example.com/img.jpeg`  (no `?w=50`)
+- **query** = `w=50`
+
+Axum's `{*path}` wildcard captures only the path component, so `?w=50` is silently dropped unless explicitly extracted with `RawQuery`. The inner URL reconstructed from the path alone is `https://cdn.example.com/img.jpeg`, which has no query string.
+
+The handler must extract `RawQuery` and re-attach it to the inner URL before CDX lookup.
+
+#### Three-level fallback in `ir_resource_inner`
+
+```
+1. Exact match:    CDX lookup for the full reconstructed URL (with query string)
+2. Scheme flip:    retry with http:// if https:// returned nothing
+3. Fuzzy strip:    normalize_url_fuzzy() — removes tracking params, sorts the rest
+4. Prefix match:   strip the entire query string; scan CDX prefix
+                   → picks the result closest in timestamp to the requested ts
+                   → handles ?w=50 → {?w=20, ?w=800} and similar CDN size variants
+```
+
+The prefix match (step 4) runs whether or not the URL originally had a query string, because the inner URL may arrive without one (query was stripped by Axum). This ensures that `.jpeg` files, and any other URL where the archived version differs in query parameters from what the browser requests, are served correctly.
+
+### CDX API fuzzy fallback
+
+The `GET /cdx/search/cdx` endpoint has its own simpler fuzzy fallback for the viewer's initial page lookup: when an exact match returns no results, `normalize_url_fuzzy` is applied and the query retried. This is sufficient for the CDX API use case (finding the top-level page) and does not need the full prefix-match treatment.
 
 ---
 

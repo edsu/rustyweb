@@ -84,7 +84,12 @@ fn collect_records_gz(path: &Path) -> Result<Vec<Result<WarcRecord>>> {
             if buf.is_empty() {
                 break;
             }
-            if !(buf[0] == 0x1f && buf.get(1) == Some(&0x8b)) {
+            // Only bail on a byte that is definitively not the gzip magic 0x1f.
+            // fill_buf() may return just 1 byte (0x1f) after an into_inner() +
+            // stream_position() pair discards the buffer; in that case buf.get(1)
+            // would be None, falsely triggering the old two-byte check and stopping
+            // 142 records short. Let GzDecoder validate the full header instead.
+            if buf[0] != 0x1f {
                 tracing::debug!(
                     "stopping at non-gzip byte 0x{:02x} in {}",
                     buf[0],
