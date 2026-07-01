@@ -339,8 +339,12 @@ fn index_real_wacz_searchable() {
     let tmp = make_index(&["a.wacz"]);
     let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
     let results = idx.search("Britain", 10).unwrap();
-    assert!(!results.is_empty(), "real wacz HTML title should be searchable");
-    assert!(results[0].url.contains("storymaps.arcgis.com"));
+    assert!(!results.is_empty(), "real wacz should be searchable for a term in its title/text");
+    // The storymaps page (title "2Tone: The Sound of Britain") should be among the hits.
+    assert!(
+        results.iter().any(|r| r.url == REAL_URL),
+        "the storymaps page should be a result"
+    );
 }
 
 #[test]
@@ -348,6 +352,30 @@ fn index_real_wacz_has_correct_url() {
     let tmp = make_index(&["a.wacz"]);
     let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
     let results = idx.search("Britain", 10).unwrap();
-    let page = results.iter().find(|r| r.doc_type == "page").unwrap();
-    assert_eq!(page.url, REAL_URL);
+    assert!(
+        results.iter().any(|r| r.doc_type == "page" && r.url == REAL_URL),
+        "a page document for the storymaps URL should exist"
+    );
+}
+
+#[test]
+fn index_real_wacz_indexes_rendered_text() {
+    // The storymaps page is a Next.js SPA: its raw HTML body is nearly empty, so
+    // before urn:text indexing only the title was searchable. Browsertrix's
+    // urn:text record carries the fully rendered text (author name, body prose),
+    // which we now index. "Scout Butler" (the author) appears only there.
+    let tmp = make_index(&["a.wacz"]);
+    let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
+    let results = idx.search("\"Scout Butler\"", 10).unwrap();
+    assert!(
+        !results.is_empty(),
+        "rendered-text-only phrase should be searchable via the urn:text record"
+    );
+    let hit = &results[0];
+    assert_eq!(hit.doc_type, "page");
+    assert!(
+        hit.snippet.contains("Scout") || hit.snippet.contains("Butler"),
+        "snippet should highlight the matched rendered text: {}",
+        hit.snippet
+    );
 }

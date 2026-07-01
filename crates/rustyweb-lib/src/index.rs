@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -106,7 +107,39 @@ fn build_collection_body(meta: &crate::wacz::WaczMetadata) -> String {
     parts.join(" ")
 }
 
+/// A raw contribution to a page's search document, parsed from one WARC record.
+enum RawRecord {
+    /// An HTML response: source of the page title and a scraped-text fallback body.
+    Html {
+        url: String,
+        timestamp: String,
+        title: String,
+        body: String,
+    },
+    /// A `urn:text:` resource record: Browsertrix's fully rendered (post-JS)
+    /// page text. Richer than scraped HTML, especially for SPAs.
+    Text {
+        url: String,
+        timestamp: String,
+        text: String,
+    },
+}
+
+/// Accumulated per-URL data merged from all WARC records for that page.
+#[derive(Default)]
+struct MergedPage {
+    timestamp: String,
+    title: Option<String>,
+    html_body: Option<String>,
+    rendered_text: Option<String>,
+}
+
 /// Index all WARC entries inside a WACZ file into the Tantivy full-text index.
+///
+/// Records are collected across every inner WARC (rendered `urn:text:` records
+/// often live in a separate WARC from the HTML response), merged into one
+/// document per URL, and indexed once. The body prefers Browsertrix's rendered
+/// text and falls back to scraped HTML; the title comes from the HTML.
 fn index_wacz(
     wacz_path: &Path,
     collection_id: &str,
@@ -117,37 +150,100 @@ fn index_wacz(
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("listing WARC entries in {}", wacz_path.display()))?;
 
-    let page_count: u64 = warc_paths
+    let per_warc: Vec<Vec<RawRecord>> = warc_paths
         .par_iter()
         .map(|entry_name| {
             let tmp = extract_warc_from_wacz(wacz_path, entry_name)
                 .with_context(|| format!("extracting {} from {}", entry_name, wacz_path.display()))?;
-            index_warc_for_search(tmp.path(), collection_id, collection_name, search)
+            collect_page_records(tmp.path())
         })
-        .try_reduce(|| 0u64, |a, b| Ok(a + b))?;
+        .collect::<Result<Vec<_>>>()?;
 
-    info!(pages = page_count, wacz = %wacz_path.display(), "indexed pages from WACZ");
+    // Merge all records into one entry per URL.
+    let mut pages: HashMap<String, MergedPage> = HashMap::new();
+    for raw in per_warc.into_iter().flatten() {
+        match raw {
+            RawRecord::Html { url, timestamp, title, body } => {
+                let e = pages.entry(url).or_default();
+                // The HTML capture is the authoritative timestamp for replay.
+                e.timestamp = timestamp;
+                if !title.is_empty() {
+                    e.title = Some(title);
+                }
+                if !body.is_empty() {
+                    e.html_body = Some(body);
+                }
+            }
+            RawRecord::Text { url, timestamp, text } => {
+                let e = pages.entry(url).or_default();
+                if e.timestamp.is_empty() {
+                    e.timestamp = timestamp;
+                }
+                e.rendered_text = Some(text);
+            }
+        }
+    }
+
+    let mut count = 0u64;
+    {
+        let mut s = search.lock().unwrap();
+        for (url, m) in pages {
+            // Prefer the fully rendered text; fall back to scraped HTML.
+            let body = m.rendered_text.or(m.html_body).unwrap_or_default();
+            let title = m.title.unwrap_or_default();
+            if title.is_empty() && body.is_empty() {
+                continue;
+            }
+            s.index_page(&url, &m.timestamp, &title, &body, collection_id, collection_name)?;
+            count += 1;
+        }
+    }
+
+    info!(pages = count, wacz = %wacz_path.display(), "indexed pages from WACZ");
     Ok(())
 }
 
-/// Parse an extracted WARC file and add HTML pages to the Tantivy index.
-/// Returns the number of HTML pages indexed.
-fn index_warc_for_search(
-    warc_path: &Path,
-    collection_id: &str,
-    collection_name: &str,
-    search: &Mutex<SearchIndex>,
-) -> Result<u64> {
+/// Parse an extracted WARC file into raw per-record contributions (HTML
+/// responses and `urn:text:` rendered-text resources). Other record types
+/// (images, JS, CSS, redirects, other `urn:` pseudo-records) are ignored.
+fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
     let records: Vec<WarcRecord> = iter_records(warc_path)
         .with_context(|| format!("reading {}", warc_path.display()))?
         .collect::<Result<Vec<_>>>()?;
 
-    let mut count = 0u64;
+    let mut out = Vec::new();
     for record in &records {
-        if !record.warc_type.eq_ignore_ascii_case("response") {
+        let uri = record.target_uri.as_str();
+        if uri.is_empty() || uri.starts_with("dns:") {
             continue;
         }
-        if record.target_uri.is_empty() || record.target_uri.starts_with("dns:") {
+
+        // Browsertrix stores fully rendered page text as a `urn:text:<url>`
+        // resource record (WARC-Type: resource, not response). Map it back to
+        // the real URL and use its plain-text payload as the body.
+        if let Some(real_url) = uri.strip_prefix("urn:text:") {
+            if record.payload.is_empty() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&record.payload).trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            out.push(RawRecord::Text {
+                url: real_url.to_string(),
+                timestamp: record.timestamp.clone(),
+                text,
+            });
+            continue;
+        }
+
+        // Skip other urn: pseudo-records (pageinfo, thumbnail, view, ...).
+        if uri.starts_with("urn:") {
+            continue;
+        }
+
+        // HTML responses give us the title and a scraped-text fallback body.
+        if !record.warc_type.eq_ignore_ascii_case("response") {
             continue;
         }
         let mime = record.content_type.to_ascii_lowercase();
@@ -158,18 +254,15 @@ fn index_warc_for_search(
         if title.is_empty() && body.is_empty() {
             continue;
         }
-        search.lock().unwrap().index_page(
-            &record.target_uri,
-            &record.timestamp,
-            &title,
-            &body,
-            collection_id,
-            collection_name,
-        )?;
-        count += 1;
+        out.push(RawRecord::Html {
+            url: uri.to_string(),
+            timestamp: record.timestamp.clone(),
+            title,
+            body,
+        });
     }
 
-    Ok(count)
+    Ok(out)
 }
 
 /// Strip archive extensions to get a clean display name.
