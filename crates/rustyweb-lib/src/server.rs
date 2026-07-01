@@ -42,6 +42,7 @@ pub fn router(index_dir: &Path) -> Result<Router> {
     let app = Router::new()
         .route("/", get(homepage))
         .route("/search", get(search_page))
+        .route("/collection/{id}", get(collection_page))
         .route("/files/{id}", get(serve_file))
         .route("/replay/viewer", get(replay_viewer))
         .route("/api/search", get(search_api))
@@ -135,18 +136,8 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 format!("<ul class=\"seeds\">{seed_links}</ul>")
             };
 
-            // Clicking the collection name opens it in the replay viewer.
-            // Land on the first seed page if we have one, otherwise let the
-            // component pick the collection's default entry point.
-            let name_enc = url_encode(&c.name);
-            let title_link = match c.seed_pages.first() {
-                Some(p) => format!(
-                    "/replay/viewer?source={source_enc}&url={}&ts={}&name={name_enc}",
-                    url_encode(&p.url),
-                    ts_to_14digit(&p.ts),
-                ),
-                None => format!("/replay/viewer?source={source_enc}&name={name_enc}"),
-            };
+            // The collection name links to its detail page.
+            let title_link = format!("/collection/{}", c.id);
             format!(
                 r#"<div class="card">
   <div class="card-header">
@@ -273,6 +264,7 @@ async fn search_page(
             });
 
             let col_name = html_escape(&r.collection_name);
+            let coll_id = html_escape(&r.collection_id);
             let url_enc = url_encode(&r.url);
             let name_enc = url_encode(&r.collection_name);
             let source_enc = url_encode(&source_for(&r.collection_id));
@@ -311,7 +303,7 @@ async fn search_page(
                      <div class=\"result-title\"><a href=\"{href}\">{title}</a></div>\
                      <div class=\"result-meta\">{url_display}{ts_display}</div>\
                      {snippet_html}\
-                     <div class=\"result-coll\">in <em>{col_name}</em></div>\
+                     <div class=\"result-coll\">in <a href=\"/collection/{coll_id}\"><em>{col_name}</em></a></div>\
                    </td>\
                    <td class=\"replay-col\">\
                      <a class=\"replay-btn\" href=\"{href}\">Replay →</a>\
@@ -385,6 +377,154 @@ async fn search_page(
     );
 
     (StatusCode::OK, [("content-type", "text/html; charset=utf-8")], html).into_response()
+}
+
+// ── Collection detail page ──────────────────────────────────────────────────
+
+async fn collection_page(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let collections = load_collections(&state);
+    let Some(c) = collections.iter().find(|c| c.id == id) else {
+        return (StatusCode::NOT_FOUND, "collection not found").into_response();
+    };
+
+    let name = html_escape(&c.name);
+    let source_enc = url_encode(&viewer_source(c));
+    let name_enc = url_encode(&c.name);
+    let source_disp = html_escape(&c.source.location());
+    let status = if c.is_present() {
+        "<span class=\"ok\">✓ present</span>"
+    } else {
+        "<span class=\"missing\">✗ missing</span>"
+    };
+    let description = c
+        .description
+        .as_deref()
+        .map(|d| format!("<p class=\"desc\">{}</p>", html_escape(d)))
+        .unwrap_or_default();
+    let crawl_row = c
+        .crawl_date
+        .as_deref()
+        .map(|d| format!("<tr><th>Crawled</th><td>{}</td></tr>", html_escape(d.get(..10).unwrap_or(d))))
+        .unwrap_or_default();
+    let indexed = c.date_indexed.get(..10).unwrap_or(&c.date_indexed);
+    let size = human_size(c.file_size);
+    let sha_short = c.sha256.get(..16).unwrap_or(&c.sha256);
+
+    // Replay button: first seed page, else the collection root.
+    let replay_href = match c.seed_pages.first() {
+        Some(p) => format!(
+            "/replay/viewer?source={source_enc}&url={}&ts={}&name={name_enc}",
+            url_encode(&p.url),
+            ts_to_14digit(&p.ts),
+        ),
+        None => format!("/replay/viewer?source={source_enc}&name={name_enc}"),
+    };
+
+    let pages: String = c
+        .seed_pages
+        .iter()
+        .map(|p| {
+            let title = p.title.as_deref().unwrap_or(&p.url);
+            let href = format!(
+                "/replay/viewer?source={source_enc}&url={}&ts={}&name={name_enc}",
+                url_encode(&p.url),
+                ts_to_14digit(&p.ts),
+            );
+            format!(
+                "<li><a href=\"{href}\">{}</a><div class=\"result-url\">{}</div></li>",
+                html_escape(title),
+                html_escape(&p.url),
+            )
+        })
+        .collect();
+    let pages_section = if pages.is_empty() {
+        "<p class=\"muted\">No pages are listed in this WACZ.</p>".to_string()
+    } else {
+        format!("<ul class=\"pages\">{pages}</ul>")
+    };
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{name} - rustyweb</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #222; }}
+    .top {{ display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; }}
+    .top a.home {{ font-size: 1.4rem; font-weight: bold; text-decoration: none; color: #222; }}
+    .search-form {{ display: flex; gap: 0.5rem; flex: 1; }}
+    .search-form input {{ flex: 1; padding: 0.5rem 0.8rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 4px; }}
+    .search-form button {{ padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; background: #0066cc; color: #fff; border: none; border-radius: 4px; }}
+    h1 {{ font-size: 1.6rem; margin: 0.3rem 0; }}
+    .desc {{ color: #444; margin: 0.5rem 0 1rem; }}
+    .replay-btn {{ display: inline-block; padding: 0.5rem 1rem; background: #0066cc; color: #fff; border-radius: 4px; text-decoration: none; margin-bottom: 1.5rem; }}
+    .replay-btn:hover {{ background: #0052a3; }}
+    table.meta {{ border-collapse: collapse; font-size: 0.9rem; margin-bottom: 2rem; }}
+    table.meta th {{ text-align: left; padding: 0.3rem 1rem 0.3rem 0; color: #666; font-weight: 600; vertical-align: top; white-space: nowrap; }}
+    table.meta td {{ padding: 0.3rem 0; }}
+    .mono {{ font-family: monospace; font-size: 0.85rem; word-break: break-all; }}
+    h2 {{ font-size: 1.1rem; border-bottom: 1px solid #eee; padding-bottom: 0.4rem; }}
+    ul.pages {{ list-style: none; padding: 0; }}
+    ul.pages li {{ padding: 0.5rem 0; border-bottom: 1px solid #f0f0f0; }}
+    ul.pages a {{ color: #1a0dab; font-size: 1.02rem; text-decoration: none; }}
+    ul.pages a:hover {{ text-decoration: underline; }}
+    .result-url {{ font-size: 0.8rem; color: #006621; margin-top: 0.1rem; }}
+    .ok {{ color: #2a7; }} .missing {{ color: #c33; }} .muted {{ color: #888; }}
+    a {{ color: #0066cc; }}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <a class="home" href="/">rustyweb</a>
+    <form class="search-form" action="/search" method="get">
+      <input type="search" name="q" placeholder="Search all collections…">
+      <button type="submit">Search</button>
+    </form>
+  </div>
+
+  <h1>{name}</h1>
+  {description}
+  <a class="replay-btn" href="{replay_href}">Replay →</a>
+
+  <table class="meta">
+    <tr><th>Source</th><td class="mono">{source_disp}</td></tr>
+    <tr><th>Size</th><td>{size}</td></tr>
+    <tr><th>SHA-256</th><td class="mono" title="{sha256}">{sha_short}…</td></tr>
+    {crawl_row}
+    <tr><th>Indexed</th><td>{indexed}</td></tr>
+    <tr><th>Status</th><td>{status}</td></tr>
+  </table>
+
+  <h2>Pages</h2>
+  {pages_section}
+</body>
+</html>"#,
+        sha256 = html_escape(&c.sha256),
+    );
+
+    (StatusCode::OK, [("content-type", "text/html; charset=utf-8")], html).into_response()
+}
+
+/// Format a byte count as a short human-readable size.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut b = bytes as f64;
+    let mut i = 0;
+    while b >= 1024.0 && i < UNITS.len() - 1 {
+        b /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{b:.1} {}", UNITS[i])
+    }
 }
 
 // ── File serving ──────────────────────────────────────────────────────────────

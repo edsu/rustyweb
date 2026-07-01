@@ -316,6 +316,54 @@ async fn homepage_shows_collection_name() {
 }
 
 #[tokio::test]
+async fn homepage_card_links_to_collection_page() {
+    let tmp = make_index(&["simple.wacz"]);
+    let manifest = rustyweb_lib::collections::CollectionManifest::open(tmp.path()).unwrap();
+    let id = manifest.collections[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    let resp = app.oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains(&format!("href=\"/collection/{id}\"")),
+        "homepage card title should link to the collection page"
+    );
+}
+
+#[tokio::test]
+async fn collection_page_shows_metadata_and_pages() {
+    let tmp = make_index(&["a.wacz"]);
+    let manifest = rustyweb_lib::collections::CollectionManifest::open(tmp.path()).unwrap();
+    let id = manifest.collections[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let resp = app
+        .oneshot(Request::get(format!("/collection/{id}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(html.contains("SHA-256"), "should show fixity metadata");
+    assert!(html.contains("Replay"), "should have a replay button");
+    assert!(html.contains("Pages"), "should have a pages section");
+    // a.wacz's seed page (title "2Tone: The Sound of Britain").
+    assert!(html.contains("2Tone"), "should list the WACZ's pages");
+}
+
+#[tokio::test]
+async fn collection_page_unknown_id_404() {
+    let tmp = TempDir::new().unwrap();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    let resp = app
+        .oneshot(Request::get("/collection/deadbeef").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn homepage_empty_collections() {
     let tmp = TempDir::new().unwrap();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
