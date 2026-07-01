@@ -109,6 +109,9 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_ansi(true)
+        // Logs go to stderr so stdout can carry data (and be silenced during
+        // indexing to hide third-party PDF extraction noise).
+        .with_writer(std::io::stderr)
         .event_format(ColorLineFormat::default())
         .init();
 
@@ -123,7 +126,14 @@ async fn main() -> Result<()> {
                     progress = format!("{}/{}", i + 1, total),
                     "indexing"
                 );
-                rustyweb_lib::index::index_location(location, &index_dir, name.as_deref())?;
+                // pdf-extract prints font/glyph diagnostics straight to stdout
+                // (e.g. "unknown glyph name '.notdef' ...") that can't be
+                // filtered by log level. Silence stdout while indexing runs;
+                // our logs are on stderr and are unaffected.
+                let quiet = gag::Gag::stdout().ok();
+                let result = rustyweb_lib::index::index_location(location, &index_dir, name.as_deref());
+                drop(quiet);
+                result?;
             }
             tracing::info!("indexing complete");
         }
