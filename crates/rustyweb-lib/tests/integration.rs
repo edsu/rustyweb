@@ -235,7 +235,7 @@ async fn viewer_wires_up_replay_web_page() {
 
     assert!(html.contains("replay-web-page"), "viewer must mount the component");
     // Absolute replaybase is what makes the service worker resolve to
-    // /replay/sw.js rather than /replay/replay/sw.js — the bug we hit.
+    // /replay/sw.js rather than /replay/replay/sw.js - the bug we hit.
     assert!(html.contains("replaybase"), "viewer must set replaybase");
     assert!(html.contains("/replay/"), "replaybase should be the absolute /replay/ path");
     assert!(html.contains("rwp-url-change"), "viewer should track navigation for the banner");

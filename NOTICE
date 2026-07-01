@@ -11,7 +11,7 @@ THIRD-PARTY COMPONENTS
 ======================
 
 rustyweb bundles and serves software from the Webrecorder project. Webrecorder
-did the hard part — the actual web archive replay — and rustyweb would not exist
+did the hard part - the actual web archive replay - and rustyweb would not exist
 without it. These components are included unmodified and remain under their own
 license:
 

@@ -201,7 +201,7 @@ fn run_verify(index_dir: &std::path::Path) -> Result<bool> {
             }
             Ok(hash) => {
                 println!(
-                    "MODIFIED  {} ({}) — expected {}… got {}…",
+                    "MODIFIED  {} ({}) - expected {}… got {}…",
                     col.name,
                     col.path.display(),
                     short_hash(&col.sha256),
@@ -210,7 +210,7 @@ fn run_verify(index_dir: &std::path::Path) -> Result<bool> {
                 modified += 1;
             }
             Err(e) => {
-                println!("ERROR     {} ({}) — {e}", col.name, col.path.display());
+                println!("ERROR     {} ({}) - {e}", col.name, col.path.display());
                 missing += 1;
             }
         }

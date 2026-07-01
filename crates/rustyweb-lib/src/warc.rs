@@ -88,7 +88,7 @@ fn collect_records_gz(path: &Path) -> Result<Vec<Result<WarcRecord>>> {
         let offset = reader.stream_position()?;
 
         // bufread::GzDecoder takes ownership of the BufReader and returns it
-        // via into_inner() — leaving it positioned right after the member's
+        // via into_inner() - leaving it positioned right after the member's
         // compressed footer, so the next member starts cleanly.
         let mut gz = flate2::bufread::GzDecoder::new(reader);
         let mut decompressed = Vec::new();

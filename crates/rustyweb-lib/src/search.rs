@@ -41,7 +41,7 @@ impl SearchIndex {
     ///
     /// Tantivy applies a delete only to documents committed before it, so the
     /// caller should `delete_collection()` first, then `index_page()` /
-    /// `index_collection()`, then `commit()` — the fresh documents survive.
+    /// `index_collection()`, then `commit()` - the fresh documents survive.
     pub fn delete_collection(&mut self, collection_id: &str) {
         let field = self.index.schema().get_field(FIELD_COLLECTION_ID).unwrap();
         self.writer

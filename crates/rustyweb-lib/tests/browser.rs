@@ -30,7 +30,7 @@ fn fixture(name: &str) -> std::path::PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a running WebDriver (chromedriver) and browser; run with --ignored"]
 async fn browser_renders_archived_page() {
-    // 1. Index a.wacz — a real Browsertrix capture of an ArcGIS StoryMaps page
+    // 1. Index a.wacz - a real Browsertrix capture of an ArcGIS StoryMaps page
     //    ("2Tone: The Sound of Britain"). We use a real WACZ, not a hand-rolled
     //    fixture, because wabac.js requires a standard CDXJ index; the minimal
     //    simple.wacz fixture uses a non-standard CDX that wabac can't read.
@@ -62,7 +62,7 @@ async fn browser_renders_archived_page() {
     caps.add_arg("--disable-dev-shm-usage").unwrap();
     let driver = WebDriver::new(&wd, caps)
         .await
-        .expect("connect to WebDriver — is `chromedriver --port=9515` running?");
+        .expect("connect to WebDriver - is `chromedriver --port=9515` running?");
 
     // 4. Drive the viewer and assert the archived page rendered. Always tear
     //    down the browser session and server, even on failure.
@@ -80,7 +80,7 @@ async fn drive_and_check(driver: &WebDriver, addr: SocketAddr, id: &str) -> Resu
     );
     driver.goto(&url).await.map_err(|e| e.to_string())?;
 
-    // The banner is rendered by our own viewer JS immediately — a quick sanity
+    // The banner is rendered by our own viewer JS immediately - a quick sanity
     // check that the viewer page itself loaded (it shows the current URL).
     if !deep_contains(driver, "storymaps.arcgis.com").await? {
         return Err("viewer banner (current URL) did not appear".into());

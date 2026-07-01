@@ -1,6 +1,6 @@
-# rustyweb — Design Document
+# rustyweb - Design Document
 
-rustyweb is a minimal, high-performance web archive server written in Rust. It provides full-text search over WACZ collections and serves them for in-browser replay via the ReplayWebPage/wabac.js service worker in **WACZ-direct mode** — the mode where the browser reads the archive directly, without a server-side proxy interpreting individual resource requests.
+rustyweb is a minimal, high-performance web archive server written in Rust. It provides full-text search over WACZ collections and serves them for in-browser replay via the ReplayWebPage/wabac.js service worker in **WACZ-direct mode** - the mode where the browser reads the archive directly, without a server-side proxy interpreting individual resource requests.
 
 Scope:
 - Index WACZ files into a local full-text search index
@@ -26,7 +26,7 @@ rustyweb index <files>                  rustyweb serve
                                               └── GET /replay/viewer → viewer shell
 ```
 
-Replay is handled entirely by the wabac.js service worker running in the browser. The service worker reads the WACZ file from `GET /files/{id}` using HTTP byte-range requests, extracts the CDX index from `indexes/index.cdx.gz` inside the ZIP, loads it into browser IndexedDB, and fetches individual WARC records by offset — all without making per-resource requests back to the rustyweb server. rustyweb's job during replay is purely to serve bytes efficiently.
+Replay is handled entirely by the wabac.js service worker running in the browser. The service worker reads the WACZ file from `GET /files/{id}` using HTTP byte-range requests, extracts the CDX index from `indexes/index.cdx.gz` inside the ZIP, loads it into browser IndexedDB, and fetches individual WARC records by offset - all without making per-resource requests back to the rustyweb server. rustyweb's job during replay is purely to serve bytes efficiently.
 
 ---
 
@@ -36,18 +36,18 @@ Replay is handled entirely by the wabac.js service worker running in the browser
 rustyweb/
 ├── Cargo.toml               (workspace root with [workspace.dependencies])
 ├── crates/
-│   ├── rustyweb-lib/        (all logic — importable in tests)
+│   ├── rustyweb-lib/        (all logic - importable in tests)
 │   │   └── src/
 │   │       ├── lib.rs
-│   │       ├── index.rs     — Indexing pipeline orchestration
-│   │       ├── search.rs    — Tantivy schema, indexing, query execution, snippets
-│   │       ├── server.rs    — Axum router and all HTTP handlers
-│   │       ├── collections.rs — Collection manifest (collections.json)
-│   │       ├── warc.rs      — WARC record iteration and HTML extraction
-│   │       └── wacz.rs      — WACZ ZIP handling, datapackage.json, CDX reader
+│   │       ├── index.rs     - Indexing pipeline orchestration
+│   │       ├── search.rs    - Tantivy schema, indexing, query execution, snippets
+│   │       ├── server.rs    - Axum router and all HTTP handlers
+│   │       ├── collections.rs - Collection manifest (collections.json)
+│   │       ├── warc.rs      - WARC record iteration and HTML extraction
+│   │       └── wacz.rs      - WACZ ZIP handling, datapackage.json, CDX reader
 │   └── rustyweb-bin/        (thin CLI entry point)
-│       └── src/main.rs      — Clap CLI, subcommand dispatch, tokio::main
-└── static/replay/           (ReplayWebPage assets — embedded at compile time)
+│       └── src/main.rs      - Clap CLI, subcommand dispatch, tokio::main
+└── static/replay/           (ReplayWebPage assets - embedded at compile time)
 ```
 
 ---
@@ -63,7 +63,7 @@ rustyweb verify     [--index-dir <DIR>]
 
 - `index`: accepts `.wacz` files or directories (recursive scan). Extracts page HTML for full-text indexing, reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. Default index dir: `./index`.
 - `serve`: opens Tantivy read-only, starts Axum. Defaults: `127.0.0.1:8080`.
-- `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging — does not require the CDX to be separately indexed.
+- `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
 - `verify`: re-hashes every WACZ in `collections.json` and compares against the stored SHA-256, reporting each collection as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
 
 ---
@@ -89,9 +89,9 @@ Two document types share the same index, distinguished by `doc_type`.
 |---|---|---|---|---|
 | `doc_type` | STRING | ✓ | exact | `"page"` or `"collection"` |
 | `collection_id` | STRING | ✓ | exact | Short collection hash (e.g. `e02536ec`) |
-| `collection_name` | STRING | ✓ | — | Human-readable collection name |
+| `collection_name` | STRING | ✓ | - | Human-readable collection name |
 | `url` | STRING | ✓ | exact | Page URL (empty for collection docs) |
-| `timestamp` | STRING | ✓ | — | 14-digit crawl timestamp |
+| `timestamp` | STRING | ✓ | - | 14-digit crawl timestamp |
 | `title` | TEXT | ✓ | BM25 | Page title or collection name |
 | `body` | TEXT | ✓ | BM25 | Page body text or collection description + seed URLs |
 
@@ -124,10 +124,10 @@ The server renders these `<b>` tags in the search results HTML; CSS applies a hi
 `datapackage.json` inside each WACZ (WACZ spec §4) is read at index time and stored in `collections.json` alongside the existing file metadata.
 
 Fields extracted:
-- `title` — collection display name (falls back to filename stem)
-- `description` — free-text description
-- `created` — ISO 8601 crawl date
-- Seed pages — first 3–5 entries from the `pages` array (url, title, timestamp)
+- `title` - collection display name (falls back to filename stem)
+- `description` - free-text description
+- `created` - ISO 8601 crawl date
+- Seed pages - first 3–5 entries from the `pages` array (url, title, timestamp)
 
 The homepage displays this metadata per collection, giving users a preview of what each archive contains before searching or replaying.
 
@@ -135,7 +135,7 @@ The homepage displays this metadata per collection, giving users a preview of wh
 
 ## Collection Management
 
-`{index_dir}/collections.json` — written/updated by `rustyweb index`, read by `rustyweb serve`.
+`{index_dir}/collections.json` - written/updated by `rustyweb index`, read by `rustyweb serve`.
 
 ```json
 [
@@ -155,9 +155,9 @@ The homepage displays this metadata per collection, giving users a preview of wh
 ]
 ```
 
-- `id`: first 8 hex chars of SHA-256 of the absolute path — stable as long as the file doesn't move
+- `id`: first 8 hex chars of SHA-256 of the absolute path - stable as long as the file doesn't move
 - Re-indexing the same path upserts the entry
-- `GET /files/{id}` only serves files registered in `collections.json` — arbitrary filesystem access is not possible
+- `GET /files/{id}` only serves files registered in `collections.json` - arbitrary filesystem access is not possible
 
 ---
 
@@ -193,7 +193,7 @@ In WACZ-direct mode the component reads the WACZ from `/files/{id}` via byte-ran
 3. Parses each CDXJ line (space-separated SURT + timestamp + JSON fields)
 4. Matches lines by URL equality or SURT prefix
 
-This is intentionally lazy — no persistent CDX index is maintained by rustyweb. The WACZ's built-in CDX is authoritative; rustyweb simply reads it when asked.
+This is intentionally lazy - no persistent CDX index is maintained by rustyweb. The WACZ's built-in CDX is authoritative; rustyweb simply reads it when asked.
 
 ---
 
@@ -218,14 +218,14 @@ Parallelism: Rayon parallel iterator over the WARC member list within each WACZ.
 
 ## ReplayWebPage Assets
 
-`static/replay/` holds the ReplayWebPage JS bundle, embedded at compile time via `rust-embed`. The directory is **not committed** — a script downloads from npm before building.
+`static/replay/` holds the ReplayWebPage JS bundle, embedded at compile time via `rust-embed`. The directory is **not committed** - a script downloads from npm before building.
 
 ```sh
 ./scripts/fetch-replay.sh          # download latest
 ./scripts/fetch-replay.sh 2.4.0   # pin a version
 ```
 
-The script downloads `ui.js` and `sw.js` from the ReplayWebPage GitHub release. Builds are reproducible without network access — users run the script once on setup and re-run to upgrade.
+The script downloads `ui.js` and `sw.js` from the ReplayWebPage GitHub release. Builds are reproducible without network access - users run the script once on setup and re-run to upgrade.
 
 ---
 
