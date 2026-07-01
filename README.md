@@ -1,5 +1,9 @@
 # rustyweb
 
+**Note bene**: *this tool has been written with Claude Code. Like any piece of software it may contain bugs, and while the software was designed through several iterations and abandoned prototypes, the developer's understanding of how it operates at a low level may be limited. See the DESIGN.md document for the overall approach that was used. Technical reviews of the code and design are always welcome!*
+
+---
+
 **rustyweb** is a small, fast web archive server written in Rust. Point it at a
 pile of [WACZ] files and it gives you:
 
@@ -88,6 +92,34 @@ rustyweb verify     [--index-dir <DIR>]
   `MISSING`. Exits non-zero if any collection fails, so it works in a cron job
   or CI. This is rustyweb's fixity check — a small guard against the archive
   quietly bit-rotting or being tampered with.
+
+## Testing
+
+```sh
+cargo test              # unit + integration tests (no browser needed)
+```
+
+Most tests run without a browser, including server-side *replay-contract* tests
+that assert what wabac.js depends on: the WACZ we serve is byte-identical to
+disk, byte-range requests return the correct slice, the served archive's CDX
+resolves a page, and the viewer wires up `<replay-web-page>` correctly.
+
+Actual replay rendering can only be checked in a real browser, so there's one
+`#[ignore]`d end-to-end test that drives headless Chrome via WebDriver and
+confirms an archived page renders from a WACZ we serve:
+
+```sh
+chromedriver --port=9515 &          # WebDriver server; must match your Chrome's major version
+cargo test -p rustyweb-lib --test browser -- --ignored
+```
+
+- Override the WebDriver endpoint with `WEBDRIVER_URL` (default
+  `http://localhost:9515`).
+- `chromedriver`'s major version must match your installed Chrome. If they
+  differ, grab a matching build from
+  [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/).
+- On macOS, a Homebrew `chromedriver` is quarantined and gets killed on launch;
+  clear it once with `xattr -d com.apple.quarantine $(which chromedriver)`.
 
 ## Why "rustyweb"?
 
