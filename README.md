@@ -26,6 +26,34 @@ separate database server.
 > serving. Webrecorder did the heavy lifting; please support them. See
 > [Credits](#credits).
 
+## Install
+
+rustyweb is a single self-contained binary. You need a
+[Rust toolchain](https://rustup.rs) (Rust 2021 / a recent stable compiler).
+
+### With cargo (recommended)
+
+```sh
+cargo install --git https://github.com/edsu/rustyweb --locked rustyweb
+```
+
+This builds and installs the `rustyweb` command into `~/.cargo/bin`. The
+ReplayWeb.page assets are embedded at build time, so there is nothing else to
+fetch or configure.
+
+### From a clone (for development)
+
+```sh
+git clone https://github.com/edsu/rustyweb
+cd rustyweb
+cargo build --release
+# binary at ./target/release/rustyweb
+```
+
+The bundled ReplayWeb.page assets are committed to the repo, so a fresh clone
+builds and runs as-is. To upgrade them later, run `./scripts/fetch-replay.sh`
+and rebuild.
+
 ## How it works
 
 rustyweb runs [ReplayWeb.page] in **WACZ-direct mode**. Rather than
@@ -57,25 +85,21 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 ## Quick start
 
-rustyweb embeds the ReplayWeb.page assets at compile time, so fetch them once
-before building:
-
-```sh
-./scripts/fetch-replay.sh        # downloads ui.js and sw.js into static/replay/
-cargo build --release
-```
-
-Index one or more WACZ files (or a directory of them), then serve:
+Index one or more WACZ files (or a directory of them, or an http(s) URL), then
+serve:
 
 ```sh
 # Index - writes a search index and collection manifest into ./index
-./target/release/rustyweb index my-archive.wacz
+rustyweb index my-archive.wacz
 
 # Serve - defaults to http://127.0.0.1:8080
-./target/release/rustyweb serve
+rustyweb serve
 ```
 
 Open <http://127.0.0.1:8080/>, search, and click a result to replay it.
+
+(If you built from a clone instead of installing, use `./target/release/rustyweb`
+in place of `rustyweb`.)
 
 Re-indexing the same WACZ is an upsert - safe to re-run any time to add or
 refresh collections.
