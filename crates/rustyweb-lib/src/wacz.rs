@@ -37,11 +37,24 @@ pub fn read_datapackage(wacz_path: &Path) -> Result<WaczMetadata> {
         .with_context(|| format!("reading ZIP {}", wacz_path.display()))?;
 
     // --- datapackage.json -------------------------------------------------
+    // Descriptive fields live at the top level in some WACZs and under a
+    // nested `metadata` object in others (e.g. Browsertrix). Read both, with
+    // the top level taking precedence.
+    #[derive(Deserialize, Default)]
+    struct Metadata {
+        title: Option<String>,
+        description: Option<String>,
+        created: Option<String>,
+        /// Epoch-millisecond modification time; a fallback for `created`.
+        mtime: Option<i64>,
+    }
     #[derive(Deserialize, Default)]
     struct DataPackage {
         title: Option<String>,
         description: Option<String>,
         created: Option<String>,
+        #[serde(default)]
+        metadata: Option<Metadata>,
     }
 
     let mut meta = WaczMetadata::default();
@@ -50,9 +63,13 @@ pub fn read_datapackage(wacz_path: &Path) -> Result<WaczMetadata> {
         let mut buf = String::new();
         entry.read_to_string(&mut buf)?;
         if let Ok(dp) = serde_json::from_str::<DataPackage>(&buf) {
-            meta.title = dp.title;
-            meta.description = dp.description;
-            meta.created = dp.created;
+            let nested = dp.metadata.unwrap_or_default();
+            meta.title = clean(dp.title.or(nested.title));
+            meta.description = clean(dp.description.or(nested.description));
+            meta.created = dp
+                .created
+                .or(nested.created)
+                .or_else(|| nested.mtime.and_then(millis_to_rfc3339));
         }
     }
 
@@ -86,6 +103,16 @@ pub fn read_datapackage(wacz_path: &Path) -> Result<WaczMetadata> {
     }
 
     Ok(meta)
+}
+
+/// Trim a metadata string and drop it if empty.
+fn clean(s: Option<String>) -> Option<String> {
+    s.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// Convert epoch milliseconds to an RFC 3339 timestamp string.
+fn millis_to_rfc3339(ms: i64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
 }
 
 /// Search a WACZ file's CDX index for records matching `url` (exact URL match).
@@ -297,6 +324,17 @@ mod tests {
         );
         assert_eq!(meta.seed_pages[0].url, "http://example.com/");
         assert_eq!(meta.seed_pages[0].title.as_deref(), Some("Example"));
+    }
+
+    #[test]
+    fn read_datapackage_reads_nested_metadata() {
+        // github-bitcoin-mining.wacz has no top-level title/created; its title
+        // lives under a nested `metadata` object, and the timestamp is mtime
+        // (epoch ms). Both should be picked up.
+        let meta = read_datapackage(&fixture("github-bitcoin-mining.wacz")).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("GitHub Bitcoin Mining"));
+        let created = meta.created.expect("created should fall back to mtime");
+        assert!(created.starts_with("2021-04-17"), "created from mtime: {created}");
     }
 
     #[test]
