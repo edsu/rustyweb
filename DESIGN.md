@@ -14,14 +14,18 @@ rustyweb is a minimal, high-performance web archive server written in Rust. It t
 ## Architecture Overview
 
 ```
-rustyweb index <files>           rustyweb serve
-       │                                │
-       ▼                                ▼
-  [Indexing pipeline]           [Axum HTTP server]
-       │                                │
-       ├── CDX records ──► Fjall        ├── GET /cdx/search/cdx ──► Fjall
-       └── HTML text ───► Tantivy       ├── GET /api/search ──────► Tantivy
-                                        ├── GET /warcreplay/* ─────► WARC files (seek by offset)
+rustyweb index <files>           rustyweb serve              rustyweb check
+       │                                │                           │
+       ▼                                ▼                           ▼
+  [Indexing pipeline]           [Axum HTTP server]        [Integrity check]
+       │                                │                     collections.json
+       ├── CDX records ──► Fjall        ├── GET /            → verify sha256
+       ├── HTML text ───► Tantivy       ├── GET /search?q=
+       └── manifest ────► collections   ├── GET /cdx/search/cdx ──► Fjall
+             .json        .json         ├── GET /api/search ──────► Tantivy
+                                        ├── GET /files/{id} ───────► registered archive file
+                                        ├── GET /replay/viewer
+                                        ├── GET /warcreplay/* ─────► WARC record (seek by offset)
                                         └── GET /replay/* ──────────► embedded ReplayWebPage assets
 ```
 
@@ -120,12 +124,14 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index [--index-dir <DIR>] [--jobs <N>] <PATH>...
+rustyweb index [--index-dir <DIR>] [--name <NAME>] [--jobs <N>] <PATH>...
 rustyweb serve [--index-dir <DIR>] [--bind <ADDR>] [--port <PORT>]
+rustyweb check [--index-dir <DIR>]
 ```
 
-- `index`: accepts `.warc`, `.warc.gz`, `.wacz`, or directories (recursive scan). Default index dir: `./rustyweb-index`.
+- `index`: accepts `.warc`, `.warc.gz`, `.wacz`, or directories (recursive scan). Default index dir: `./rustyweb-index`. `--name` sets the collection display name (defaults to filename stem). Updates `collections.json` after indexing.
 - `serve`: opens Fjall + Tantivy read-only, starts Axum server. Defaults: `127.0.0.1:8080`.
+- `check`: reads `collections.json`, re-hashes each registered file, and reports which files are present/missing/modified. Does not run on startup — called explicitly.
 - Incremental indexing is safe: Fjall inserts overwrite duplicate keys; Tantivy uses `surt_url + timestamp` as a deduplication ID.
 
 ---
@@ -134,10 +140,14 @@ rustyweb serve [--index-dir <DIR>] [--bind <ADDR>] [--port <PORT>]
 
 | Route | Handler |
 |---|---|
+| `GET /` | Homepage: search box + indexed collections table |
+| `GET /search?q=...` | Server-rendered fulltext search results + replay links |
+| `GET /files/{id}` | Stream a registered WARC or WACZ file by collection ID |
+| `GET /replay/viewer` | Replay viewer shell (reads `?source=&url=` params, mounts `<replay-web-page>`) |
 | `GET /replay/` | Serve ReplayWebPage HTML shell |
-| `GET /replay/*` | Serve embedded ReplayWebPage static assets (JS, CSS) |
+| `GET /replay/*` | Serve embedded ReplayWebPage static assets (JS, CSS, WASM) |
 | `GET /cdx/search/cdx` | IA-compatible CDX API → Fjall query |
-| `GET /api/search` | Fulltext search → Tantivy query |
+| `GET /api/search` | Fulltext search → Tantivy query (JSON) |
 | `GET /warcreplay/*` | Read raw WARC record at stored offset, stream HTTP response body |
 
 ### CDX API
@@ -152,6 +162,102 @@ Handler for `/warcreplay/*`:
 3. Decompress if `.warc.gz`
 4. Strip WARC headers (read past `\r\n\r\n`)
 5. Stream HTTP response body back via Axum streaming response
+
+---
+
+## Collection Management
+
+rustyweb is primarily an **index** over archive files, not a custody system. Files stay wherever the user put them; rustyweb tracks what it has indexed via a manifest and can serve registered files for replay.
+
+### Collections manifest
+
+`{index_dir}/collections.json` — written/updated by `rustyweb index`, read by `rustyweb serve` and `rustyweb check`.
+
+```json
+[
+  {
+    "id": "abc12345",
+    "path": "/data/archives/my-collection.wacz",
+    "name": "my-collection",
+    "kind": "wacz",
+    "date_indexed": "2026-07-01T00:00:00Z",
+    "record_count": 1247,
+    "file_size": 104857600,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb924..."
+  }
+]
+```
+
+- `id`: first 8 hex chars of SHA-256 of the absolute path — stable as long as the file doesn't move
+- `kind`: `"wacz"` or `"warc"` — drives how the replay viewer link is constructed
+- `sha256`: hash of the file contents computed once at index time
+- Re-indexing the same path upserts the entry (updates `record_count`, `date_indexed`, `sha256`)
+
+### Integrity checking
+
+Re-hashing a large WARC on every server startup would be too slow. Instead, `rustyweb check` is an explicit subcommand:
+
+```
+rustyweb check --index-dir ./rustyweb-index
+```
+
+It reads `collections.json`, re-hashes each file, and reports:
+- ✓ OK — file present, hash matches
+- ⚠ MISSING — file not found at registered path
+- ⚠ MODIFIED — file present but hash does not match
+
+The homepage shows a last-checked timestamp per collection if a check has been run.
+
+### File serving security
+
+`GET /files/{id}` only serves files that are registered in `collections.json`. It looks up the collection by `id`, retrieves the stored `path`, and streams the file. Arbitrary filesystem access is not possible.
+
+### Format philosophy
+
+- WACZ files are served whole — preserves producer-generated metadata (`datapackage.json`, `pages.jsonl`) and collection grouping
+- WARC files are served directly — ReplayWebPage accepts both WACZ and WARC via its `source=` attribute
+- No format conversion in either direction; if a user wants WARC metadata enriched, `py-wacz` is the right tool before ingest
+
+---
+
+## Homepage and Search UI
+
+All UI is server-rendered HTML with minimal inline CSS — no template engine dependency, no JavaScript framework.
+
+### Homepage (`GET /`)
+
+- Search box submitting to `GET /search?q=...`
+- "Indexed collections" table: name, file, record count, date indexed, integrity status
+
+### Search results (`GET /search?q=...`)
+
+- Queries Tantivy fulltext index
+- Each result row: title, URL, timestamp, **Replay** link
+- Replay link: `/replay/viewer?source=/files/{collection_id}&url={original_url}`
+- Collection ID resolved by matching `warc_path` in the search result against the manifest
+
+### Replay viewer (`GET /replay/viewer`)
+
+Static HTML page embedded at `static/replay/viewer.html`. Reads `source` and `url` from URL params, mounts:
+
+```html
+<replay-web-page source="..." url="..." embed="replayonly"></replay-web-page>
+```
+
+Requires real ReplayWebPage assets (see §ReplayWebPage Assets below).
+
+---
+
+## ReplayWebPage Assets
+
+`static/replay/` holds the ReplayWebPage JS bundle, embedded at compile time via `rust-embed`. The directory is **not committed** — a script downloads from npm before building.
+
+```sh
+./scripts/fetch-replay.sh          # download latest
+./scripts/fetch-replay.sh 2.4.0   # pin a version
+```
+
+The script downloads `ui.js` and `sw.js` directly from `https://replayweb.page/` (the project's GitHub Pages deployment — there is no versioned npm/jsDelivr distribution). Builds are reproducible without network access — users run the script once on setup and re-run to upgrade.
 
 ---
 
@@ -334,3 +440,10 @@ Fixture files in `crates/rustyweb-lib/tests/fixtures/`: `simple.warc.gz`, `post.
 12. Tantivy indexing — HTML extraction wired in
 13. `/api/search` route — `search_api_*` tests pass
 14. Rayon parallelism, structured logging, graceful shutdown
+15. `scripts/fetch-replay.sh` — download real ReplayWebPage assets
+16. Collection manifest — `collections.json` written on `rustyweb index`; fix WACZ `warc_path` bug
+17. `rustyweb check` subcommand — re-hash files, report integrity status
+18. `GET /files/{id}` route — serve registered WARC/WACZ files
+19. Homepage (`GET /`) — search box + collections table
+20. Search results page (`GET /search?q=`) — server-rendered HTML with replay links
+21. Replay viewer (`static/replay/viewer.html` + `GET /replay/viewer`) — mounts `<replay-web-page>`

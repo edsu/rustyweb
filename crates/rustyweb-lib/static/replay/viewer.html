@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Replay</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; }
+    iframe { width: 100%; height: 100%; border: none; display: block; }
+    #error { padding: 2rem; font-family: sans-serif; color: #c00; }
+  </style>
+</head>
+<body>
+  <iframe id="replay_iframe"></iframe>
+  <script>
+    (async function () {
+      const params = new URLSearchParams(window.location.search);
+      const source = params.get('source'); // e.g. /files/a926c132
+      const url    = params.get('url');
+      const ts     = params.get('ts') || '';
+
+      if (!source || !url) {
+        document.body.innerHTML =
+          '<div id="error">Missing <code>source</code> or <code>url</code> parameters.</div>';
+        return;
+      }
+
+      // Derive collection ID from source path (/files/{id} → {id})
+      // collName must equal the URL path segment after /replay/ so the SW's getColl() lookup matches.
+      const collId        = source.split('/').pop();
+      const archivePrefix = `/replay/${collId}/`;
+      const collName      = collId;
+
+      try {
+        await navigator.serviceWorker.register(
+          '/replay/sw.js?replayPrefix=',
+          { scope: '/replay/' }
+        );
+
+        await navigator.serviceWorker.ready;
+
+        // Wait for the SW to confirm the collection is ready.
+        const collReady = new Promise(resolve => {
+          navigator.serviceWorker.addEventListener('message', function handler(e) {
+            if (e.data.msg_type === 'collAdded' && e.data.name === collName) {
+              navigator.serviceWorker.removeEventListener('message', handler);
+              resolve();
+            }
+          });
+        });
+
+        const msg = {
+          msg_type: 'addColl',
+          name: collName,
+          type: 'live',
+          file: { sourceUrl: 'proxy:' },
+          skipExisting: true,
+          extraConfig: {
+            prefix: '',
+            isLive: false,
+            baseUrl: archivePrefix,
+            baseUrlAppendReplay: true,
+            noPostToGet: true,
+            archivePrefix: archivePrefix,
+            archiveMod: 'ir_',
+            injectScripts: [],
+          },
+        };
+
+        const ctrl = navigator.serviceWorker.controller;
+        if (ctrl) {
+          ctrl.postMessage(msg);
+        } else {
+          navigator.serviceWorker.addEventListener('controllerchange', () => {
+            navigator.serviceWorker.controller.postMessage(msg);
+          });
+        }
+
+        await collReady;
+
+        document.getElementById('replay_iframe').src =
+          `${archivePrefix}${ts}mp_/${url}`;
+      } catch (e) {
+        document.body.innerHTML =
+          `<div id="error">Replay error: ${e.message}</div>`;
+      }
+    })();
+  </script>
+</body>
+</html>

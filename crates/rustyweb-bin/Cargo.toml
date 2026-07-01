@@ -1,0 +1,12 @@
+[package]
+name = "rustyweb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustyweb-lib = { path = "../rustyweb-lib" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
