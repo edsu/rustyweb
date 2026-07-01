@@ -330,6 +330,67 @@ async fn homepage_empty_collections() {
     );
 }
 
+// ── Remote (HTTP) source ────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn index_from_http_url_and_link_directly() {
+    use axum::routing::get;
+
+    // Serve the simple.wacz fixture bytes over a local HTTP server.
+    let wacz = std::fs::read(fixture("simple.wacz")).unwrap();
+    let app = axum::Router::new().route(
+        "/simple.wacz",
+        get(move || {
+            let bytes = wacz.clone();
+            async move { bytes }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service()).await.unwrap();
+    });
+
+    let url = format!("http://{addr}/simple.wacz");
+    let tmp = TempDir::new().unwrap();
+
+    // index_location uses a blocking HTTP client; run it off the async runtime.
+    let (url_c, dir_c) = (url.clone(), tmp.path().to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        rustyweb_lib::index::index_location(&url_c, &dir_c, None).unwrap();
+    })
+    .await
+    .unwrap();
+    server.abort();
+
+    // The manifest records the URL as the source (not a local path).
+    let manifest = rustyweb_lib::collections::CollectionManifest::open(tmp.path()).unwrap();
+    assert_eq!(manifest.collections.len(), 1);
+    let col = &manifest.collections[0];
+    assert_eq!(col.source, rustyweb_lib::collections::Source::Url(url.clone()));
+
+    // The downloaded WACZ was indexed and is searchable. Scope the index so its
+    // writer lock is released before the router opens its own SearchIndex.
+    {
+        let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
+        assert!(!idx.search("example", 10).unwrap().is_empty());
+    }
+
+    // The homepage links wabac directly at the remote URL, not through /files/{id}.
+    let app2 = rustyweb_lib::server::router(tmp.path()).unwrap();
+    let resp = app2.oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("source=http%3A%2F%2F127.0.0.1"),
+        "remote source should be used directly in viewer links"
+    );
+    assert!(
+        !html.contains(&format!("/files/{}", col.id)),
+        "remote source should not be routed through /files/{{id}}"
+    );
+}
+
 // ── Real-fixture smoke tests ───────────────────────────────────────────────────
 
 const REAL_URL: &str = "https://storymaps.arcgis.com/stories/278e1b5c18a3474082e583e889705179";

@@ -11,10 +11,70 @@ pub struct SeedPage {
     pub ts: String,
 }
 
+/// Where a collection's WACZ lives: a local file or a remote http(s) URL.
+/// Serializes as a plain string (the path or the URL) for a readable manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum Source {
+    File(PathBuf),
+    Url(String),
+}
+
+impl Source {
+    /// Parse a location string: `http://`/`https://` is a URL, else a file path.
+    pub fn parse(s: &str) -> Self {
+        if s.starts_with("http://") || s.starts_with("https://") {
+            Source::Url(s.to_string())
+        } else {
+            Source::File(PathBuf::from(s))
+        }
+    }
+
+    pub fn is_url(&self) -> bool {
+        matches!(self, Source::Url(_))
+    }
+
+    /// The local file path, if this is a file source.
+    pub fn as_file(&self) -> Option<&Path> {
+        match self {
+            Source::File(p) => Some(p.as_path()),
+            Source::Url(_) => None,
+        }
+    }
+
+    /// Stable string form: the file path or the URL.
+    pub fn location(&self) -> String {
+        match self {
+            Source::File(p) => p.to_string_lossy().into_owned(),
+            Source::Url(u) => u.clone(),
+        }
+    }
+}
+
+impl From<String> for Source {
+    fn from(s: String) -> Self {
+        Source::parse(&s)
+    }
+}
+
+impl From<Source> for String {
+    fn from(s: Source) -> Self {
+        s.location()
+    }
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.location())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collection {
     pub id: String,
-    pub path: PathBuf,
+    /// The WACZ location. Older manifests used the key `path`.
+    #[serde(alias = "path")]
+    pub source: Source,
     pub name: String,
     pub date_indexed: String,
     pub file_size: u64,
@@ -28,9 +88,13 @@ pub struct Collection {
 }
 
 impl Collection {
-    /// Whether the file still exists at its registered path.
+    /// Whether the WACZ is available. Local files must exist on disk; remote
+    /// URLs are assumed present (we do not probe the network here).
     pub fn is_present(&self) -> bool {
-        self.path.exists()
+        match &self.source {
+            Source::File(p) => p.exists(),
+            Source::Url(_) => true,
+        }
     }
 }
 
@@ -73,9 +137,10 @@ impl CollectionManifest {
     }
 }
 
-/// Stable short ID for a collection: first 8 hex chars of SHA-256 of the absolute path string.
-pub fn collection_id(path: &Path) -> String {
-    let hash = sha256_of_bytes(path.to_string_lossy().as_bytes());
+/// Stable short ID for a collection: first 8 hex chars of SHA-256 of the source
+/// location string (an absolute file path or a URL).
+pub fn collection_id(source: &Source) -> String {
+    let hash = sha256_of_bytes(source.location().as_bytes());
     bytes_to_hex(&hash[..4])
 }
 
@@ -115,18 +180,50 @@ mod tests {
 
     #[test]
     fn collection_id_is_stable() {
-        let p = Path::new("/data/archive.wacz");
-        let id1 = collection_id(p);
-        let id2 = collection_id(p);
+        let s = Source::File(PathBuf::from("/data/archive.wacz"));
+        let id1 = collection_id(&s);
+        let id2 = collection_id(&s);
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), 8);
     }
 
     #[test]
-    fn different_paths_different_ids() {
-        let id1 = collection_id(Path::new("/data/a.wacz"));
-        let id2 = collection_id(Path::new("/data/b.wacz"));
+    fn different_sources_different_ids() {
+        let id1 = collection_id(&Source::File(PathBuf::from("/data/a.wacz")));
+        let id2 = collection_id(&Source::File(PathBuf::from("/data/b.wacz")));
+        let id3 = collection_id(&Source::Url("https://ex.org/a.wacz".to_string()));
         assert_ne!(id1, id2);
+        assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn source_parse_distinguishes_url_from_path() {
+        assert!(Source::parse("https://ex.org/a.wacz").is_url());
+        assert!(Source::parse("http://ex.org/a.wacz").is_url());
+        assert!(!Source::parse("/data/a.wacz").is_url());
+        assert!(!Source::parse("relative/a.wacz").is_url());
+    }
+
+    #[test]
+    fn source_serializes_as_plain_string() {
+        let file = Source::File(PathBuf::from("/data/a.wacz"));
+        assert_eq!(serde_json::to_string(&file).unwrap(), "\"/data/a.wacz\"");
+        let url = Source::Url("https://ex.org/a.wacz".to_string());
+        assert_eq!(serde_json::to_string(&url).unwrap(), "\"https://ex.org/a.wacz\"");
+        // Round-trips back to the right variant.
+        let back: Source = serde_json::from_str("\"https://ex.org/a.wacz\"").unwrap();
+        assert_eq!(back, url);
+    }
+
+    #[test]
+    fn manifest_reads_legacy_path_key() {
+        // Older manifests used "path" instead of "source".
+        let tmp = TempDir::new().unwrap();
+        let legacy = r#"[{"id":"abc12345","path":"/data/old.wacz","name":"old","date_indexed":"2026-07-01T00:00:00Z","file_size":10,"sha256":"deadbeef"}]"#;
+        std::fs::write(tmp.path().join("collections.json"), legacy).unwrap();
+        let m = CollectionManifest::open(tmp.path()).unwrap();
+        assert_eq!(m.collections.len(), 1);
+        assert_eq!(m.collections[0].source, Source::File(PathBuf::from("/data/old.wacz")));
     }
 
     #[test]
@@ -155,7 +252,7 @@ mod tests {
 
         let col = Collection {
             id: "abc12345".to_string(),
-            path: PathBuf::from("/data/test.wacz"),
+            source: Source::File(PathBuf::from("/data/test.wacz")),
             name: "test".to_string(),
             date_indexed: "2026-07-01T00:00:00Z".to_string(),
             file_size: 1024,
@@ -180,7 +277,7 @@ mod tests {
 
         let col = Collection {
             id: "abc12345".to_string(),
-            path: PathBuf::from("/data/test.wacz"),
+            source: Source::File(PathBuf::from("/data/test.wacz")),
             name: "test".to_string(),
             date_indexed: "2026-07-01T00:00:00Z".to_string(),
             file_size: 1024,
@@ -192,7 +289,7 @@ mod tests {
         m.upsert(col);
         m.upsert(Collection {
             id: "abc12345".to_string(),
-            path: PathBuf::from("/data/test.wacz"),
+            source: Source::File(PathBuf::from("/data/test.wacz")),
             name: "test-updated".to_string(),
             date_indexed: "2026-07-02T00:00:00Z".to_string(),
             file_size: 2048,

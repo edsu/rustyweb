@@ -28,6 +28,9 @@ scraper = "0.27"
 # PDF text extraction
 pdf-extract = "0.7"
 
+# HTTP client for indexing remote WACZ files
+ureq = "2"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

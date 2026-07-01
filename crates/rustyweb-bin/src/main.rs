@@ -61,11 +61,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index one or more WACZ files.
+    /// Index one or more WACZ files, directories, or http(s) URLs.
     Index {
-        /// WACZ files or directories to index.
+        /// WACZ files, directories, or http(s) URLs to index.
         #[arg(required = true)]
-        paths: Vec<PathBuf>,
+        paths: Vec<String>,
 
         /// Directory where the index will be stored.
         #[arg(short, long, default_value = "index")]
@@ -117,13 +117,13 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Index { paths, index_dir, name } => {
             let total = paths.len();
-            for (i, path) in paths.iter().enumerate() {
+            for (i, location) in paths.iter().enumerate() {
                 tracing::info!(
-                    file = %path.display(),
+                    source = %location,
                     progress = format!("{}/{}", i + 1, total),
                     "indexing"
                 );
-                rustyweb_lib::index::index_path(path, &index_dir, name.as_deref())?;
+                rustyweb_lib::index::index_location(location, &index_dir, name.as_deref())?;
             }
             tracing::info!("indexing complete");
         }
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
 /// recorded at index time. Reports each collection as OK / MODIFIED / MISSING
 /// and returns `false` if any collection failed its fixity check.
 fn run_verify(index_dir: &std::path::Path) -> Result<bool> {
-    use rustyweb_lib::collections::{file_sha256, CollectionManifest};
+    use rustyweb_lib::collections::{file_sha256, CollectionManifest, Source};
 
     let manifest = CollectionManifest::open(index_dir)?;
     if manifest.collections.is_empty() {
@@ -187,36 +187,43 @@ fn run_verify(index_dir: &std::path::Path) -> Result<bool> {
     let mut ok = 0usize;
     let mut missing = 0usize;
     let mut modified = 0usize;
+    let mut remote = 0usize;
 
     for col in &manifest.collections {
-        if !col.path.exists() {
-            println!("MISSING   {} ({})", col.name, col.path.display());
+        let loc = col.source.location();
+        // Remote sources would have to be re-downloaded to re-hash; skip them.
+        let Source::File(path) = &col.source else {
+            println!("REMOTE    {} ({loc}) - skipped (not re-fetched)", col.name);
+            remote += 1;
+            continue;
+        };
+        if !path.exists() {
+            println!("MISSING   {} ({loc})", col.name);
             missing += 1;
             continue;
         }
-        match file_sha256(&col.path) {
+        match file_sha256(path) {
             Ok(hash) if hash == col.sha256 => {
-                println!("OK        {} ({})", col.name, col.path.display());
+                println!("OK        {} ({loc})", col.name);
                 ok += 1;
             }
             Ok(hash) => {
                 println!(
-                    "MODIFIED  {} ({}) - expected {}… got {}…",
+                    "MODIFIED  {} ({loc}) - expected {}… got {}…",
                     col.name,
-                    col.path.display(),
                     short_hash(&col.sha256),
                     short_hash(&hash),
                 );
                 modified += 1;
             }
             Err(e) => {
-                println!("ERROR     {} ({}) - {e}", col.name, col.path.display());
+                println!("ERROR     {} ({loc}) - {e}", col.name);
                 missing += 1;
             }
         }
     }
 
-    println!("\n{ok} OK, {missing} missing, {modified} modified");
+    println!("\n{ok} OK, {missing} missing, {modified} modified, {remote} remote (skipped)");
     Ok(missing == 0 && modified == 0)
 }
 
@@ -226,7 +233,7 @@ fn short_hash(hash: &str) -> &str {
 }
 
 fn run_search_url(url: &str, index_dir: &std::path::Path) -> Result<()> {
-    use rustyweb_lib::collections::CollectionManifest;
+    use rustyweb_lib::collections::{CollectionManifest, Source};
     use rustyweb_lib::wacz::search_cdx;
 
     let manifest = CollectionManifest::open(index_dir)?;
@@ -237,16 +244,22 @@ fn run_search_url(url: &str, index_dir: &std::path::Path) -> Result<()> {
 
     let mut found_any = false;
     for col in &manifest.collections {
-        if !col.path.exists() {
-            eprintln!("warning: {} not found at {}", col.name, col.path.display());
+        // This debugging aid reads the CDX from the local WACZ; skip remote
+        // sources rather than re-downloading them.
+        let Source::File(path) = &col.source else {
+            eprintln!("skipping remote collection {} ({})", col.name, col.source.location());
+            continue;
+        };
+        if !path.exists() {
+            eprintln!("warning: {} not found at {}", col.name, path.display());
             continue;
         }
-        let records = search_cdx(&col.path, url)?;
+        let records = search_cdx(path, url)?;
         if records.is_empty() {
             continue;
         }
         found_any = true;
-        println!("Collection: {} ({})", col.name, col.path.display());
+        println!("Collection: {} ({})", col.name, path.display());
         for r in &records {
             println!("  url:       {}", r.url);
             println!("  timestamp: {}", r.timestamp);

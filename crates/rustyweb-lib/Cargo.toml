@@ -16,6 +16,7 @@ zip = { workspace = true }
 url = { workspace = true }
 scraper = { workspace = true }
 pdf-extract = { workspace = true }
+ureq = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rust-embed = { workspace = true }

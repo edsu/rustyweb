@@ -1,21 +1,31 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use tracing::{debug, info};
 
-use crate::collections::{Collection, CollectionManifest, collection_id, file_sha256};
+use crate::collections::{Collection, CollectionManifest, Source, collection_id, file_sha256};
 use crate::search::{SearchIndex, extract_html_text};
 use crate::warc::{WarcRecord, iter_records};
 use crate::wacz::{extract_warc_from_wacz, iter_warc_paths, read_datapackage};
 
-/// Index a WACZ file (or a directory of WACZ files) into the given index directory.
-/// Idempotent: re-indexing the same file overwrites the existing manifest entry and
-/// re-adds documents to Tantivy.
-/// `name` sets the collection display name; defaults to the file's stem.
+/// Index a local WACZ file or directory of WACZ files. Thin wrapper over
+/// [`index_location`] for callers that already have a filesystem path.
 pub fn index_path(path: &Path, index_dir: &Path, name: Option<&str>) -> Result<()> {
+    index_location(&path.to_string_lossy(), index_dir, name)
+}
+
+/// Index WACZ(s) from a location into the given index directory. The location is
+/// a local file, a local directory (scanned for `.wacz`), or a remote
+/// `http(s)://` URL (downloaded to a temp file for indexing).
+///
+/// Idempotent: re-indexing the same source upserts its manifest entry and
+/// replaces its documents in Tantivy.
+/// `name` overrides the collection display name; otherwise it comes from the
+/// WACZ metadata, falling back to the filename/URL stem.
+pub fn index_location(location: &str, index_dir: &Path, name: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(index_dir)
         .with_context(|| format!("creating index dir {}", index_dir.display()))?;
 
@@ -24,72 +34,133 @@ pub fn index_path(path: &Path, index_dir: &Path, name: Option<&str>) -> Result<(
             .with_context(|| format!("opening search index at {}", index_dir.display()))?,
     );
 
-    let paths: Vec<_> = if path.is_dir() {
-        std::fs::read_dir(path)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("wacz"))
-            .collect()
-    } else {
-        vec![path.to_path_buf()]
-    };
-
+    let sources = resolve_sources(location)?;
     let mut manifest = CollectionManifest::open(index_dir)?;
 
-    // Process each WACZ file (potentially in parallel across files if multiple).
-    // Within each WACZ, WARC entries are processed in parallel.
-    for p in &paths {
-        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-        if ext != "wacz" {
-            debug!("skipping non-WACZ file: {}", p.display());
-            continue;
-        }
-
-        let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
-        let collection_name = name
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| file_display_name(&abs));
-        let id = collection_id(&abs);
-
-        // Drop any prior documents for this collection so re-indexing upserts
-        // instead of appending duplicates.
-        search.lock().unwrap().delete_collection(&id);
-
-        index_wacz(&abs, &id, &collection_name, &search)?;
-
-        // Read metadata from WACZ datapackage.json.
-        let meta = read_datapackage(&abs).unwrap_or_default();
-        let display_name = meta.title.as_deref().unwrap_or(&collection_name).to_string();
-
-        // Index the collection itself as a searchable document.
-        let coll_body = build_collection_body(&meta);
-        search
-            .lock()
-            .unwrap()
-            .index_collection(&id, &display_name, &coll_body)?;
-
-        let sha = file_sha256(&abs)
-            .with_context(|| format!("computing sha256 of {}", abs.display()))?;
-        let file_size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
-        let date_indexed = chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        manifest.upsert(Collection {
-            id,
-            path: abs,
-            name: display_name,
-            date_indexed,
-            file_size,
-            sha256: sha,
-            description: meta.description,
-            crawl_date: meta.created,
-            seed_pages: meta.seed_pages,
-        });
+    for source in &sources {
+        index_one(source, &mut manifest, &search, name)?;
     }
 
     search.into_inner().unwrap().commit()?;
     manifest.save()?;
 
     Ok(())
+}
+
+/// Expand a location into the concrete WACZ sources to index. A directory is
+/// scanned (non-recursively) for `.wacz` files; a URL or single file yields one
+/// source. Local file paths are canonicalized so the derived collection id is
+/// stable regardless of how the path was written.
+fn resolve_sources(location: &str) -> Result<Vec<Source>> {
+    match Source::parse(location) {
+        url @ Source::Url(_) => Ok(vec![url]),
+        Source::File(p) => {
+            if p.is_dir() {
+                let mut sources = Vec::new();
+                for entry in std::fs::read_dir(&p)? {
+                    let path = entry?.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("wacz") {
+                        let abs = path.canonicalize().unwrap_or(path);
+                        sources.push(Source::File(abs));
+                    }
+                }
+                Ok(sources)
+            } else if p.extension().and_then(|e| e.to_str()) == Some("wacz") {
+                let abs = p.canonicalize().unwrap_or(p);
+                Ok(vec![Source::File(abs)])
+            } else {
+                debug!("skipping non-WACZ path: {}", p.display());
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+/// Index a single WACZ source: obtain a local readable copy (downloading a URL
+/// to a temp file), index its pages and metadata, and upsert its manifest entry.
+fn index_one(
+    source: &Source,
+    manifest: &mut CollectionManifest,
+    search: &Mutex<SearchIndex>,
+    name: Option<&str>,
+) -> Result<()> {
+    // A URL is downloaded to a temp file for indexing; the temp file is kept
+    // alive (`_tmp`) for the duration of this function.
+    let (local, _tmp): (PathBuf, Option<tempfile::NamedTempFile>) = match source {
+        Source::File(p) => (p.clone(), None),
+        Source::Url(u) => {
+            info!(url = %u, "downloading remote WACZ for indexing");
+            let tmp = download_to_temp(u).with_context(|| format!("downloading {u}"))?;
+            (tmp.path().to_path_buf(), Some(tmp))
+        }
+    };
+
+    let id = collection_id(source);
+    let collection_name = name
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| source_display_name(source));
+
+    // Drop any prior documents for this collection so re-indexing upserts
+    // instead of appending duplicates.
+    search.lock().unwrap().delete_collection(&id);
+
+    index_wacz(&local, &id, &collection_name, search)?;
+
+    // Read metadata from the WACZ datapackage.json.
+    let meta = read_datapackage(&local).unwrap_or_default();
+    let display_name = meta.title.as_deref().unwrap_or(&collection_name).to_string();
+
+    // Index the collection itself as a searchable document.
+    let coll_body = build_collection_body(&meta);
+    search
+        .lock()
+        .unwrap()
+        .index_collection(&id, &display_name, &coll_body)?;
+
+    let sha = file_sha256(&local)
+        .with_context(|| format!("computing sha256 of {}", local.display()))?;
+    let file_size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+    let date_indexed = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    manifest.upsert(Collection {
+        id,
+        source: source.clone(),
+        name: display_name,
+        date_indexed,
+        file_size,
+        sha256: sha,
+        description: meta.description,
+        crawl_date: meta.created,
+        seed_pages: meta.seed_pages,
+    });
+
+    Ok(())
+}
+
+/// Download a remote WACZ to a temp file for indexing.
+fn download_to_temp(url: &str) -> Result<tempfile::NamedTempFile> {
+    use std::io::{copy, Write};
+
+    let resp = ureq::get(url)
+        .call()
+        .with_context(|| format!("HTTP GET {url}"))?;
+    let mut tmp = tempfile::Builder::new().suffix(".wacz").tempfile()?;
+    let mut reader = resp.into_reader();
+    copy(&mut reader, &mut tmp).with_context(|| format!("writing {url} to temp file"))?;
+    tmp.flush()?;
+    Ok(tmp)
+}
+
+/// Display name for a source: the WACZ filename stem, for a file or URL.
+fn source_display_name(source: &Source) -> String {
+    match source {
+        Source::File(p) => file_display_name(p),
+        Source::Url(u) => {
+            let path = u.split(['?', '#']).next().unwrap_or(u);
+            let base = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(u);
+            base.strip_suffix(".wacz").unwrap_or(base).to_string()
+        }
+    }
 }
 
 /// Build the body text for a collection-level Tantivy document from its metadata.

@@ -106,8 +106,9 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             let status_class = if c.is_present() { "ok" } else { "missing" };
             let status_text = if c.is_present() { "✓ present" } else { "✗ missing" };
             let name = html_escape(&c.name);
-            let path = html_escape(c.path.to_string_lossy().as_ref());
+            let path = html_escape(&c.source.location());
             let date = c.date_indexed.get(..10).unwrap_or(&c.date_indexed);
+            let source_enc = url_encode(&viewer_source(c));
 
             let description = c.description.as_deref()
                 .map(|d| format!("<p class=\"desc\">{}</p>", html_escape(d)))
@@ -123,9 +124,8 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             let seed_links: String = c.seed_pages.iter().take(5).map(|p| {
                 let title = p.title.as_deref().unwrap_or(&p.url);
                 let url_enc = url_encode(&p.url);
-                let col_id = &c.id;
                 let ts = ts_to_14digit(&p.ts);
-                let viewer_href = format!("/replay/viewer?source=/files/{col_id}&url={url_enc}&ts={ts}&name={}", url_encode(&c.name));
+                let viewer_href = format!("/replay/viewer?source={source_enc}&url={url_enc}&ts={ts}&name={}", url_encode(&c.name));
                 format!("<li><a href=\"{viewer_href}\">{}</a></li>", html_escape(title))
             }).collect();
 
@@ -139,14 +139,13 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             // Land on the first seed page if we have one, otherwise let the
             // component pick the collection's default entry point.
             let name_enc = url_encode(&c.name);
-            let col_id = &c.id;
             let title_link = match c.seed_pages.first() {
                 Some(p) => format!(
-                    "/replay/viewer?source=/files/{col_id}&url={}&ts={}&name={name_enc}",
+                    "/replay/viewer?source={source_enc}&url={}&ts={}&name={name_enc}",
                     url_encode(&p.url),
                     ts_to_14digit(&p.ts),
                 ),
-                None => format!("/replay/viewer?source=/files/{col_id}&name={name_enc}"),
+                None => format!("/replay/viewer?source={source_enc}&name={name_enc}"),
             };
             format!(
                 r#"<div class="card">
@@ -252,6 +251,17 @@ async fn search_page(
         Err(e) => return error_response(e).into_response(),
     };
 
+    // Map each collection id to the wabac `source` to use: /files/{id} for a
+    // local WACZ, or the remote URL directly for an http source.
+    let collections = load_collections(&state);
+    let source_for = |cid: &str| -> String {
+        collections
+            .iter()
+            .find(|c| c.id == cid)
+            .map(viewer_source)
+            .unwrap_or_else(|| format!("/files/{cid}"))
+    };
+
     let rows: String = results
         .iter()
         .map(|r| {
@@ -265,14 +275,15 @@ async fn search_page(
             let col_name = html_escape(&r.collection_name);
             let url_enc = url_encode(&r.url);
             let name_enc = url_encode(&r.collection_name);
+            let source_enc = url_encode(&source_for(&r.collection_id));
 
             let href = if is_collection {
                 // Link to the collection's root in the viewer.
-                format!("/replay/viewer?source=/files/{}&name={name_enc}", r.collection_id)
+                format!("/replay/viewer?source={source_enc}&name={name_enc}")
             } else {
                 format!(
-                    "/replay/viewer?source=/files/{}&url={url_enc}&ts={}&name={name_enc}",
-                    r.collection_id, r.timestamp
+                    "/replay/viewer?source={source_enc}&url={url_enc}&ts={}&name={name_enc}",
+                    r.timestamp
                 )
             };
 
@@ -387,7 +398,16 @@ async fn serve_file(
     let Some(col) = collections.iter().find(|c| c.id == id) else {
         return (StatusCode::NOT_FOUND, "collection not found").into_response();
     };
-    if !col.is_present() {
+
+    // Remote sources aren't proxied: wabac.js reads them directly. If /files/{id}
+    // is hit for a remote source anyway, redirect to the URL as a convenience.
+    let path = match &col.source {
+        crate::collections::Source::File(p) => p,
+        crate::collections::Source::Url(u) => {
+            return axum::response::Redirect::temporary(u).into_response();
+        }
+    };
+    if !path.exists() {
         return (StatusCode::NOT_FOUND, "archive file not found on disk").into_response();
     }
 
@@ -397,7 +417,7 @@ async fn serve_file(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| parse_byte_range(s, file_size));
 
-    match tokio::fs::File::open(&col.path).await {
+    match tokio::fs::File::open(path).await {
         Ok(mut file) => {
             const CONTENT_TYPE: &str = "application/octet-stream";
             const CORS_EXPOSE: &str = "Content-Length, Content-Range, Accept-Ranges";
@@ -572,6 +592,15 @@ fn load_collections(state: &AppState) -> Vec<Collection> {
     CollectionManifest::open(&state.index_dir)
         .map(|m| m.collections)
         .unwrap_or_default()
+}
+
+/// The `source` value to hand wabac.js for a collection: our local byte-range
+/// endpoint for a file, or the remote URL directly (read client-side) for a URL.
+fn viewer_source(col: &Collection) -> String {
+    match &col.source {
+        crate::collections::Source::File(_) => format!("/files/{}", col.id),
+        crate::collections::Source::Url(u) => u.clone(),
+    }
 }
 
 fn error_response(e: anyhow::Error) -> Response {

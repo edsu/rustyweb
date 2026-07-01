@@ -17,3 +17,6 @@ test.txt
 /node_modules
 /package.json
 /package-lock.json
+
+# bv (beads viewer) local config and caches
+.bv/

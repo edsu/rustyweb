@@ -55,13 +55,13 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index      [--index-dir <DIR>] [--name <NAME>] <PATH>...
+rustyweb index      [--index-dir <DIR>] [--name <NAME>] <PATH|URL>...
 rustyweb serve      [--index-dir <DIR>] [--bind <ADDR>]
 rustyweb search-url [--index-dir <DIR>] <URL>
 rustyweb verify     [--index-dir <DIR>]
 ```
 
-- `index`: accepts `.wacz` files or directories (recursive scan). Extracts page HTML for full-text indexing, reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. Default index dir: `./index`.
+- `index`: accepts `.wacz` files, directories (scanned for `.wacz`), or `http(s)://` URLs (downloaded to a temp file for indexing). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. A `Source` is either a local file or a remote URL. Default index dir: `./index`.
 - `serve`: opens Tantivy read-only, starts Axum. Defaults: `127.0.0.1:8080`.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
 - `verify`: re-hashes every WACZ in `collections.json` and compares against the stored SHA-256, reporting each collection as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
@@ -141,7 +141,7 @@ The homepage displays this metadata per collection, giving users a preview of wh
 [
   {
     "id": "e02536ec",
-    "path": "/data/archives/attar.wacz",
+    "source": "/data/archives/attar.wacz",
     "name": "Attar Silas",
     "date_indexed": "2026-07-01T00:00:00Z",
     "file_size": 104857600,
@@ -155,9 +155,11 @@ The homepage displays this metadata per collection, giving users a preview of wh
 ]
 ```
 
-- `id`: first 8 hex chars of SHA-256 of the absolute path - stable as long as the file doesn't move
-- Re-indexing the same path upserts the entry
-- `GET /files/{id}` only serves files registered in `collections.json` - arbitrary filesystem access is not possible
+- `source`: a local file path or an `http(s)://` URL. (Older manifests used the key `path`; it is still read.)
+- `id`: first 8 hex chars of SHA-256 of the source string - stable as long as the source doesn't move
+- Re-indexing the same source upserts the entry
+- For a **file** source, `GET /files/{id}` streams the registered file with byte-range support; only files registered in `collections.json` are served, so arbitrary filesystem access is not possible.
+- For a **URL** source, replay points wabac.js directly at the remote URL (the host must provide range + CORS); `GET /files/{id}` just redirects there. rustyweb never proxies remote bytes.
 
 ---
 

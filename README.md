@@ -80,16 +80,33 @@ Open <http://127.0.0.1:8080/>, search, and click a result to replay it.
 Re-indexing the same WACZ is an upsert - safe to re-run any time to add or
 refresh collections.
 
+### Remote WACZ files
+
+A WACZ can also live at an `http(s)` URL:
+
+```sh
+./target/release/rustyweb index https://example.org/archives/site.wacz
+```
+
+Indexing downloads the WACZ once to read its text and metadata, but records the
+URL as the collection's source. At replay time the browser reads the remote WACZ
+directly (via HTTP range requests) - rustyweb does not proxy the bytes. For that
+to work the remote host must serve the WACZ with **HTTP range support and CORS**
+allowing rustyweb's origin. (This is also why S3 and other object stores work
+without special support: expose the object as a range- and CORS-capable HTTPS
+URL, e.g. a presigned URL, and index that.)
+
 ## Command line
 
 ```
-rustyweb index      [--index-dir <DIR>] [--name <NAME>] <PATH>...
+rustyweb index      [--index-dir <DIR>] [--name <NAME>] <PATH|URL>...
 rustyweb serve      [--index-dir <DIR>] [--bind <ADDR>]
 rustyweb search-url [--index-dir <DIR>] <URL>
 rustyweb verify     [--index-dir <DIR>]
 ```
 
-- **`index`** - accepts `.wacz` files or directories (scanned for `.wacz`).
+- **`index`** - accepts `.wacz` files, directories (scanned for `.wacz`), or
+  `http(s)://` URLs (the remote WACZ is downloaded to a temp file for indexing).
   Extracts searchable text from each page (HTML, Browsertrix's rendered
   `urn:text` records, and PDFs), reads `datapackage.json` for collection
   metadata, and records everything in `{index-dir}/collections.json`, including
