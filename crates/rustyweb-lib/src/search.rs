@@ -115,7 +115,10 @@ impl SearchIndex {
         let collector = TopDocs::with_limit(limit).order_by_score();
         let top_docs = searcher.search(&query, &collector)?;
 
-        let snippet_gen = SnippetGenerator::create(&searcher, &query, body_f)?;
+        let mut snippet_gen = SnippetGenerator::create(&searcher, &query, body_f)?;
+        // Tantivy's default snippet window is 150 chars; widen it for more
+        // context around the matched terms in search results.
+        snippet_gen.set_max_num_chars(350);
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (_score, addr) in top_docs {
