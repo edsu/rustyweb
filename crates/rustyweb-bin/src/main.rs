@@ -61,17 +61,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index one or more WACZ files, directories, or http(s) URLs.
+    /// Index WACZ files, directories, or http(s) URLs (defaults to <home>/archive).
     Index {
-        /// WACZ files, directories, or http(s) URLs to index.
-        #[arg(required = true)]
+        /// WACZ files, directories, or http(s) URLs. If omitted, indexes every
+        /// .wacz under <home>/archive.
         paths: Vec<String>,
 
-        /// Directory where the index will be stored.
-        #[arg(short, long, default_value = "index")]
-        index_dir: PathBuf,
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
 
-        /// Collection display name (defaults to the filename stem).
+        /// Collection display name (defaults to the WACZ title or filename).
         #[arg(long)]
         name: Option<String>,
     },
@@ -81,24 +81,24 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         bind: String,
 
-        /// Index directory created by `rustyweb index`.
-        #[arg(short, long, default_value = "index")]
-        index_dir: PathBuf,
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
     },
     /// Search indexed WACZ files for CDX records matching a URL.
     SearchUrl {
         /// URL to search for (exact match against archived URLs).
         url: String,
 
-        /// Index directory created by `rustyweb index`.
-        #[arg(short, long, default_value = "index")]
-        index_dir: PathBuf,
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
     },
     /// Verify the fixity of indexed WACZ files by re-hashing each one.
     Verify {
-        /// Index directory created by `rustyweb index`.
-        #[arg(short, long, default_value = "index")]
-        index_dir: PathBuf,
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
     },
 }
 
@@ -118,9 +118,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index { paths, index_dir, name } => {
-            let total = paths.len();
-            for (i, location) in paths.iter().enumerate() {
+        Commands::Index { paths, home, name } => {
+            // With no paths, index everything under <home>/archive.
+            let locations: Vec<String> = if paths.is_empty() {
+                vec![rustyweb_lib::index::archive_dir(&home).to_string_lossy().into_owned()]
+            } else {
+                paths
+            };
+            let total = locations.len();
+            for (i, location) in locations.iter().enumerate() {
                 tracing::info!(
                     source = %location,
                     progress = format!("{}/{}", i + 1, total),
@@ -131,14 +137,14 @@ async fn main() -> Result<()> {
                 // filtered by log level. Silence stdout while indexing runs;
                 // our logs are on stderr and are unaffected.
                 let quiet = gag::Gag::stdout().ok();
-                let result = rustyweb_lib::index::index_location(location, &index_dir, name.as_deref());
+                let result = rustyweb_lib::index::index_location(location, &home, name.as_deref());
                 drop(quiet);
                 result?;
             }
             tracing::info!("indexing complete");
         }
 
-        Commands::Serve { bind, index_dir } => {
+        Commands::Serve { bind, home } => {
             let ctrl_c = async {
                 tokio::signal::ctrl_c()
                     .await
@@ -159,7 +165,7 @@ async fn main() -> Result<()> {
             let terminate = std::future::pending::<()>();
 
             tokio::select! {
-                result = rustyweb_lib::server::serve(&bind, &index_dir) => {
+                result = rustyweb_lib::server::serve(&bind, &home) => {
                     result?;
                 }
                 _ = ctrl_c => {}
@@ -167,12 +173,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::SearchUrl { url, index_dir } => {
-            run_search_url(&url, &index_dir)?;
+        Commands::SearchUrl { url, home } => {
+            run_search_url(&url, &home)?;
         }
 
-        Commands::Verify { index_dir } => {
-            let all_ok = run_verify(&index_dir)?;
+        Commands::Verify { home } => {
+            let all_ok = run_verify(&home)?;
             if !all_ok {
                 std::process::exit(1);
             }
@@ -185,10 +191,11 @@ async fn main() -> Result<()> {
 /// Re-hash every WACZ registered in the manifest and compare against the SHA-256
 /// recorded at index time. Reports each collection as OK / MODIFIED / MISSING
 /// and returns `false` if any collection failed its fixity check.
-fn run_verify(index_dir: &std::path::Path) -> Result<bool> {
+fn run_verify(home: &std::path::Path) -> Result<bool> {
     use rustyweb_lib::collections::{file_sha256, CollectionManifest, Source};
 
-    let manifest = CollectionManifest::open(index_dir)?;
+    let index_dir = rustyweb_lib::index::index_dir(home);
+    let manifest = CollectionManifest::open(&index_dir)?;
     if manifest.collections.is_empty() {
         println!("No collections registered in {}", index_dir.display());
         return Ok(true);
@@ -202,17 +209,18 @@ fn run_verify(index_dir: &std::path::Path) -> Result<bool> {
     for col in &manifest.collections {
         let loc = col.source.location();
         // Remote sources would have to be re-downloaded to re-hash; skip them.
-        let Source::File(path) = &col.source else {
+        if matches!(col.source, Source::Url(_)) {
             println!("REMOTE    {} ({loc}) - skipped (not re-fetched)", col.name);
             remote += 1;
             continue;
-        };
+        }
+        let path = col.source.resolve(home).unwrap();
         if !path.exists() {
             println!("MISSING   {} ({loc})", col.name);
             missing += 1;
             continue;
         }
-        match file_sha256(path) {
+        match file_sha256(&path) {
             Ok(hash) if hash == col.sha256 => {
                 println!("OK        {} ({loc})", col.name);
                 ok += 1;
@@ -242,11 +250,12 @@ fn short_hash(hash: &str) -> &str {
     hash.get(..8).unwrap_or(hash)
 }
 
-fn run_search_url(url: &str, index_dir: &std::path::Path) -> Result<()> {
+fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
     use rustyweb_lib::collections::{CollectionManifest, Source};
     use rustyweb_lib::wacz::search_cdx;
 
-    let manifest = CollectionManifest::open(index_dir)?;
+    let index_dir = rustyweb_lib::index::index_dir(home);
+    let manifest = CollectionManifest::open(&index_dir)?;
     if manifest.collections.is_empty() {
         println!("No collections registered in {}", index_dir.display());
         return Ok(());
@@ -256,15 +265,16 @@ fn run_search_url(url: &str, index_dir: &std::path::Path) -> Result<()> {
     for col in &manifest.collections {
         // This debugging aid reads the CDX from the local WACZ; skip remote
         // sources rather than re-downloading them.
-        let Source::File(path) = &col.source else {
+        if matches!(col.source, Source::Url(_)) {
             eprintln!("skipping remote collection {} ({})", col.name, col.source.location());
             continue;
-        };
+        }
+        let path = col.source.resolve(home).unwrap();
         if !path.exists() {
             eprintln!("warning: {} not found at {}", col.name, path.display());
             continue;
         }
-        let records = search_cdx(path, url)?;
+        let records = search_cdx(&path, url)?;
         if records.is_empty() {
             continue;
         }

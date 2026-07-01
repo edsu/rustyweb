@@ -27,18 +27,23 @@ struct ReplayAssets;
 
 struct AppState {
     search: SearchIndex,
+    /// rustyweb home directory; local WACZ sources resolve against it.
+    home: PathBuf,
+    /// `<home>/index`, where the manifest and full-text index live.
     index_dir: PathBuf,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
-pub fn router(index_dir: &Path) -> Result<Router> {
+pub fn router(home: &Path) -> Result<Router> {
+    let index_dir = crate::index::index_dir(home);
     // Read-only: the server never writes, so it must not hold the write lock,
     // which would block `rustyweb index` from running while serving.
     let search = SearchIndex::open_read_only(index_dir.join("full_text").as_path())?;
     let state = Arc::new(AppState {
         search,
-        index_dir: index_dir.to_path_buf(),
+        home: home.to_path_buf(),
+        index_dir,
     });
 
     let app = Router::new()
@@ -86,8 +91,8 @@ pub fn router(index_dir: &Path) -> Result<Router> {
     Ok(app)
 }
 
-pub async fn serve(bind: &str, index_dir: &Path) -> Result<()> {
-    let app = router(index_dir)?;
+pub async fn serve(bind: &str, home: &Path) -> Result<()> {
+    let app = router(home)?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("listening on {bind}");
     axum::serve(
@@ -106,8 +111,9 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cards: String = collections
         .iter()
         .map(|c| {
-            let status_class = if c.is_present() { "ok" } else { "missing" };
-            let status_text = if c.is_present() { "✓ present" } else { "✗ missing" };
+            let present = c.is_present(&state.home);
+            let status_class = if present { "ok" } else { "missing" };
+            let status_text = if present { "✓ present" } else { "✗ missing" };
             let name = html_escape(&c.name);
             let path = html_escape(&c.source.location());
             let date = c.date_indexed.get(..10).unwrap_or(&c.date_indexed);
@@ -396,7 +402,7 @@ async fn collection_page(
     let source_enc = url_encode(&viewer_source(c));
     let name_enc = url_encode(&c.name);
     let source_disp = html_escape(&c.source.location());
-    let status = if c.is_present() {
+    let status = if c.is_present(&state.home) {
         "<span class=\"ok\">✓ present</span>"
     } else {
         "<span class=\"missing\">✗ missing</span>"
@@ -543,12 +549,11 @@ async fn serve_file(
 
     // Remote sources aren't proxied: wabac.js reads them directly. If /files/{id}
     // is hit for a remote source anyway, redirect to the URL as a convenience.
-    let path = match &col.source {
-        crate::collections::Source::File(p) => p,
-        crate::collections::Source::Url(u) => {
-            return axum::response::Redirect::temporary(u).into_response();
-        }
-    };
+    if let crate::collections::Source::Url(u) = &col.source {
+        return axum::response::Redirect::temporary(u).into_response();
+    }
+    // File source: resolve relative paths against home.
+    let path = col.source.resolve(&state.home).unwrap();
     if !path.exists() {
         return (StatusCode::NOT_FOUND, "archive file not found on disk").into_response();
     }

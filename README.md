@@ -86,15 +86,35 @@ See [DESIGN.md](DESIGN.md) for the full architecture.
 
 ## Quick start
 
-Index one or more WACZ files (or a directory of them, or an http(s) URL), then
-serve:
+rustyweb keeps everything under a **home directory** (default: the current
+directory):
+
+```
+<home>/
+├── archive/   your WACZ files
+└── index/     search index + metadata (created by `rustyweb index`)
+```
+
+Put your WACZ files in `archive/`, then index and serve:
 
 ```sh
-# Index - writes a search index and collection manifest into ./index
-rustyweb index my-archive.wacz
+mkdir -p archive
+cp my-archive.wacz archive/
 
-# Serve - defaults to http://127.0.0.1:8080
-rustyweb serve
+rustyweb index      # indexes everything in ./archive
+rustyweb serve      # http://127.0.0.1:8080
+```
+
+Point at a different home with `--home <DIR>` (both `index` and `serve` take
+it). Because the archive and its index live together under one folder, you can
+move or copy the whole `<home>` directory to another disk or machine and it
+still works - the paths are stored relative to home.
+
+You can also index specific files or a URL instead of the whole archive:
+
+```sh
+rustyweb index archive/my-archive.wacz
+rustyweb index https://example.org/site.wacz
 ```
 
 Open <http://127.0.0.1:8080/>, search, and click a result to replay it.
@@ -128,22 +148,26 @@ object like the one above, or a presigned URL) and index that.
 ## Command line
 
 ```
-rustyweb index      [--index-dir <DIR>] [--name <NAME>] <PATH|URL>...
-rustyweb serve      [--index-dir <DIR>] [--bind <ADDR>]
-rustyweb search-url [--index-dir <DIR>] <URL>
-rustyweb verify     [--index-dir <DIR>]
+rustyweb index      [--home <DIR>] [--name <NAME>] [<PATH|URL>...]
+rustyweb serve      [--home <DIR>] [--bind <ADDR>]
+rustyweb search-url [--home <DIR>] <URL>
+rustyweb verify     [--home <DIR>]
 ```
 
-- **`index`** - accepts `.wacz` files, directories (scanned for `.wacz`), or
+Every command takes `--home <DIR>` (default `.`); `archive/` and `index/` are
+derived siblings under it.
+
+- **`index`** - with no path, indexes every `.wacz` under `<home>/archive`. Also
+  accepts explicit `.wacz` files, directories (scanned for `.wacz`), or
   `http(s)://` URLs (the remote WACZ is downloaded to a temp file for indexing).
   Extracts searchable text from each page (HTML, Browsertrix's rendered
   `urn:text` records, and PDFs), reads `datapackage.json` for collection
-  metadata, and records everything in `{index-dir}/collections.json`, including
-  the SHA-256 of each WACZ. The collection name comes from `--name` if given,
+  metadata, and records everything in `<home>/index/collections.json`, including
+  the SHA-256 of each WACZ. Local WACZ paths are stored relative to home so the
+  folder is portable. The collection name comes from `--name` if given,
   otherwise the WACZ's `datapackage.json` title, otherwise the filename.
-  Defaults to `./index`.
-- **`serve`** - opens the index read-only and starts the HTTP server. Defaults
-  to `127.0.0.1:8080`.
+- **`serve`** - opens the index read-only and starts the HTTP server (so you can
+  `index` while it runs). Defaults to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and
   prints the records matching a URL. No separate CDX store is maintained; the
   WACZ's own index is authoritative.

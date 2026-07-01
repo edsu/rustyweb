@@ -36,7 +36,7 @@ async fn browser_renders_archived_page() {
     //    simple.wacz fixture uses a non-standard CDX that wabac can't read.
     let tmp = tempfile::TempDir::new().unwrap();
     rustyweb_lib::index::index_path(&fixture("a.wacz"), tmp.path(), None).unwrap();
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(tmp.path()).unwrap();
+    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
     let id = manifest.collections[0].id.clone();
 
     // 2. Serve it on an ephemeral port (localhost is a secure context, so the

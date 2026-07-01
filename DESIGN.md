@@ -55,14 +55,19 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index      [--index-dir <DIR>] [--name <NAME>] <PATH|URL>...
-rustyweb serve      [--index-dir <DIR>] [--bind <ADDR>]
-rustyweb search-url [--index-dir <DIR>] <URL>
-rustyweb verify     [--index-dir <DIR>]
+rustyweb index      [--home <DIR>] [--name <NAME>] [<PATH|URL>...]
+rustyweb serve      [--home <DIR>] [--bind <ADDR>]
+rustyweb search-url [--home <DIR>] <URL>
+rustyweb verify     [--home <DIR>]
 ```
 
-- `index`: accepts `.wacz` files, directories (scanned for `.wacz`), or `http(s)://` URLs (downloaded to a temp file for indexing). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. A `Source` is either a local file or a remote URL. Default index dir: `./index`.
-- `serve`: opens Tantivy read-only, starts Axum. Defaults: `127.0.0.1:8080`.
+Every command takes `--home <DIR>` (default `.`). The home directory holds two
+derived siblings: `<home>/archive/` (WACZ files) and `<home>/index/` (Tantivy
+index + `collections.json`). Keeping them together makes a home folder portable
+- move it to another disk or machine and it still resolves.
+
+- `index`: with no path, indexes every `.wacz` under `<home>/archive`. Also accepts explicit `.wacz` files, directories (scanned for `.wacz`), or `http(s)://` URLs (downloaded to a temp file for indexing). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. A `Source` is a local file (stored relative to home when under it) or a remote URL.
+- `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
 - `verify`: re-hashes every WACZ in `collections.json` and compares against the stored SHA-256, reporting each collection as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
 
@@ -135,13 +140,13 @@ The homepage displays this metadata per collection, giving users a preview of wh
 
 ## Collection Management
 
-`{index_dir}/collections.json` - written/updated by `rustyweb index`, read by `rustyweb serve`.
+`<home>/index/collections.json` - written/updated by `rustyweb index`, read by `rustyweb serve`.
 
 ```json
 [
   {
     "id": "e02536ec",
-    "source": "/data/archives/attar.wacz",
+    "source": "archive/attar.wacz",
     "name": "Attar Silas",
     "date_indexed": "2026-07-01T00:00:00Z",
     "file_size": 104857600,
@@ -155,8 +160,8 @@ The homepage displays this metadata per collection, giving users a preview of wh
 ]
 ```
 
-- `source`: a local file path or an `http(s)://` URL. (Older manifests used the key `path`; it is still read.)
-- `id`: first 8 hex chars of SHA-256 of the source string - stable as long as the source doesn't move
+- `source`: a local file path (stored relative to `<home>` when under it, e.g. `archive/attar.wacz`; absolute otherwise) or an `http(s)://` URL. Relative paths resolve against `<home>` at serve time, so the whole home folder is portable. (Older manifests used the key `path`; it is still read.)
+- `id`: first 8 hex chars of SHA-256 of the source string - relative sources give IDs that are stable across moves
 - Re-indexing the same source upserts the entry
 - For a **file** source, `GET /files/{id}` streams the registered file with byte-range support; only files registered in `collections.json` are served, so arbitrary filesystem access is not possible.
 - For a **URL** source, replay points wabac.js directly at the remote URL (the host must provide range + CORS); `GET /files/{id}` just redirects there. rustyweb never proxies remote bytes.

@@ -11,22 +11,34 @@ use crate::search::{SearchIndex, extract_html_text};
 use crate::warc::{WarcRecord, iter_records};
 use crate::wacz::{extract_warc_from_wacz, iter_warc_paths, read_datapackage};
 
-/// Index a local WACZ file or directory of WACZ files. Thin wrapper over
-/// [`index_location`] for callers that already have a filesystem path.
-pub fn index_path(path: &Path, index_dir: &Path, name: Option<&str>) -> Result<()> {
-    index_location(&path.to_string_lossy(), index_dir, name)
+/// Paths derived from a rustyweb home directory.
+pub fn index_dir(home: &Path) -> PathBuf {
+    home.join("index")
+}
+pub fn archive_dir(home: &Path) -> PathBuf {
+    home.join("archive")
 }
 
-/// Index WACZ(s) from a location into the given index directory. The location is
-/// a local file, a local directory (scanned for `.wacz`), or a remote
-/// `http(s)://` URL (downloaded to a temp file for indexing).
+/// Index a local WACZ file or directory of WACZ files under the given home dir.
+/// Thin wrapper over [`index_location`].
+pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
+    index_location(&path.to_string_lossy(), home, name)
+}
+
+/// Index WACZ(s) from a location into the home directory's `index/`. The
+/// location is a local file, a local directory (scanned for `.wacz`), or a
+/// remote `http(s)://` URL (downloaded to a temp file for indexing).
+///
+/// Local WACZ paths are stored relative to `home` when they live under it, so
+/// the home folder (archive + index together) is portable.
 ///
 /// Idempotent: re-indexing the same source upserts its manifest entry and
 /// replaces its documents in Tantivy.
 /// `name` overrides the collection display name; otherwise it comes from the
 /// WACZ metadata, falling back to the filename/URL stem.
-pub fn index_location(location: &str, index_dir: &Path, name: Option<&str>) -> Result<()> {
-    std::fs::create_dir_all(index_dir)
+pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result<()> {
+    let index_dir = index_dir(home);
+    std::fs::create_dir_all(&index_dir)
         .with_context(|| format!("creating index dir {}", index_dir.display()))?;
 
     let search = Mutex::new(
@@ -34,11 +46,11 @@ pub fn index_location(location: &str, index_dir: &Path, name: Option<&str>) -> R
             .with_context(|| format!("opening search index at {}", index_dir.display()))?,
     );
 
-    let sources = resolve_sources(location)?;
-    let mut manifest = CollectionManifest::open(index_dir)?;
+    let sources = resolve_sources(location, home)?;
+    let mut manifest = CollectionManifest::open(&index_dir)?;
 
     for source in &sources {
-        index_one(source, &mut manifest, &search, name)?;
+        index_one(source, home, &mut manifest, &search, name)?;
     }
 
     search.into_inner().unwrap().commit()?;
@@ -49,9 +61,9 @@ pub fn index_location(location: &str, index_dir: &Path, name: Option<&str>) -> R
 
 /// Expand a location into the concrete WACZ sources to index. A directory is
 /// scanned (non-recursively) for `.wacz` files; a URL or single file yields one
-/// source. Local file paths are canonicalized so the derived collection id is
-/// stable regardless of how the path was written.
-fn resolve_sources(location: &str) -> Result<Vec<Source>> {
+/// source. Local file paths are canonicalized, then stored relative to `home`
+/// when under it (see [`Source::for_file`]).
+fn resolve_sources(location: &str, home: &Path) -> Result<Vec<Source>> {
     match Source::parse(location) {
         url @ Source::Url(_) => Ok(vec![url]),
         Source::File(p) => {
@@ -61,13 +73,13 @@ fn resolve_sources(location: &str) -> Result<Vec<Source>> {
                     let path = entry?.path();
                     if path.extension().and_then(|e| e.to_str()) == Some("wacz") {
                         let abs = path.canonicalize().unwrap_or(path);
-                        sources.push(Source::File(abs));
+                        sources.push(Source::for_file(&abs, home));
                     }
                 }
                 Ok(sources)
             } else if p.extension().and_then(|e| e.to_str()) == Some("wacz") {
                 let abs = p.canonicalize().unwrap_or(p);
-                Ok(vec![Source::File(abs)])
+                Ok(vec![Source::for_file(&abs, home)])
             } else {
                 debug!("skipping non-WACZ path: {}", p.display());
                 Ok(Vec::new())
@@ -80,14 +92,16 @@ fn resolve_sources(location: &str) -> Result<Vec<Source>> {
 /// to a temp file), index its pages and metadata, and upsert its manifest entry.
 fn index_one(
     source: &Source,
+    home: &Path,
     manifest: &mut CollectionManifest,
     search: &Mutex<SearchIndex>,
     name: Option<&str>,
 ) -> Result<()> {
     // A URL is downloaded to a temp file for indexing; the temp file is kept
-    // alive (`_tmp`) for the duration of this function.
+    // alive (`_tmp`) for the duration of this function. File sources are
+    // resolved against home (relative sources live under it).
     let (local, _tmp): (PathBuf, Option<tempfile::NamedTempFile>) = match source {
-        Source::File(p) => (p.clone(), None),
+        Source::File(_) => (source.resolve(home).unwrap(), None),
         Source::Url(u) => {
             info!(url = %u, "downloading remote WACZ for indexing");
             let tmp = download_to_temp(u).with_context(|| format!("downloading {u}"))?;
@@ -400,7 +414,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_path(&fixture("simple.wacz"), tmp.path(), Some("my-collection")).unwrap();
 
-        let manifest = CollectionManifest::open(tmp.path()).unwrap();
+        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections.len(), 1);
         let col = &manifest.collections[0];
         assert_eq!(col.name, "my-collection");
@@ -415,7 +429,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
 
-        let manifest = CollectionManifest::open(tmp.path()).unwrap();
+        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections[0].name, "simple");
     }
 
@@ -426,7 +440,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_path(&fixture("pdf-doc.wacz"), tmp.path(), None).unwrap();
 
-        let manifest = CollectionManifest::open(tmp.path()).unwrap();
+        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections[0].name, "PDF Test Collection");
     }
 
@@ -436,7 +450,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_path(&fixture("pdf-doc.wacz"), tmp.path(), Some("Custom Name")).unwrap();
 
-        let manifest = CollectionManifest::open(tmp.path()).unwrap();
+        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections[0].name, "Custom Name");
     }
 
@@ -445,7 +459,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
 
-        let idx = crate::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
+        let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
         let results = idx.search("example", 10).unwrap();
         assert!(!results.is_empty(), "should find HTML content from WACZ");
         assert_eq!(results[0].collection_name, "simple");
@@ -456,7 +470,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
 
-        let manifest = CollectionManifest::open(tmp.path()).unwrap();
+        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         let col = &manifest.collections[0];
         assert!(
             !col.seed_pages.is_empty(),
@@ -470,7 +484,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
 
-        let idx = crate::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
+        let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
         // The seed page URL "http://example.com/" is part of the collection body.
         let results = idx.search("example.com", 10).unwrap();
         assert!(
@@ -485,7 +499,7 @@ mod tests {
         index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
         index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
 
-        let idx = crate::search::SearchIndex::open(tmp.path().join("full_text").as_path()).unwrap();
+        let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
         let results = idx.search("example", 50).unwrap();
         let pages = results.iter().filter(|r| r.doc_type == "page").count();
         assert_eq!(pages, 1, "re-indexing should upsert, not duplicate pages");

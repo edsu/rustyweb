@@ -49,6 +49,26 @@ impl Source {
             Source::Url(u) => u.clone(),
         }
     }
+
+    /// Build a File source for an absolute path, stored relative to `home` when
+    /// the path is under it (so the home folder is portable), else absolute.
+    pub fn for_file(abs: &Path, home: &Path) -> Source {
+        let home_abs = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+        match abs.strip_prefix(&home_abs) {
+            Ok(rel) => Source::File(rel.to_path_buf()),
+            Err(_) => Source::File(abs.to_path_buf()),
+        }
+    }
+
+    /// Resolve a File source to a concrete path against `home`: relative paths
+    /// are joined to `home`, absolute paths are returned as-is. `None` for URLs.
+    pub fn resolve(&self, home: &Path) -> Option<PathBuf> {
+        match self {
+            Source::File(p) if p.is_absolute() => Some(p.clone()),
+            Source::File(p) => Some(home.join(p)),
+            Source::Url(_) => None,
+        }
+    }
 }
 
 impl From<String> for Source {
@@ -88,12 +108,12 @@ pub struct Collection {
 }
 
 impl Collection {
-    /// Whether the WACZ is available. Local files must exist on disk; remote
-    /// URLs are assumed present (we do not probe the network here).
-    pub fn is_present(&self) -> bool {
-        match &self.source {
-            Source::File(p) => p.exists(),
-            Source::Url(_) => true,
+    /// Whether the WACZ is available, resolving file paths against `home`.
+    /// Local files must exist on disk; remote URLs are assumed present.
+    pub fn is_present(&self, home: &Path) -> bool {
+        match self.source.resolve(home) {
+            Some(path) => path.exists(),
+            None => true, // URL source
         }
     }
 }
