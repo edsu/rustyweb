@@ -134,7 +134,9 @@ rustyweb verify     [--index-dir <DIR>]
   Extracts searchable text from each page (HTML, Browsertrix's rendered
   `urn:text` records, and PDFs), reads `datapackage.json` for collection
   metadata, and records everything in `{index-dir}/collections.json`, including
-  the SHA-256 of each WACZ. Defaults to `./index`.
+  the SHA-256 of each WACZ. The collection name comes from `--name` if given,
+  otherwise the WACZ's `datapackage.json` title, otherwise the filename.
+  Defaults to `./index`.
 - **`serve`** - opens the index read-only and starts the HTTP server. Defaults
   to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and

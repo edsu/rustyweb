@@ -96,19 +96,23 @@ fn index_one(
     };
 
     let id = collection_id(source);
-    let collection_name = name
+
+    // Read metadata from the WACZ datapackage.json up front so its title can
+    // name the collection. Precedence: explicit --name, then the WACZ title,
+    // then the filename/URL stem.
+    let meta = read_datapackage(&local).unwrap_or_default();
+    let display_name = name
         .map(|n| n.to_string())
+        .or_else(|| meta.title.clone().filter(|t| !t.trim().is_empty()))
         .unwrap_or_else(|| source_display_name(source));
 
     // Drop any prior documents for this collection so re-indexing upserts
     // instead of appending duplicates.
     search.lock().unwrap().delete_collection(&id);
 
-    index_wacz(&local, &id, &collection_name, search)?;
-
-    // Read metadata from the WACZ datapackage.json.
-    let meta = read_datapackage(&local).unwrap_or_default();
-    let display_name = meta.title.as_deref().unwrap_or(&collection_name).to_string();
+    // Use the resolved name for page documents so page and collection results
+    // agree on the collection's name.
+    index_wacz(&local, &id, &display_name, search)?;
 
     // Index the collection itself as a searchable document.
     let coll_body = build_collection_body(&meta);
@@ -406,11 +410,34 @@ mod tests {
 
     #[test]
     fn index_path_name_defaults_to_stem() {
+        // simple.wacz has no title in its datapackage, so the name falls back
+        // to the filename stem.
         let tmp = TempDir::new().unwrap();
         index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
 
         let manifest = CollectionManifest::open(tmp.path()).unwrap();
         assert_eq!(manifest.collections[0].name, "simple");
+    }
+
+    #[test]
+    fn index_name_comes_from_datapackage_title() {
+        // pdf-doc.wacz has "title": "PDF Test Collection" in its datapackage,
+        // which should name the collection when --name is not given.
+        let tmp = TempDir::new().unwrap();
+        index_path(&fixture("pdf-doc.wacz"), tmp.path(), None).unwrap();
+
+        let manifest = CollectionManifest::open(tmp.path()).unwrap();
+        assert_eq!(manifest.collections[0].name, "PDF Test Collection");
+    }
+
+    #[test]
+    fn explicit_name_overrides_datapackage_title() {
+        // --name wins even when the WACZ has a title.
+        let tmp = TempDir::new().unwrap();
+        index_path(&fixture("pdf-doc.wacz"), tmp.path(), Some("Custom Name")).unwrap();
+
+        let manifest = CollectionManifest::open(tmp.path()).unwrap();
+        assert_eq!(manifest.collections[0].name, "Custom Name");
     }
 
     #[test]
