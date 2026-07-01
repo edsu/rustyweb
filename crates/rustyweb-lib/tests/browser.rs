@@ -91,15 +91,51 @@ async fn drive_and_check(driver: &WebDriver, addr: SocketAddr, id: &str) -> Resu
     // Poll for the archived page's title text ("2Tone", present in the served
     // HTML <title>) to appear anywhere in the frame tree.
     let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
+    let mut rendered = false;
+    while Instant::now() <= deadline {
         if deep_contains(driver, "2Tone").await? {
-            return Ok(());
-        }
-        if Instant::now() > deadline {
-            let diag = diagnostics(driver).await.unwrap_or_else(|e| e);
-            return Err(format!("archived page title '2Tone' never rendered.\nDIAG: {diag}"));
+            rendered = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !rendered {
+        let diag = diagnostics(driver).await.unwrap_or_else(|e| e);
+        return Err(format!("archived page title '2Tone' never rendered.\nDIAG: {diag}"));
+    }
+
+    check_banner_tracks_navigation(driver).await
+}
+
+/// Verify the banner updates when ReplayWeb.page fires `rwp-url-change`. wabac
+/// dispatches this (non-bubbling) event on the <replay-web-page> element as the
+/// user navigates; our viewer listens on the element and updates the banner. We
+/// dispatch a synthetic event so the check is deterministic (no reliance on
+/// clicking links inside the SPA).
+async fn check_banner_tracks_navigation(driver: &WebDriver) -> Result<(), String> {
+    let new_url = "https://storymaps.arcgis.com/stories/navigation-check";
+    driver
+        .execute(
+            "document.querySelector('replay-web-page')\
+               .dispatchEvent(new CustomEvent('rwp-url-change', {detail: {url: arguments[0]}}));",
+            vec![serde_json::json!(new_url)],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let banner = driver
+        .execute(
+            "return document.getElementById('current-url').textContent;",
+            vec![],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let text = banner.json().as_str().unwrap_or("").to_string();
+    if text == new_url {
+        Ok(())
+    } else {
+        Err(format!("banner did not track rwp-url-change: expected {new_url}, got {text:?}"))
     }
 }
 

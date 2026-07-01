@@ -95,7 +95,10 @@
       document.getElementById('replay-container').appendChild(rp);
 
       // Keep the banner URL in sync as the user navigates within the archive.
-      window.addEventListener('rwp-url-change', function (e) {
+      // ReplayWeb.page dispatches rwp-url-change on the <replay-web-page>
+      // element itself, and it does not bubble, so we listen on the element
+      // (not window).
+      rp.addEventListener('rwp-url-change', function (e) {
         const newUrl = e.detail && e.detail.url;
         if (newUrl) {
           document.getElementById('current-url').textContent = newUrl;
