@@ -1,0 +1,33 @@
+rustyweb
+Copyright (C) 2026 Ed Summers
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See the LICENSE file for the full text.
+
+
+THIRD-PARTY COMPONENTS
+======================
+
+rustyweb bundles and serves software from the Webrecorder project. Webrecorder
+did the hard part — the actual web archive replay — and rustyweb would not exist
+without it. These components are included unmodified and remain under their own
+license:
+
+  ReplayWeb.page  (crates/rustyweb-lib/static/replay/ui.js)
+  wabac.js + wombat (crates/rustyweb-lib/static/replay/sw.js)
+
+    Copyright (C) 2020-2026, Webrecorder Software
+    Licensed under the GNU Affero General Public License v3.0 or later
+    Source: https://github.com/webrecorder/replayweb.page
+            https://github.com/webrecorder/wabac.js
+    Bundled version: ReplayWeb.page 2.4.6 (wabac.js 2.26.4)
+
+These files are fetched from the pinned upstream release by
+scripts/fetch-replay.sh and are not modified by rustyweb. Their corresponding
+source is available at the URLs above.
+
+The ReplayWeb.page/wabac.js bundles themselves incorporate additional
+third-party libraries under permissive licenses (MIT, BSD-3-Clause, Apache-2.0);
+their notices are preserved inline within ui.js and sw.js.

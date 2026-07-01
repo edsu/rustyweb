@@ -15,6 +15,12 @@ pile of [WACZ] files and it gives you:
 It ships as a single self-contained binary — no Solr, no Elasticsearch, no
 separate database server.
 
+> **The web archive replay is entirely [Webrecorder]'s work.** rustyweb bundles
+> and serves [ReplayWeb.page] and [wabac.js] — the browser-side engine that does
+> all the actual replay — and adds a thin Rust layer for indexing, search, and
+> serving. Webrecorder did the heavy lifting; please support them. See
+> [Credits](#credits).
+
 ## How it works
 
 rustyweb runs [ReplayWeb.page] in **WACZ-direct mode**. Rather than
@@ -123,12 +129,14 @@ cargo test -p rustyweb-lib --test browser -- --ignored
 
 ## Why "rustyweb"?
 
-The tool is written in Rust, but it's really a nod to an older idea. In 2013
-[Olivier Thereaux] gave a talk at [Paris Web] called *"Esthétique et pratique du
-Web qui rouille"* — the aesthetics and practice of **the web that rusts** — and
-gathered notes and references under the name [rustyweb][rustyweb-orig]. It was an
-exploration of how web content ages, decays, and transforms over time, and how
-we might redesign sites without razing what came before.
+The tool is written in Rust, and (somewhat confusingly) there's a rusty-web
+library on crates.io But the name rustyweb (no hyphen) is really a nod to an
+older idea. In 2013 [Olivier Thereaux] gave a talk at [Paris Web] called
+*"Esthétique et pratique du Web qui rouille"* — the aesthetics and practice of
+**the web that rusts** — and gathered notes and references under the name
+[rustyweb][rustyweb-orig]. It was an exploration of how web content ages,
+decays, and transforms over time, and how we might redesign sites without
+razing what came before.
 
 A touchstone of that conversation is [Karl Dubost]'s essay
 [*Un site web de 1000 ans*][1000ans] ("A 1000-year website"). Dubost argues that
@@ -143,7 +151,24 @@ This rustyweb is a small tool in service of that same idea: keep the archived
 web readable, searchable, and replayable — let it rust gracefully, but keep
 parts of it around.
 
+## Credits
+
+rustyweb stands almost entirely on the shoulders of [Webrecorder]. The hard
+part — faithfully replaying an archived page in the browser — is done by their
+[ReplayWeb.page] and [wabac.js] (which bundles wombat.js), both of which rustyweb
+ships and serves unmodified. It also builds on the open [WACZ] format and the
+broader web-archiving community. If rustyweb is useful to you, please support
+Webrecorder's work.
+
+## License
+
+rustyweb is licensed under the **GNU Affero General Public License v3.0 or
+later** (AGPL-3.0-or-later) — the same license as the ReplayWeb.page and
+wabac.js components it bundles. See [LICENSE](LICENSE) for the full text and
+[NOTICE](NOTICE) for third-party attributions and bundled-asset details.
+
 [WACZ]: https://specs.webrecorder.net/wacz/latest/
+[Webrecorder]: https://webrecorder.net/
 [ReplayWeb.page]: https://replayweb.page/
 [Paris Web]: https://www.paris-web.fr/
 [Olivier Thereaux]: https://github.com/olivierthereaux
