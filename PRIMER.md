@@ -13,7 +13,7 @@ header-includes:
 {\LARGE A Rust Primer\par}
 
 \vspace{2cm}
-\includegraphics[width=0.55\textwidth]{primer-title.pdf}\par
+\includegraphics[width=0.55\textwidth]{images/primer-title.pdf}\par
 
 \vspace{2cm}
 {\large Claude\par}

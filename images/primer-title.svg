@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">
+  <defs>
+    <linearGradient id="rust" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#E4572E"/>
+      <stop offset="1" stop-color="#B7410E"/>
+    </linearGradient>
+  </defs>
+
+  <!-- stacked archived pages -->
+  <g stroke="#B7410E" stroke-width="4" fill="#fff">
+    <rect x="150" y="150" width="260" height="320" rx="12" transform="rotate(-9 280 310)"/>
+    <rect x="170" y="140" width="260" height="320" rx="12" transform="rotate(-3 300 300)"/>
+    <rect x="190" y="130" width="260" height="320" rx="12"/>
+  </g>
+  <!-- lines of "text" on the top page -->
+  <g stroke="#E4572E" stroke-width="8" stroke-linecap="round" opacity="0.5">
+    <line x1="215" y1="175" x2="405" y2="175"/>
+    <line x1="215" y1="205" x2="405" y2="205"/>
+    <line x1="215" y1="235" x2="360" y2="235"/>
+  </g>
+
+  <!-- Rust-style gear -->
+  <g transform="translate(360 380)">
+    <g fill="url(#rust)">
+      <circle r="92"/>
+      <g id="teeth">
+        <rect x="-16" y="-118" width="32" height="34" rx="6"/>
+      </g>
+      <use href="#teeth" transform="rotate(45)"/>
+      <use href="#teeth" transform="rotate(90)"/>
+      <use href="#teeth" transform="rotate(135)"/>
+      <use href="#teeth" transform="rotate(180)"/>
+      <use href="#teeth" transform="rotate(225)"/>
+      <use href="#teeth" transform="rotate(270)"/>
+      <use href="#teeth" transform="rotate(315)"/>
+    </g>
+    <circle r="46" fill="#fff"/>
+    <text x="0" y="26" font-family="Helvetica, Arial, sans-serif" font-size="76"
+          font-weight="700" text-anchor="middle" fill="#B7410E">R</text>
+  </g>
+</svg>

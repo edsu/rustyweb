@@ -145,6 +145,21 @@ This is also why S3 and other object stores work without any special support in
 rustyweb: expose the object as a range- and CORS-capable HTTPS URL (a public
 object like the one above, or a presigned URL) and index that.
 
+## Searching
+
+The search box matches page titles, page text, and words from the page URL. A
+few things worth knowing (there's also a "Search tips" panel in the app itself):
+
+- **All words must match.** `climate policy` finds pages containing both words.
+  Use `OR` for either (`climate OR weather`) and `-` to exclude (`climate -policy`).
+- **Quotes** search an exact phrase: `"climate policy"`.
+- **Field search**: `title:climate` matches only the title; `domain:example.com`
+  restricts to pages from that exact host.
+- **Grouping and boosting**: `(climate OR weather) risk`, and `climate^2 change`
+  ranks "climate" matches higher.
+
+Title matches rank above body matches, and searches are case-insensitive.
+
 ## Command line
 
 ```
