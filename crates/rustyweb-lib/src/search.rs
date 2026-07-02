@@ -14,6 +14,13 @@ const FIELD_URL: &str = "url";
 const FIELD_TS: &str = "timestamp";
 const FIELD_TITLE: &str = "title";
 const FIELD_BODY: &str = "body";
+/// Exact host of a page URL (e.g. `example.com`), for `domain:` filtering.
+const FIELD_DOMAIN: &str = "domain";
+/// Tokenized words from a page URL (host + path), so URL words are searchable.
+const FIELD_URL_TOKENS: &str = "url_tokens";
+
+/// How much more a title match counts than a body/url match when ranking.
+const TITLE_BOOST: tantivy::Score = 3.0;
 
 pub struct SearchIndex {
     index: Index,
@@ -88,6 +95,10 @@ impl SearchIndex {
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), timestamp);
         doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), title);
         doc.add_text(schema.get_field(FIELD_BODY).unwrap(), body);
+        // Derived URL fields: an exact host for `domain:` filtering, and the
+        // URL's words tokenized so they're searchable as ordinary terms.
+        doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), domain_of(url));
+        doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), url_search_text(url));
         self.writer_mut().add_document(doc)?;
         Ok(())
     }
@@ -109,6 +120,9 @@ impl SearchIndex {
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), collection_name);
         doc.add_text(schema.get_field(FIELD_BODY).unwrap(), body);
+        // Collection docs have no page URL; keep the URL-derived fields empty.
+        doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), "");
+        doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), "");
         self.writer_mut().add_document(doc)?;
         Ok(())
     }
@@ -130,9 +144,22 @@ impl SearchIndex {
         let coll_name_f = schema.get_field(FIELD_COLLECTION_NAME).unwrap();
         let url_f = schema.get_field(FIELD_URL).unwrap();
         let ts_f = schema.get_field(FIELD_TS).unwrap();
+        let domain_f = schema.get_field(FIELD_DOMAIN).unwrap();
+        let url_tokens_f = schema.get_field(FIELD_URL_TOKENS).unwrap();
 
-        let query_parser = QueryParser::for_index(&self.index, vec![title_f, body_f]);
-        let query = query_parser.parse_query(query_str)?;
+        // Bare words search the title, body, and URL words. Other fields
+        // (domain:, url:, title:) are reachable by explicit `field:` syntax.
+        let mut query_parser =
+            QueryParser::for_index(&self.index, vec![title_f, body_f, url_tokens_f]);
+        // Require all terms by default (`climate change` means both), which
+        // matches what people expect from a search box more than OR does.
+        query_parser.set_conjunction_by_default();
+        // A title match is a stronger relevance signal than a body match.
+        query_parser.set_field_boost(title_f, TITLE_BOOST);
+        // Parse leniently: a malformed query (stray quote, bad `field:`) yields
+        // a best-effort query instead of a hard error, so the search box never
+        // 500s while someone is experimenting with syntax.
+        let (query, _errors) = query_parser.parse_query_lenient(query_str);
         let collector = TopDocs::with_limit(limit).order_by_score();
         let top_docs = searcher.search(&query, &collector)?;
 
@@ -150,6 +177,7 @@ impl SearchIndex {
                 collection_id: get_text(&doc, coll_id_f),
                 collection_name: get_text(&doc, coll_name_f),
                 url: get_text(&doc, url_f),
+                domain: get_text(&doc, domain_f),
                 timestamp: get_text(&doc, ts_f),
                 title: get_text(&doc, title_f),
                 snippet: snippet.to_html(),
@@ -166,6 +194,8 @@ pub struct SearchResult {
     pub collection_id: String,
     pub collection_name: String,
     pub url: String,
+    /// Exact host of the page URL (empty for collection results).
+    pub domain: String,
     pub timestamp: String,
     pub title: String,
     pub snippet: String,
@@ -180,7 +210,38 @@ fn build_schema() -> Schema {
     builder.add_text_field(FIELD_TS, STRING | STORED);
     builder.add_text_field(FIELD_TITLE, TEXT | STORED);
     builder.add_text_field(FIELD_BODY, TEXT | STORED);
+    // Exact host, stored so results can show it: matched only by `domain:host`.
+    builder.add_text_field(FIELD_DOMAIN, STRING | STORED);
+    // Tokenized URL words; indexed for search but not stored (we keep the URL).
+    builder.add_text_field(FIELD_URL_TOKENS, TEXT);
     builder.build()
+}
+
+/// The exact host of a URL, lowercased (e.g. `https://Example.com/a` -> `example.com`).
+/// Empty when the URL has no host (relative paths, `urn:`, unparseable input).
+fn domain_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+/// A searchable text rendering of a URL: the host and path with separators
+/// turned into spaces, so the default tokenizer indexes each word. For example
+/// `https://github.com/DocNow/hydrator` yields `github.com DocNow hydrator`,
+/// making a search for `hydrator` match the page.
+fn url_search_text(url: &str) -> String {
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return String::new(),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(host) = parsed.host_str() {
+        parts.push(host);
+    }
+    // Split the path on `/` and keep non-empty segments (drops the leading `/`).
+    parts.extend(parsed.path().split('/').filter(|s| !s.is_empty()));
+    parts.join(" ")
 }
 
 fn get_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
@@ -316,5 +377,104 @@ mod tests {
 
         let results = idx.search("nonexistent", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn domain_of_extracts_lowercased_host() {
+        assert_eq!(domain_of("https://Example.COM/a/b?x=1"), "example.com");
+        assert_eq!(domain_of("http://sub.example.org/"), "sub.example.org");
+        // No host / unparseable input yields an empty domain.
+        assert_eq!(domain_of("urn:text:foo"), "");
+        assert_eq!(domain_of("not a url"), "");
+    }
+
+    #[test]
+    fn url_search_text_yields_host_and_path_words() {
+        let text = url_search_text("https://github.com/DocNow/hydrator");
+        assert_eq!(text, "github.com DocNow hydrator");
+    }
+
+    #[test]
+    fn search_matches_words_from_the_url() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page(
+            "https://github.com/DocNow/hydrator",
+            "20240115120000",
+            "Some Title",
+            "unrelated body text",
+            "abc12345",
+            "Test",
+        ).unwrap();
+        idx.commit().unwrap();
+
+        // "hydrator" appears only in the URL, but url words are searchable.
+        let results = idx.search("hydrator", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://github.com/DocNow/hydrator");
+        assert_eq!(results[0].domain, "github.com");
+    }
+
+    #[test]
+    fn domain_filter_restricts_to_exact_host() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page("https://example.com/one", "20240101000000", "One", "shared word", "c1", "C1").unwrap();
+        idx.index_page("https://other.org/two", "20240101000000", "Two", "shared word", "c1", "C1").unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.search("domain:example.com", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/one");
+
+        // Combined with a term, still AND-scoped to that domain.
+        let results = idx.search("domain:example.com shared", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/one");
+    }
+
+    #[test]
+    fn multi_word_queries_require_all_terms() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page("https://ex.com/a", "20240101000000", "A", "alpha beta", "c1", "C1").unwrap();
+        idx.index_page("https://ex.com/b", "20240101000000", "B", "alpha gamma", "c1", "C1").unwrap();
+        idx.commit().unwrap();
+
+        // AND-by-default: only the page containing BOTH words matches.
+        let results = idx.search("alpha beta", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://ex.com/a");
+
+        // A term present in neither-together combination returns nothing.
+        let results = idx.search("beta gamma", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn title_matches_rank_above_body_matches() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        // The term is in page 1's title and page 2's body only.
+        idx.index_page("https://ex.com/title-hit", "20240101000000", "kangaroo", "filler text", "c1", "C1").unwrap();
+        idx.index_page("https://ex.com/body-hit", "20240101000000", "filler", "kangaroo text", "c1", "C1").unwrap();
+        idx.commit().unwrap();
+
+        let results = idx.search("kangaroo", 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].url, "https://ex.com/title-hit", "title match should rank first");
+    }
+
+    #[test]
+    fn malformed_query_does_not_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page("https://ex.com/a", "20240101000000", "A", "hello world", "c1", "C1").unwrap();
+        idx.commit().unwrap();
+
+        // An unbalanced quote would be a parse error; lenient parsing must not
+        // propagate it as an Err (the search box should never 500).
+        assert!(idx.search("\"hello", 10).is_ok());
+        assert!(idx.search("title:", 10).is_ok());
     }
 }
