@@ -298,10 +298,15 @@ async fn search_page(
                 )
             };
 
-            let snippet_html = if r.snippet.is_empty() {
-                String::new()
-            } else {
+            // Prefer the hit-highlighted body snippet; if the query didn't match
+            // the body (e.g. a title-only or URL-only hit), fall back to the
+            // page's description so the result still has context.
+            let snippet_html = if !r.snippet.is_empty() {
                 format!("<div class=\"snippet\">{}</div>", r.snippet)
+            } else if !r.description.is_empty() {
+                format!("<div class=\"snippet\">{}</div>", html_escape(&r.description))
+            } else {
+                String::new()
             };
 
             let url_display = if is_collection {
@@ -786,9 +791,9 @@ fn search_tips_html() -> &'static str {
     r#"<details class="tips">
   <summary>Search tips</summary>
   <div class="tips-body">
-    <p>Type words to search page titles, page text, and URLs. <strong>All
-    words must match</strong> - <code>climate policy</code> finds pages
-    containing both.</p>
+    <p>Type words to search page titles, headings, page text, descriptions, and
+    URLs. <strong>All words must match</strong> - <code>climate policy</code>
+    finds pages containing both.</p>
     <ul>
       <li><code>"climate policy"</code> - an exact phrase (use quotes)</li>
       <li><code>climate OR weather</code> - either word</li>

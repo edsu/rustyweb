@@ -99,18 +99,20 @@ Two document types share the same index, distinguished by `doc_type`.
 | `timestamp` | STRING | ✓ | - | 14-digit crawl timestamp |
 | `title` | TEXT | ✓ | BM25 | Page title or collection name |
 | `body` | TEXT | ✓ | BM25 | Page body text or collection description + seed URLs |
+| `description` | TEXT | ✓ | BM25 | Page `<meta description>` / og:description; shown as a snippet fallback |
+| `headings` | TEXT | - | BM25 | Page `<h1>`/`<h2>` text; boosted at query time |
 | `domain` | STRING | ✓ | exact | Lowercased host of the page URL, for `domain:` filtering (empty for collection docs) |
 | `url_tokens` | TEXT | - | BM25 | URL host + path split into words, so URL words are searchable as ordinary terms |
 
-`body` is stored (not just indexed) so that Tantivy's `SnippetGenerator` can produce hit-highlighted excerpts without re-reading the source files. `url_tokens` is indexed but not stored: it exists only to make URL words findable; the canonical URL is kept in `url`.
+`body` and `description` are stored (not just indexed) so that Tantivy's `SnippetGenerator` can produce hit-highlighted excerpts without re-reading the source files, and so a result can show the description when the query didn't match the body. `headings` and `url_tokens` are indexed but not stored: they exist only to make that text findable; the canonical URL is kept in `url`.
 
 ### Query behavior
 
 Queries go through Tantivy's `QueryParser`, configured in `SearchIndex::search`:
 
-- **Default fields** are `title`, `body`, and `url_tokens`, so a bare word matches the title, page text, or URL words. Other fields are reachable with explicit `field:` syntax (`title:climate`, `domain:example.com`).
+- **Default fields** are `title`, `headings`, `body`, `description`, and `url_tokens`, so a bare word matches any of them. Other fields are reachable with explicit `field:` syntax (`title:climate`, `domain:example.com`).
 - **AND by default** (`set_conjunction_by_default`): `climate policy` requires both terms. Users can still write `OR`, `-`, `+`, `"phrases"`, `(groups)`, and `^boost`.
-- **Title boost**: title matches are boosted (`set_field_boost`) so they rank above body-only matches.
+- **Field boosts** (`set_field_boost`): title matches rank highest, headings next, then body/description/URL.
 - **Lenient parsing** (`parse_query_lenient`): a malformed query (stray quote, empty `field:`) yields a best-effort query rather than an error, so the search box never returns a 500 while a user experiments with syntax.
 
 The `<details>` "Search tips" panel on the homepage and results page documents this syntax for end users; its examples must stay in sync with this configuration.

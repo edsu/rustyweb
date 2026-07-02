@@ -198,12 +198,16 @@ fn build_collection_body(meta: &crate::wacz::WaczMetadata) -> String {
 
 /// A raw contribution to a page's search document, parsed from one WARC record.
 enum RawRecord {
-    /// An HTML response: source of the page title and a scraped-text fallback body.
+    /// An HTML response: source of the page title, description, headings, and a
+    /// scraped-text fallback body. (PDF responses reuse this variant with just a
+    /// title and body.)
     Html {
         url: String,
         timestamp: String,
         title: String,
         body: String,
+        description: String,
+        headings: String,
     },
     /// A `urn:text:` resource record: Browsertrix's fully rendered (post-JS)
     /// page text. Richer than scraped HTML, especially for SPAs.
@@ -221,6 +225,8 @@ struct MergedPage {
     title: Option<String>,
     html_body: Option<String>,
     rendered_text: Option<String>,
+    description: Option<String>,
+    headings: Option<String>,
 }
 
 /// Index all WARC entries inside a WACZ file into the Tantivy full-text index.
@@ -252,7 +258,7 @@ fn index_wacz(
     let mut pages: HashMap<String, MergedPage> = HashMap::new();
     for raw in per_warc.into_iter().flatten() {
         match raw {
-            RawRecord::Html { url, timestamp, title, body } => {
+            RawRecord::Html { url, timestamp, title, body, description, headings } => {
                 let e = pages.entry(url).or_default();
                 // The HTML capture is the authoritative timestamp for replay.
                 e.timestamp = timestamp;
@@ -261,6 +267,12 @@ fn index_wacz(
                 }
                 if !body.is_empty() {
                     e.html_body = Some(body);
+                }
+                if !description.is_empty() {
+                    e.description = Some(description);
+                }
+                if !headings.is_empty() {
+                    e.headings = Some(headings);
                 }
             }
             RawRecord::Text { url, timestamp, text } => {
@@ -275,15 +287,27 @@ fn index_wacz(
 
     let mut count = 0u64;
     {
+        use crate::search::Page;
         let mut s = search.lock().unwrap();
         for (url, m) in pages {
             // Prefer the fully rendered text; fall back to scraped HTML.
             let body = m.rendered_text.or(m.html_body).unwrap_or_default();
             let title = m.title.unwrap_or_default();
-            if title.is_empty() && body.is_empty() {
+            let description = m.description.unwrap_or_default();
+            let headings = m.headings.unwrap_or_default();
+            if title.is_empty() && body.is_empty() && description.is_empty() {
                 continue;
             }
-            s.index_page(&url, &m.timestamp, &title, &body, collection_id, collection_name)?;
+            s.index_page(&Page {
+                url: &url,
+                timestamp: &m.timestamp,
+                title: &title,
+                body: &body,
+                description: &description,
+                headings: &headings,
+                collection_id,
+                collection_name,
+            })?;
             count += 1;
         }
     }
@@ -347,6 +371,8 @@ fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
                         timestamp: record.timestamp.clone(),
                         title: pdf_title_from_url(uri),
                         body: text,
+                        description: String::new(),
+                        headings: String::new(),
                     });
                 } else {
                     debug!(url = uri, "PDF text extraction yielded nothing; skipping");
@@ -358,15 +384,17 @@ fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
         if !mime.contains("html") || record.payload.is_empty() {
             continue;
         }
-        let (title, body) = extract_html_text(&record.payload);
-        if title.is_empty() && body.is_empty() {
+        let html = extract_html_text(&record.payload);
+        if html.title.is_empty() && html.body.is_empty() && html.description.is_empty() {
             continue;
         }
         out.push(RawRecord::Html {
             url: uri.to_string(),
             timestamp: record.timestamp.clone(),
-            title,
-            body,
+            title: html.title,
+            body: html.body,
+            description: html.description,
+            headings: html.headings,
         });
     }
 

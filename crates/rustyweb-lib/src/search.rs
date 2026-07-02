@@ -18,9 +18,15 @@ const FIELD_BODY: &str = "body";
 const FIELD_DOMAIN: &str = "domain";
 /// Tokenized words from a page URL (host + path), so URL words are searchable.
 const FIELD_URL_TOKENS: &str = "url_tokens";
+/// Page description from `<meta name=description>` / `og:description`.
+const FIELD_DESCRIPTION: &str = "description";
+/// Concatenated `<h1>`/`<h2>` heading text.
+const FIELD_HEADINGS: &str = "headings";
 
 /// How much more a title match counts than a body/url match when ranking.
 const TITLE_BOOST: tantivy::Score = 3.0;
+/// Headings rank above body text but below the title.
+const HEADINGS_BOOST: tantivy::Score = 2.0;
 
 pub struct SearchIndex {
     index: Index,
@@ -76,29 +82,24 @@ impl SearchIndex {
         self.writer_mut().delete_term(Term::from_field_text(field, collection_id));
     }
 
-    /// Index a single HTML page from an archive.
-    pub fn index_page(
-        &mut self,
-        url: &str,
-        timestamp: &str,
-        title: &str,
-        body: &str,
-        collection_id: &str,
-        collection_name: &str,
-    ) -> Result<()> {
+    /// Index a single page from an archive. Fields not set on the [`Page`]
+    /// default to empty, so callers only populate what they have.
+    pub fn index_page(&mut self, page: &Page) -> Result<()> {
         let schema = self.index.schema();
         let mut doc = TantivyDocument::default();
         doc.add_text(schema.get_field(FIELD_DOC_TYPE).unwrap(), "page");
-        doc.add_text(schema.get_field(FIELD_COLLECTION_ID).unwrap(), collection_id);
-        doc.add_text(schema.get_field(FIELD_COLLECTION_NAME).unwrap(), collection_name);
-        doc.add_text(schema.get_field(FIELD_URL).unwrap(), url);
-        doc.add_text(schema.get_field(FIELD_TS).unwrap(), timestamp);
-        doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), title);
-        doc.add_text(schema.get_field(FIELD_BODY).unwrap(), body);
+        doc.add_text(schema.get_field(FIELD_COLLECTION_ID).unwrap(), page.collection_id);
+        doc.add_text(schema.get_field(FIELD_COLLECTION_NAME).unwrap(), page.collection_name);
+        doc.add_text(schema.get_field(FIELD_URL).unwrap(), page.url);
+        doc.add_text(schema.get_field(FIELD_TS).unwrap(), page.timestamp);
+        doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), page.title);
+        doc.add_text(schema.get_field(FIELD_BODY).unwrap(), page.body);
+        doc.add_text(schema.get_field(FIELD_DESCRIPTION).unwrap(), page.description);
+        doc.add_text(schema.get_field(FIELD_HEADINGS).unwrap(), page.headings);
         // Derived URL fields: an exact host for `domain:` filtering, and the
         // URL's words tokenized so they're searchable as ordinary terms.
-        doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), domain_of(url));
-        doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), url_search_text(url));
+        doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), domain_of(page.url));
+        doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), url_search_text(page.url));
         self.writer_mut().add_document(doc)?;
         Ok(())
     }
@@ -120,7 +121,9 @@ impl SearchIndex {
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), collection_name);
         doc.add_text(schema.get_field(FIELD_BODY).unwrap(), body);
-        // Collection docs have no page URL; keep the URL-derived fields empty.
+        // Collection docs have no page URL or HTML metadata; keep those empty.
+        doc.add_text(schema.get_field(FIELD_DESCRIPTION).unwrap(), "");
+        doc.add_text(schema.get_field(FIELD_HEADINGS).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), "");
         self.writer_mut().add_document(doc)?;
@@ -146,16 +149,22 @@ impl SearchIndex {
         let ts_f = schema.get_field(FIELD_TS).unwrap();
         let domain_f = schema.get_field(FIELD_DOMAIN).unwrap();
         let url_tokens_f = schema.get_field(FIELD_URL_TOKENS).unwrap();
+        let description_f = schema.get_field(FIELD_DESCRIPTION).unwrap();
+        let headings_f = schema.get_field(FIELD_HEADINGS).unwrap();
 
-        // Bare words search the title, body, and URL words. Other fields
-        // (domain:, url:, title:) are reachable by explicit `field:` syntax.
-        let mut query_parser =
-            QueryParser::for_index(&self.index, vec![title_f, body_f, url_tokens_f]);
+        // Bare words search the title, headings, body, description, and URL
+        // words. Other fields (domain:, url:, title:) are reachable by explicit
+        // `field:` syntax.
+        let mut query_parser = QueryParser::for_index(
+            &self.index,
+            vec![title_f, headings_f, body_f, description_f, url_tokens_f],
+        );
         // Require all terms by default (`climate change` means both), which
         // matches what people expect from a search box more than OR does.
         query_parser.set_conjunction_by_default();
-        // A title match is a stronger relevance signal than a body match.
+        // A title match is the strongest relevance signal; headings next.
         query_parser.set_field_boost(title_f, TITLE_BOOST);
+        query_parser.set_field_boost(headings_f, HEADINGS_BOOST);
         // Parse leniently: a malformed query (stray quote, bad `field:`) yields
         // a best-effort query instead of a hard error, so the search box never
         // 500s while someone is experimenting with syntax.
@@ -180,12 +189,28 @@ impl SearchIndex {
                 domain: get_text(&doc, domain_f),
                 timestamp: get_text(&doc, ts_f),
                 title: get_text(&doc, title_f),
+                description: get_text(&doc, description_f),
                 snippet: snippet.to_html(),
             });
         }
 
         Ok(results)
     }
+}
+
+/// The indexable fields of one page. Borrowed string slices so callers can pass
+/// references without cloning; unset fields default to `""` via [`Default`], so
+/// adding a field here does not force every call site to change.
+#[derive(Debug, Default)]
+pub struct Page<'a> {
+    pub url: &'a str,
+    pub timestamp: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub description: &'a str,
+    pub headings: &'a str,
+    pub collection_id: &'a str,
+    pub collection_name: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +223,8 @@ pub struct SearchResult {
     pub domain: String,
     pub timestamp: String,
     pub title: String,
+    /// Page description (`<meta description>` / og:description), if any.
+    pub description: String,
     pub snippet: String,
 }
 
@@ -210,6 +237,10 @@ fn build_schema() -> Schema {
     builder.add_text_field(FIELD_TS, STRING | STORED);
     builder.add_text_field(FIELD_TITLE, TEXT | STORED);
     builder.add_text_field(FIELD_BODY, TEXT | STORED);
+    // Description is stored so it can be shown when a page has no body snippet.
+    builder.add_text_field(FIELD_DESCRIPTION, TEXT | STORED);
+    // Headings are indexed (and boosted at query time) but not stored.
+    builder.add_text_field(FIELD_HEADINGS, TEXT);
     // Exact host, stored so results can show it: matched only by `domain:host`.
     builder.add_text_field(FIELD_DOMAIN, STRING | STORED);
     // Tokenized URL words; indexed for search but not stored (we keep the URL).
@@ -251,8 +282,20 @@ fn get_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
         .to_string()
 }
 
-/// Extract `(title, body_text)` from raw HTML bytes, skipping script/style content.
-pub fn extract_html_text(html: &[u8]) -> (String, String) {
+/// Text extracted from an HTML page for indexing.
+#[derive(Debug, Default, PartialEq)]
+pub struct HtmlText {
+    pub title: String,
+    pub body: String,
+    /// `<meta name=description>` or `og:description`, if present.
+    pub description: String,
+    /// Concatenated `<h1>`/`<h2>` heading text.
+    pub headings: String,
+}
+
+/// Extract title, body text, description, and headings from raw HTML bytes,
+/// skipping script/style content.
+pub fn extract_html_text(html: &[u8]) -> HtmlText {
     use scraper::{Html, Selector};
 
     let html_str = String::from_utf8_lossy(html);
@@ -266,6 +309,20 @@ pub fn extract_html_text(html: &[u8]) -> (String, String) {
         .unwrap_or_default()
         .trim()
         .to_string();
+
+    // Description: prefer <meta name="description">, fall back to og:description.
+    let description = meta_content(&doc, "meta[name=description]")
+        .or_else(|| meta_content(&doc, "meta[property=\"og:description\"]"))
+        .unwrap_or_default();
+
+    // Headings: h1 and h2 text, in document order.
+    let heading_sel = Selector::parse("h1, h2").unwrap();
+    let headings = doc
+        .select(&heading_sel)
+        .map(|e| e.text().collect::<String>().trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let body_sel = Selector::parse("body").unwrap();
     let skip_sel = Selector::parse("script, style, noscript").unwrap();
@@ -292,7 +349,23 @@ pub fn extract_html_text(html: &[u8]) -> (String, String) {
         }
     }
 
-    (title, body_parts.join(" "))
+    HtmlText {
+        title,
+        body: body_parts.join(" "),
+        description,
+        headings,
+    }
+}
+
+/// The trimmed `content` attribute of the first element matching `selector`,
+/// dropped if empty. `selector` must be a valid CSS selector.
+fn meta_content(doc: &scraper::Html, selector: &str) -> Option<String> {
+    let sel = scraper::Selector::parse(selector).ok()?;
+    doc.select(&sel)
+        .next()
+        .and_then(|e| e.value().attr("content"))
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
 }
 
 #[cfg(test)]
@@ -300,13 +373,38 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Build a page with the common fields; unset fields default to empty.
+    fn page<'a>(url: &'a str, title: &'a str, body: &'a str, cid: &'a str, cname: &'a str) -> Page<'a> {
+        Page { url, title, body, collection_id: cid, collection_name: cname, ..Default::default() }
+    }
+
     #[test]
     fn extract_text_from_html() {
         let html = b"<html><head><title>Hello World</title></head><body><p>Some text</p><script>var x=1;</script></body></html>";
-        let (title, body) = extract_html_text(html);
-        assert_eq!(title, "Hello World");
-        assert!(body.contains("Some text"), "body: {body}");
-        assert!(!body.contains("var x"), "should exclude script content: {body}");
+        let t = extract_html_text(html);
+        assert_eq!(t.title, "Hello World");
+        assert!(t.body.contains("Some text"), "body: {}", t.body);
+        assert!(!t.body.contains("var x"), "should exclude script content: {}", t.body);
+    }
+
+    #[test]
+    fn extract_description_and_headings_from_html() {
+        let html = br#"<html><head><title>T</title>
+            <meta name="description" content="A concise summary">
+            <meta property="og:description" content="OG fallback"></head>
+            <body><h1>Main Heading</h1><h2>Sub Heading</h2><p>Body.</p></body></html>"#;
+        let t = extract_html_text(html);
+        assert_eq!(t.description, "A concise summary");
+        assert!(t.headings.contains("Main Heading"), "headings: {}", t.headings);
+        assert!(t.headings.contains("Sub Heading"), "headings: {}", t.headings);
+    }
+
+    #[test]
+    fn description_falls_back_to_og_description() {
+        let html = br#"<html><head><meta property="og:description" content="OG only"></head>
+            <body>x</body></html>"#;
+        let t = extract_html_text(html);
+        assert_eq!(t.description, "OG only");
     }
 
     #[test]
@@ -314,14 +412,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
 
-        idx.index_page(
+        idx.index_page(&page(
             "http://example.com/",
-            "20240115120000",
             "Example Page",
             "This is some interesting content about Rust programming",
             "abc12345",
             "My Collection",
-        ).unwrap();
+        )).unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("Rust programming", 10).unwrap();
@@ -329,6 +426,27 @@ mod tests {
         assert_eq!(results[0].url, "http://example.com/");
         assert_eq!(results[0].collection_id, "abc12345");
         assert_eq!(results[0].doc_type, "page");
+    }
+
+    #[test]
+    fn description_and_headings_are_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page(&Page {
+            url: "https://ex.com/a",
+            title: "Plain Title",
+            body: "ordinary body",
+            description: "a treatise on marmots",
+            headings: "Notable Rodents",
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        assert_eq!(idx.search("marmots", 10).unwrap().len(), 1, "description searchable");
+        assert_eq!(idx.search("rodents", 10).unwrap().len(), 1, "headings searchable");
+        assert_eq!(idx.search("a", 10).unwrap()[0].description, "a treatise on marmots");
     }
 
     #[test]
@@ -354,14 +472,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
 
-        idx.index_page(
+        idx.index_page(&page(
             "http://example.com/",
-            "20240115120000",
             "Example",
             "The quick brown fox jumps over the lazy dog near the riverbank",
             "abc12345",
             "Test",
-        ).unwrap();
+        )).unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("fox", 10).unwrap();
@@ -398,14 +515,13 @@ mod tests {
     fn search_matches_words_from_the_url() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        idx.index_page(
+        idx.index_page(&page(
             "https://github.com/DocNow/hydrator",
-            "20240115120000",
             "Some Title",
             "unrelated body text",
             "abc12345",
             "Test",
-        ).unwrap();
+        )).unwrap();
         idx.commit().unwrap();
 
         // "hydrator" appears only in the URL, but url words are searchable.
@@ -419,8 +535,8 @@ mod tests {
     fn domain_filter_restricts_to_exact_host() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        idx.index_page("https://example.com/one", "20240101000000", "One", "shared word", "c1", "C1").unwrap();
-        idx.index_page("https://other.org/two", "20240101000000", "Two", "shared word", "c1", "C1").unwrap();
+        idx.index_page(&page("https://example.com/one", "One", "shared word", "c1", "C1")).unwrap();
+        idx.index_page(&page("https://other.org/two", "Two", "shared word", "c1", "C1")).unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("domain:example.com", 10).unwrap();
@@ -437,8 +553,8 @@ mod tests {
     fn multi_word_queries_require_all_terms() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        idx.index_page("https://ex.com/a", "20240101000000", "A", "alpha beta", "c1", "C1").unwrap();
-        idx.index_page("https://ex.com/b", "20240101000000", "B", "alpha gamma", "c1", "C1").unwrap();
+        idx.index_page(&page("https://ex.com/a", "A", "alpha beta", "c1", "C1")).unwrap();
+        idx.index_page(&page("https://ex.com/b", "B", "alpha gamma", "c1", "C1")).unwrap();
         idx.commit().unwrap();
 
         // AND-by-default: only the page containing BOTH words matches.
@@ -456,8 +572,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
         // The term is in page 1's title and page 2's body only.
-        idx.index_page("https://ex.com/title-hit", "20240101000000", "kangaroo", "filler text", "c1", "C1").unwrap();
-        idx.index_page("https://ex.com/body-hit", "20240101000000", "filler", "kangaroo text", "c1", "C1").unwrap();
+        idx.index_page(&page("https://ex.com/title-hit", "kangaroo", "filler text", "c1", "C1")).unwrap();
+        idx.index_page(&page("https://ex.com/body-hit", "filler", "kangaroo text", "c1", "C1")).unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("kangaroo", 10).unwrap();
@@ -469,7 +585,7 @@ mod tests {
     fn malformed_query_does_not_error() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        idx.index_page("https://ex.com/a", "20240101000000", "A", "hello world", "c1", "C1").unwrap();
+        idx.index_page(&page("https://ex.com/a", "A", "hello world", "c1", "C1")).unwrap();
         idx.commit().unwrap();
 
         // An unbalanced quote would be a parse error; lenient parsing must not
