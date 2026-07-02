@@ -8,11 +8,6 @@
 /archive
 /a
 
-# Scratch captures and screenshots
-*.har
-*.png
-test.txt
-
 # Node / Playwright tooling (not used)
 /node_modules
 /package.json
@@ -20,6 +15,3 @@ test.txt
 
 # bv (beads viewer) local config and caches
 .bv/
-
-archive
-index
