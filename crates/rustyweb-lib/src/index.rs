@@ -208,6 +208,10 @@ enum RawRecord {
         body: String,
         description: String,
         headings: String,
+        /// `"html"` or `"pdf"`.
+        media_type: String,
+        /// `<html lang>` value (empty for PDFs).
+        lang: String,
     },
     /// A `urn:text:` resource record: Browsertrix's fully rendered (post-JS)
     /// page text. Richer than scraped HTML, especially for SPAs.
@@ -227,6 +231,8 @@ struct MergedPage {
     rendered_text: Option<String>,
     description: Option<String>,
     headings: Option<String>,
+    media_type: Option<String>,
+    lang: Option<String>,
 }
 
 /// Index all WARC entries inside a WACZ file into the Tantivy full-text index.
@@ -258,7 +264,7 @@ fn index_wacz(
     let mut pages: HashMap<String, MergedPage> = HashMap::new();
     for raw in per_warc.into_iter().flatten() {
         match raw {
-            RawRecord::Html { url, timestamp, title, body, description, headings } => {
+            RawRecord::Html { url, timestamp, title, body, description, headings, media_type, lang } => {
                 let e = pages.entry(url).or_default();
                 // The HTML capture is the authoritative timestamp for replay.
                 e.timestamp = timestamp;
@@ -274,6 +280,12 @@ fn index_wacz(
                 if !headings.is_empty() {
                     e.headings = Some(headings);
                 }
+                if !media_type.is_empty() {
+                    e.media_type = Some(media_type);
+                }
+                if !lang.is_empty() {
+                    e.lang = Some(lang);
+                }
             }
             RawRecord::Text { url, timestamp, text } => {
                 let e = pages.entry(url).or_default();
@@ -281,6 +293,8 @@ fn index_wacz(
                     e.timestamp = timestamp;
                 }
                 e.rendered_text = Some(text);
+                // Rendered text always comes from an HTML page.
+                e.media_type.get_or_insert_with(|| "html".to_string());
             }
         }
     }
@@ -295,6 +309,8 @@ fn index_wacz(
             let title = m.title.unwrap_or_default();
             let description = m.description.unwrap_or_default();
             let headings = m.headings.unwrap_or_default();
+            let media_type = m.media_type.unwrap_or_default();
+            let lang = m.lang.unwrap_or_default();
             if title.is_empty() && body.is_empty() && description.is_empty() {
                 continue;
             }
@@ -305,6 +321,8 @@ fn index_wacz(
                 body: &body,
                 description: &description,
                 headings: &headings,
+                media_type: &media_type,
+                lang: &lang,
                 collection_id,
                 collection_name,
             })?;
@@ -373,6 +391,8 @@ fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
                         body: text,
                         description: String::new(),
                         headings: String::new(),
+                        media_type: "pdf".to_string(),
+                        lang: String::new(),
                     });
                 } else {
                     debug!(url = uri, "PDF text extraction yielded nothing; skipping");
@@ -395,6 +415,8 @@ fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
             body: html.body,
             description: html.description,
             headings: html.headings,
+            media_type: "html".to_string(),
+            lang: html.lang,
         });
     }
 
@@ -480,6 +502,21 @@ mod tests {
 
         let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections[0].name, "Custom Name");
+    }
+
+    #[test]
+    fn pdf_pages_are_filterable_by_type() {
+        // End-to-end: a PDF response in the WACZ should be tagged type:pdf so
+        // it can be filtered from the search box.
+        let tmp = TempDir::new().unwrap();
+        index_path(&fixture("pdf-doc.wacz"), tmp.path(), None).unwrap();
+
+        let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+        let results = idx.search("type:pdf", 10).unwrap();
+        assert!(
+            results.iter().any(|r| r.doc_type == "page"),
+            "PDF page should be reachable via type:pdf"
+        );
     }
 
     #[test]

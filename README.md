@@ -156,7 +156,8 @@ tips" panel in the app itself):
 - **Quotes** search an exact phrase: `"climate policy"`.
 - **Field search**: `title:climate` matches only the title; `domain:example.com`
   restricts to pages from that exact host; `year:2021` (or `year:[2020 TO 2023]`)
-  filters by crawl year.
+  filters by crawl year; `type:pdf` and `lang:en` filter by media type and
+  language.
 - **Grouping and boosting**: `(climate OR weather) risk`, and `climate^2 change`
   ranks "climate" matches higher.
 

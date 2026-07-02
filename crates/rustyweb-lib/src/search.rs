@@ -24,6 +24,10 @@ const FIELD_DESCRIPTION: &str = "description";
 const FIELD_HEADINGS: &str = "headings";
 /// Four-digit crawl year (from the page timestamp), for `year:` filtering.
 const FIELD_YEAR: &str = "year";
+/// Coarse media type of the page: `html` or `pdf`, for `type:` filtering.
+const FIELD_MEDIA_TYPE: &str = "type";
+/// Primary language subtag from `<html lang>` (e.g. `en`), for `lang:` filtering.
+const FIELD_LANG: &str = "lang";
 
 /// How much more a title match counts than a body/url match when ranking.
 const TITLE_BOOST: tantivy::Score = 3.0;
@@ -106,6 +110,8 @@ impl SearchIndex {
         if let Some(year) = year_of(page.timestamp) {
             doc.add_u64(schema.get_field(FIELD_YEAR).unwrap(), year);
         }
+        doc.add_text(schema.get_field(FIELD_MEDIA_TYPE).unwrap(), page.media_type);
+        doc.add_text(schema.get_field(FIELD_LANG).unwrap(), primary_lang(page.lang));
         self.writer_mut().add_document(doc)?;
         Ok(())
     }
@@ -132,6 +138,8 @@ impl SearchIndex {
         doc.add_text(schema.get_field(FIELD_HEADINGS).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), "");
+        doc.add_text(schema.get_field(FIELD_MEDIA_TYPE).unwrap(), "");
+        doc.add_text(schema.get_field(FIELD_LANG).unwrap(), "");
         self.writer_mut().add_document(doc)?;
         Ok(())
     }
@@ -215,6 +223,10 @@ pub struct Page<'a> {
     pub body: &'a str,
     pub description: &'a str,
     pub headings: &'a str,
+    /// Coarse media type: `"html"` or `"pdf"` (empty if unknown).
+    pub media_type: &'a str,
+    /// Page language tag, e.g. `"en-US"` (stored as its primary subtag).
+    pub lang: &'a str,
     pub collection_id: &'a str,
     pub collection_name: &'a str,
 }
@@ -253,7 +265,20 @@ fn build_schema() -> Schema {
     builder.add_text_field(FIELD_URL_TOKENS, TEXT);
     // Numeric crawl year, indexed for `year:2021` and `year:[2020 TO 2023]`.
     builder.add_u64_field(FIELD_YEAR, INDEXED | STORED);
+    // Coarse media type (`html`/`pdf`) and page language, for exact filtering.
+    builder.add_text_field(FIELD_MEDIA_TYPE, STRING | STORED);
+    builder.add_text_field(FIELD_LANG, STRING | STORED);
     builder.build()
+}
+
+/// The primary language subtag of an HTML `lang` attribute, lowercased
+/// (`en-US` -> `en`). Empty when there's no usable value.
+fn primary_lang(lang: &str) -> String {
+    lang.split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// The four-digit crawl year parsed from a 14-digit page timestamp
@@ -307,6 +332,8 @@ pub struct HtmlText {
     pub description: String,
     /// Concatenated `<h1>`/`<h2>` heading text.
     pub headings: String,
+    /// The `<html lang>` attribute value, if present (e.g. `en`, `en-US`).
+    pub lang: String,
 }
 
 /// Extract title, body text, description, and headings from raw HTML bytes,
@@ -340,6 +367,16 @@ pub fn extract_html_text(html: &[u8]) -> HtmlText {
         .collect::<Vec<_>>()
         .join(" ");
 
+    // Language from the <html lang="..."> attribute, if any.
+    let html_sel = Selector::parse("html").unwrap();
+    let lang = doc
+        .select(&html_sel)
+        .next()
+        .and_then(|e| e.value().attr("lang"))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
     let body_sel = Selector::parse("body").unwrap();
     let skip_sel = Selector::parse("script, style, noscript").unwrap();
     let mut body_parts: Vec<String> = Vec::new();
@@ -370,6 +407,7 @@ pub fn extract_html_text(html: &[u8]) -> HtmlText {
         body: body_parts.join(" "),
         description,
         headings,
+        lang,
     }
 }
 
@@ -426,6 +464,49 @@ mod tests {
             <body>x</body></html>"#;
         let t = extract_html_text(html);
         assert_eq!(t.description, "OG only");
+    }
+
+    #[test]
+    fn extract_lang_from_html_element() {
+        let html = br#"<html lang="en-US"><head><title>T</title></head><body>x</body></html>"#;
+        let t = extract_html_text(html);
+        assert_eq!(t.lang, "en-US");
+    }
+
+    #[test]
+    fn primary_lang_takes_the_first_subtag() {
+        assert_eq!(primary_lang("en-US"), "en");
+        assert_eq!(primary_lang("EN"), "en");
+        assert_eq!(primary_lang("pt_BR"), "pt");
+        assert_eq!(primary_lang(""), "");
+    }
+
+    #[test]
+    fn type_and_lang_filters() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page(&Page {
+            url: "https://ex.com/page", title: "Doc", body: "shared", media_type: "html",
+            lang: "en-US", collection_id: "c1", collection_name: "C1", ..Default::default()
+        }).unwrap();
+        idx.index_page(&Page {
+            url: "https://ex.com/file.pdf", title: "Report", body: "shared", media_type: "pdf",
+            lang: "", collection_id: "c1", collection_name: "C1", ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        let r = idx.search("type:pdf", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://ex.com/file.pdf");
+
+        let r = idx.search("shared type:html", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://ex.com/page");
+
+        // lang is stored as its primary subtag, so `lang:en` matches `en-US`.
+        let r = idx.search("lang:en", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://ex.com/page");
     }
 
     #[test]
