@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Schema, Value, STORED, STRING, TEXT};
+use tantivy::schema::{Schema, Value, INDEXED, STORED, STRING, TEXT};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
@@ -22,6 +22,8 @@ const FIELD_URL_TOKENS: &str = "url_tokens";
 const FIELD_DESCRIPTION: &str = "description";
 /// Concatenated `<h1>`/`<h2>` heading text.
 const FIELD_HEADINGS: &str = "headings";
+/// Four-digit crawl year (from the page timestamp), for `year:` filtering.
+const FIELD_YEAR: &str = "year";
 
 /// How much more a title match counts than a body/url match when ranking.
 const TITLE_BOOST: tantivy::Score = 3.0;
@@ -100,6 +102,10 @@ impl SearchIndex {
         // URL's words tokenized so they're searchable as ordinary terms.
         doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), domain_of(page.url));
         doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), url_search_text(page.url));
+        // Numeric year for range filtering; omitted when there's no usable date.
+        if let Some(year) = year_of(page.timestamp) {
+            doc.add_u64(schema.get_field(FIELD_YEAR).unwrap(), year);
+        }
         self.writer_mut().add_document(doc)?;
         Ok(())
     }
@@ -245,7 +251,17 @@ fn build_schema() -> Schema {
     builder.add_text_field(FIELD_DOMAIN, STRING | STORED);
     // Tokenized URL words; indexed for search but not stored (we keep the URL).
     builder.add_text_field(FIELD_URL_TOKENS, TEXT);
+    // Numeric crawl year, indexed for `year:2021` and `year:[2020 TO 2023]`.
+    builder.add_u64_field(FIELD_YEAR, INDEXED | STORED);
     builder.build()
+}
+
+/// The four-digit crawl year parsed from a 14-digit page timestamp
+/// (`20210417...` -> `2021`). `None` when the timestamp is missing or does not
+/// start with a plausible year.
+fn year_of(timestamp: &str) -> Option<u64> {
+    let year: u64 = timestamp.get(..4)?.parse().ok()?;
+    (1000..=9999).contains(&year).then_some(year)
 }
 
 /// The exact host of a URL, lowercased (e.g. `https://Example.com/a` -> `example.com`).
@@ -376,6 +392,11 @@ mod tests {
     /// Build a page with the common fields; unset fields default to empty.
     fn page<'a>(url: &'a str, title: &'a str, body: &'a str, cid: &'a str, cname: &'a str) -> Page<'a> {
         Page { url, title, body, collection_id: cid, collection_name: cname, ..Default::default() }
+    }
+
+    /// A page with a given URL and timestamp; fixed title/body for date tests.
+    fn page_ts<'a>(url: &'a str, ts: &'a str) -> Page<'a> {
+        Page { url, timestamp: ts, title: "T", body: "shared content", collection_id: "c1", collection_name: "C1", ..Default::default() }
     }
 
     #[test]
@@ -579,6 +600,39 @@ mod tests {
         let results = idx.search("kangaroo", 10).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].url, "https://ex.com/title-hit", "title match should rank first");
+    }
+
+    #[test]
+    fn year_of_parses_leading_year() {
+        assert_eq!(year_of("20210417120000"), Some(2021));
+        assert_eq!(year_of("2021"), Some(2021));
+        assert_eq!(year_of(""), None);
+        assert_eq!(year_of("notadate"), None);
+        assert_eq!(year_of("0099010100"), None); // implausible year
+    }
+
+    #[test]
+    fn year_filter_exact_and_range() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page(&page_ts("https://ex.com/2019", "20190101000000")).unwrap();
+        idx.index_page(&page_ts("https://ex.com/2021", "20210101000000")).unwrap();
+        idx.index_page(&page_ts("https://ex.com/2023", "20230101000000")).unwrap();
+        idx.commit().unwrap();
+
+        // Exact year.
+        let r = idx.search("year:2021", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://ex.com/2021");
+
+        // Inclusive range.
+        let r = idx.search("year:[2020 TO 2023]", 10).unwrap();
+        assert_eq!(r.len(), 2, "2021 and 2023 fall in range");
+
+        // Combined with a term (AND-scoped).
+        let r = idx.search("shared year:2019", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://ex.com/2019");
     }
 
     #[test]

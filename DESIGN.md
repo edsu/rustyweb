@@ -103,6 +103,7 @@ Two document types share the same index, distinguished by `doc_type`.
 | `headings` | TEXT | - | BM25 | Page `<h1>`/`<h2>` text; boosted at query time |
 | `domain` | STRING | ✓ | exact | Lowercased host of the page URL, for `domain:` filtering (empty for collection docs) |
 | `url_tokens` | TEXT | - | BM25 | URL host + path split into words, so URL words are searchable as ordinary terms |
+| `year` | u64 | ✓ | numeric | Four-digit crawl year from the page timestamp, for `year:2021` / `year:[2020 TO 2023]` |
 
 `body` and `description` are stored (not just indexed) so that Tantivy's `SnippetGenerator` can produce hit-highlighted excerpts without re-reading the source files, and so a result can show the description when the query didn't match the body. `headings` and `url_tokens` are indexed but not stored: they exist only to make that text findable; the canonical URL is kept in `url`.
 

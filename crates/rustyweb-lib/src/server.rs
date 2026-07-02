@@ -801,6 +801,7 @@ fn search_tips_html() -> &'static str {
       <li><code>(climate OR weather) risk</code> - group with parentheses</li>
       <li><code>title:climate</code> - match only in the page title</li>
       <li><code>domain:example.com</code> - only pages from that exact host</li>
+      <li><code>year:2021</code> or <code>year:[2020 TO 2023]</code> - filter by crawl year</li>
       <li><code>climate^2 change</code> - rank "climate" matches higher</li>
     </ul>
     <p class="tips-note">Searches are case-insensitive. Title matches rank
