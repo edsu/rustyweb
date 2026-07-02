@@ -1,3 +1,30 @@
+---
+header-includes:
+  - \usepackage{graphicx}
+---
+
+```{=latex}
+\begin{titlepage}
+\centering
+\vspace*{3cm}
+
+{\Huge\bfseries rustyweb\par}
+\vspace{0.4cm}
+{\LARGE A Rust Primer\par}
+
+\vspace{2cm}
+\includegraphics[width=0.55\textwidth]{primer-title.pdf}\par
+
+\vspace{2cm}
+{\large Claude\par}
+\vspace{0.3cm}
+{\large July 2026\par}
+
+\vfill
+{\small Reading and understanding a web-archive server, one type at a time.\par}
+\end{titlepage}
+```
+
 # rustyweb - A Rust Primer
 
 This document has two jobs at once:
