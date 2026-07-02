@@ -20,3 +20,6 @@ test.txt
 
 # bv (beads viewer) local config and caches
 .bv/
+
+archive
+index
