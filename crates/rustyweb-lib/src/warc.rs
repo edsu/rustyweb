@@ -20,6 +20,89 @@ pub struct WarcRecord {
     pub record_length: u64, // compressed member size for .warc.gz
 }
 
+/// Provenance fields parsed from a WARC `warcinfo` record's
+/// `application/warc-fields` block. A `warcinfo` record describes how the WARCs
+/// that follow it were produced, so it is the canonical place to learn which
+/// tool made a capture, who ran it, and with what settings.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Warcinfo {
+    /// Crawler software and version (e.g. `Browsertrix-Crawler 1.13.0`).
+    pub software: Option<String>,
+    /// Contact for the operator who ran the crawl.
+    pub operator: Option<String>,
+    /// The `User-Agent` the crawler sent (warc-fields `http-header-user-agent`).
+    pub user_agent: Option<String>,
+    /// The collection/crawl this WARC belongs to (warc-fields `isPartOf`).
+    pub is_part_of: Option<String>,
+    /// The spec the WARC conforms to (warc-fields `conformsTo`).
+    pub conforms_to: Option<String>,
+    /// How the crawler handled robots.txt.
+    pub robots: Option<String>,
+    /// Host the crawl ran on.
+    pub hostname: Option<String>,
+}
+
+impl Warcinfo {
+    /// Parse a `warcinfo` record. Returns `None` for any other record type.
+    pub fn from_record(record: &WarcRecord) -> Option<Warcinfo> {
+        if !record.warc_type.eq_ignore_ascii_case("warcinfo") {
+            return None;
+        }
+        Some(Warcinfo::from_fields(&parse_warc_fields(&record.payload)))
+    }
+
+    /// Build from parsed `application/warc-fields` pairs (keys case-insensitive).
+    pub fn from_fields(fields: &[(String, String)]) -> Warcinfo {
+        let mut info = Warcinfo::default();
+        for (key, value) in fields {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let slot = match key.to_ascii_lowercase().as_str() {
+                "software" => &mut info.software,
+                "operator" => &mut info.operator,
+                "http-header-user-agent" => &mut info.user_agent,
+                "ispartof" => &mut info.is_part_of,
+                "conformsto" => &mut info.conforms_to,
+                "robots" => &mut info.robots,
+                "hostname" => &mut info.hostname,
+                _ => continue,
+            };
+            // First occurrence wins; ignore later duplicates.
+            slot.get_or_insert_with(|| value.to_string());
+        }
+        info
+    }
+
+    /// Whether no recognized provenance field was found.
+    pub fn is_empty(&self) -> bool {
+        *self == Warcinfo::default()
+    }
+}
+
+/// Parse an `application/warc-fields` block into `(key, value)` pairs. The
+/// format is one `Name: value` per line (a small subset of message headers);
+/// blank lines and lines without a colon are skipped.
+pub fn parse_warc_fields(bytes: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(colon) = line.find(':') {
+            let key = line[..colon].trim();
+            let value = line[colon + 1..].trim();
+            if !key.is_empty() {
+                out.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
+
 /// Iterate over records in a `.warc` or `.warc.gz` file.
 ///
 /// For `.warc.gz`, each gzip member is read individually to track the
@@ -428,6 +511,63 @@ mod tests {
 
     fn fixture(name: &str) -> std::path::PathBuf {
         Path::new(FIXTURES).join(name)
+    }
+
+    #[test]
+    fn parse_warc_fields_splits_key_value_lines() {
+        let block = b"software: Browsertrix-Crawler 1.13.0\nformat: WARC File Format 1.1\n\nrobots: obey\n";
+        let fields = parse_warc_fields(block);
+        assert_eq!(fields[0], ("software".to_string(), "Browsertrix-Crawler 1.13.0".to_string()));
+        assert!(fields.iter().any(|(k, v)| k == "robots" && v == "obey"));
+        // Blank lines are skipped.
+        assert!(fields.iter().all(|(k, _)| !k.is_empty()));
+    }
+
+    #[test]
+    fn warcinfo_from_fields_maps_known_keys() {
+        let fields = vec![
+            ("software".to_string(), "Browsertrix-Crawler 1.13.0".to_string()),
+            ("operator".to_string(), "crawls@example.org".to_string()),
+            ("http-header-user-agent".to_string(), "Mozilla/5.0 (compatible)".to_string()),
+            ("isPartOf".to_string(), "my-collection".to_string()),
+            ("conformsTo".to_string(), "https://iipc.github.io/warc-specifications/".to_string()),
+            ("robots".to_string(), "ignore".to_string()),
+            ("hostname".to_string(), "crawler-01".to_string()),
+            ("format".to_string(), "WARC File Format 1.1".to_string()), // unrecognized -> ignored
+        ];
+        let info = Warcinfo::from_fields(&fields);
+        assert_eq!(info.software.as_deref(), Some("Browsertrix-Crawler 1.13.0"));
+        assert_eq!(info.operator.as_deref(), Some("crawls@example.org"));
+        assert_eq!(info.user_agent.as_deref(), Some("Mozilla/5.0 (compatible)"));
+        assert_eq!(info.is_part_of.as_deref(), Some("my-collection"));
+        assert_eq!(info.conforms_to.as_deref(), Some("https://iipc.github.io/warc-specifications/"));
+        assert_eq!(info.robots.as_deref(), Some("ignore"));
+        assert_eq!(info.hostname.as_deref(), Some("crawler-01"));
+        assert!(!info.is_empty());
+    }
+
+    #[test]
+    fn warcinfo_from_record_only_for_warcinfo_type() {
+        // A warcinfo record yields parsed fields.
+        let mut rec = WarcRecord {
+            record_id: String::new(),
+            concurrent_to: None,
+            target_uri: String::new(),
+            timestamp: String::new(),
+            warc_type: "warcinfo".to_string(),
+            http_status: None,
+            content_type: "application/warc-fields".to_string(),
+            digest: String::new(),
+            payload: b"software: wget/1.21\n".to_vec(),
+            http_headers: Vec::new(),
+            offset: 0,
+            record_length: 0,
+        };
+        assert_eq!(Warcinfo::from_record(&rec).unwrap().software.as_deref(), Some("wget/1.21"));
+
+        // Any other record type yields None.
+        rec.warc_type = "response".to_string();
+        assert!(Warcinfo::from_record(&rec).is_none());
     }
 
     #[test]

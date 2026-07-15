@@ -256,6 +256,29 @@ pub fn iter_warc_paths(wacz_path: &Path) -> Result<impl Iterator<Item = Result<S
     Ok(names.into_iter().map(Ok))
 }
 
+/// Read the first `warcinfo` record found in a WACZ's WARC(s) and return its
+/// parsed provenance ([`crate::warc::Warcinfo`]). `warcinfo` normally leads each
+/// WARC, so the first hit describes how the capture was produced. Returns
+/// `Ok(None)` when the WACZ has no warcinfo (or none with recognized fields).
+pub fn read_warcinfo(wacz_path: &Path) -> Result<Option<crate::warc::Warcinfo>> {
+    use crate::warc::{iter_records, Warcinfo};
+
+    let warc_paths: Vec<String> = iter_warc_paths(wacz_path)?.collect::<Result<Vec<_>>>()?;
+    for entry_name in &warc_paths {
+        let tmp = extract_warc_from_wacz(wacz_path, entry_name)
+            .with_context(|| format!("extracting {} from {}", entry_name, wacz_path.display()))?;
+        for record in iter_records(tmp.path())? {
+            let record = record?;
+            if let Some(info) = Warcinfo::from_record(&record) {
+                if !info.is_empty() {
+                    return Ok(Some(info));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Extract a single named WARC entry from a WACZ ZIP into a temp file.
 pub fn extract_warc_from_wacz(
     wacz_path: &Path,
@@ -381,5 +404,23 @@ mod tests {
     fn search_cdx_no_match() {
         let records = search_cdx(&fixture("simple.wacz"), "http://notexist.example/").unwrap();
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn read_warcinfo_extracts_software_from_real_wacz() {
+        // a.wacz was produced by Browsertrix-Crawler, which writes a warcinfo
+        // record with a `software` field.
+        let info = read_warcinfo(&fixture("a.wacz")).unwrap().expect("a.wacz has a warcinfo record");
+        let software = info.software.expect("warcinfo should carry software");
+        assert!(
+            software.contains("Browsertrix-Crawler"),
+            "unexpected software: {software}"
+        );
+    }
+
+    #[test]
+    fn read_warcinfo_returns_none_when_absent() {
+        // simple.wacz has no warcinfo record.
+        assert!(read_warcinfo(&fixture("simple.wacz")).unwrap().is_none());
     }
 }
