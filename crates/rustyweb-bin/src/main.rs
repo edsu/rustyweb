@@ -71,9 +71,14 @@ enum Commands {
         #[arg(long, default_value = ".")]
         home: PathBuf,
 
-        /// Collection display name (defaults to the WACZ title or filename).
+        /// WACZ display name (defaults to the WACZ title or filename).
         #[arg(long)]
         name: Option<String>,
+
+        /// Add the WACZ(s) to this collection (created if new). Without it, each
+        /// WACZ is its own collection.
+        #[arg(long)]
+        collection: Option<String>,
     },
     /// Start the replay web server.
     Serve {
@@ -106,6 +111,38 @@ enum Commands {
         #[arg(long, default_value = ".")]
         home: PathBuf,
     },
+    /// Manage collections (curated groups of WACZs).
+    Collection {
+        #[command(subcommand)]
+        action: CollectionCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CollectionCmd {
+    /// Create or update a collection's metadata (created if it doesn't exist).
+    Set {
+        /// Collection name (its id is a slug of this).
+        name: String,
+
+        /// A description of the collection.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Curator / owner.
+        #[arg(long)]
+        curator: Option<String>,
+
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
+    },
+    /// List collections and their WACZ counts.
+    List {
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -124,7 +161,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index { paths, home, name } => {
+        Commands::Index { paths, home, name, collection } => {
             // `index` no longer auto-scans <home>/archive; a bare invocation is
             // almost always a mistake, so guide the user to the two things they
             // probably meant instead.
@@ -155,7 +192,12 @@ async fn main() -> Result<()> {
                 // filtered by log level. Silence stdout while indexing runs;
                 // our logs are on stderr and are unaffected.
                 let quiet = gag::Gag::stdout().ok();
-                let result = rustyweb_lib::index::index_location(location, &home, name.as_deref());
+                let result = rustyweb_lib::index::index_location(
+                    location,
+                    &home,
+                    name.as_deref(),
+                    collection.as_deref(),
+                );
                 drop(quiet);
                 result?;
             }
@@ -211,8 +253,36 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+
+        Commands::Collection { action } => match action {
+            CollectionCmd::Set { name, description, curator, home } => {
+                let id = rustyweb_lib::index::set_collection(&home, &name, description, curator)?;
+                println!("collection \"{name}\" ({id}) updated");
+            }
+            CollectionCmd::List { home } => {
+                run_collection_list(&home)?;
+            }
+        },
     }
 
+    Ok(())
+}
+
+/// Print each collection with its WACZ count and description.
+fn run_collection_list(home: &std::path::Path) -> Result<()> {
+    use rustyweb_lib::collections::Manifest;
+
+    let index_dir = rustyweb_lib::index::index_dir(home);
+    let manifest = Manifest::open(&index_dir)?;
+    if manifest.collections.is_empty() {
+        println!("No collections registered in {}", index_dir.display());
+        return Ok(());
+    }
+    for c in &manifest.collections {
+        let count = manifest.members_of(&c.id).count();
+        let desc = c.description.as_deref().unwrap_or("");
+        println!("{:<24} {:>3} WACZ  {}", c.name, count, desc);
+    }
     Ok(())
 }
 

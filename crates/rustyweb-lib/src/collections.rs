@@ -265,6 +265,37 @@ impl Manifest {
         id.to_string()
     }
 
+    /// Create or update a collection's metadata by name (its id is the slug of
+    /// the name). Only provided fields are changed; `created` is set on first
+    /// creation. Returns the collection id.
+    pub fn set_collection(
+        &mut self,
+        name: &str,
+        description: Option<String>,
+        curator: Option<String>,
+        created: &str,
+    ) -> String {
+        let id = slugify(name);
+        if let Some(c) = self.collections.iter_mut().find(|c| c.id == id) {
+            c.name = name.to_string();
+            if description.is_some() {
+                c.description = description;
+            }
+            if curator.is_some() {
+                c.curator = curator;
+            }
+        } else {
+            self.collections.push(Collection {
+                id: id.clone(),
+                name: name.to_string(),
+                description,
+                created: created.to_string(),
+                curator,
+            });
+        }
+        id
+    }
+
     pub fn save(&self) -> Result<()> {
         std::fs::write(
             self.index_dir.join("collections.json"),
@@ -318,9 +349,34 @@ where
     })
 }
 
-/// Stable short ID for a collection: first 8 hex chars of SHA-256 of the source
+/// A URL/id-friendly slug for a collection name: lowercase ASCII alphanumerics,
+/// with runs of anything else collapsed to a single hyphen and trimmed
+/// (`"Bay Area Transit"` -> `bay-area-transit`). Falls back to a short hash when
+/// the name has no sluggable characters.
+pub fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash {
+                slug.push('-');
+                pending_dash = false;
+            }
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.is_empty() {
+            pending_dash = true;
+        }
+    }
+    if slug.is_empty() {
+        bytes_to_hex(&sha256_of_bytes(name.as_bytes())[..4])
+    } else {
+        slug
+    }
+}
+
+/// Stable short ID for a WACZ: first 8 hex chars of SHA-256 of the source
 /// location string (an absolute file path or a URL).
-pub fn collection_id(source: &Source) -> String {
+pub fn wacz_id(source: &Source) -> String {
     let hash = sha256_of_bytes(source.location().as_bytes());
     bytes_to_hex(&hash[..4])
 }
@@ -360,19 +416,19 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn collection_id_is_stable() {
+    fn wacz_id_is_stable() {
         let s = Source::File(PathBuf::from("/data/archive.wacz"));
-        let id1 = collection_id(&s);
-        let id2 = collection_id(&s);
+        let id1 = wacz_id(&s);
+        let id2 = wacz_id(&s);
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), 8);
     }
 
     #[test]
     fn different_sources_different_ids() {
-        let id1 = collection_id(&Source::File(PathBuf::from("/data/a.wacz")));
-        let id2 = collection_id(&Source::File(PathBuf::from("/data/b.wacz")));
-        let id3 = collection_id(&Source::Url("https://ex.org/a.wacz".to_string()));
+        let id1 = wacz_id(&Source::File(PathBuf::from("/data/a.wacz")));
+        let id2 = wacz_id(&Source::File(PathBuf::from("/data/b.wacz")));
+        let id3 = wacz_id(&Source::Url("https://ex.org/a.wacz".to_string()));
         assert_ne!(id1, id2);
         assert_ne!(id1, id3);
     }
@@ -498,5 +554,32 @@ mod tests {
 
         assert_eq!(m.waczs.len(), 1);
         assert_eq!(m.waczs[0].name, "test-updated");
+    }
+
+    #[test]
+    fn slugify_makes_readable_ids() {
+        assert_eq!(slugify("Bay Area Transit"), "bay-area-transit");
+        assert_eq!(slugify("  Hello, World!  "), "hello-world");
+        assert_eq!(slugify("already-slug"), "already-slug");
+        // No sluggable characters -> short hash fallback (8 hex chars).
+        assert_eq!(slugify("!!!").len(), 8);
+    }
+
+    #[test]
+    fn set_collection_creates_then_updates_preserving_created() {
+        let tmp = TempDir::new().unwrap();
+        let mut m = Manifest::open(tmp.path()).unwrap();
+
+        let id = m.set_collection("Bay Area Transit", Some("desc".into()), None, "2026-01-01T00:00:00Z");
+        assert_eq!(id, "bay-area-transit");
+        assert_eq!(m.collections.len(), 1);
+        assert_eq!(m.collections[0].description.as_deref(), Some("desc"));
+
+        // Re-setting updates fields but keeps the original created timestamp.
+        m.set_collection("Bay Area Transit", Some("new".into()), Some("Ed".into()), "2026-02-02T00:00:00Z");
+        assert_eq!(m.collections.len(), 1);
+        assert_eq!(m.collections[0].description.as_deref(), Some("new"));
+        assert_eq!(m.collections[0].curator.as_deref(), Some("Ed"));
+        assert_eq!(m.collections[0].created, "2026-01-01T00:00:00Z");
     }
 }
