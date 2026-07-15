@@ -89,9 +89,16 @@ impl std::fmt::Display for Source {
     }
 }
 
+/// A single WACZ file in the archive - one member of a [`Collection`]. (This was
+/// previously the top-level `Collection`; a curated `Collection` now groups many
+/// of these.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Collection {
+pub struct Wacz {
     pub id: String,
+    /// Id of the [`Collection`] this WACZ belongs to. Defaults to the WACZ's own
+    /// id (a singleton collection) when not explicitly grouped.
+    #[serde(default)]
+    pub collection: String,
     /// The WACZ location. Older manifests used the key `path`.
     #[serde(alias = "path")]
     pub source: Source,
@@ -134,7 +141,7 @@ pub struct Collection {
     pub capture_end: Option<String>,
 }
 
-impl Collection {
+impl Wacz {
     /// Whether the WACZ is available, resolving file paths against `home`.
     /// Local files must exist on disk; remote URLs are assumed present.
     pub fn is_present(&self, home: &Path) -> bool {
@@ -145,27 +152,97 @@ impl Collection {
     }
 }
 
-pub struct CollectionManifest {
-    manifest_path: PathBuf,
-    pub collections: Vec<Collection>,
+/// A curated collection: a named group of [`Wacz`] members with its own
+/// (curatorial) metadata. Aggregates (member count, size, capture range,
+/// software) are derived from members at read time, not stored here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Collection {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// When the collection was first created (RFC 3339).
+    pub created: String,
+    /// Optional curator / owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curator: Option<String>,
 }
 
-impl CollectionManifest {
+/// The on-disk manifest: curated collections (`collections.json`) plus their
+/// WACZ members (`waczs.json`), both under `<home>/index`.
+pub struct Manifest {
+    index_dir: PathBuf,
+    pub collections: Vec<Collection>,
+    pub waczs: Vec<Wacz>,
+}
+
+impl Manifest {
     pub fn open(index_dir: &Path) -> Result<Self> {
-        let manifest_path = index_dir.join("collections.json");
-        let collections = if manifest_path.exists() {
-            let data = std::fs::read_to_string(&manifest_path)?;
-            serde_json::from_str(&data)?
-        } else {
-            Vec::new()
-        };
+        let collections_path = index_dir.join("collections.json");
+        let waczs_path = index_dir.join("waczs.json");
+
+        // New two-file layout.
+        if waczs_path.exists() {
+            return Ok(Self {
+                index_dir: index_dir.to_path_buf(),
+                collections: read_json(&collections_path)?.unwrap_or_default(),
+                waczs: read_json(&waczs_path)?.unwrap_or_default(),
+            });
+        }
+
+        // Migrate an older single-file `collections.json` that held WACZ
+        // records: each becomes a member of its own singleton collection.
+        if collections_path.exists() {
+            let data = std::fs::read_to_string(&collections_path)?;
+            let value: serde_json::Value = serde_json::from_str(&data)?;
+            let looks_like_waczs = value
+                .as_array()
+                .and_then(|a| a.first())
+                .map(|e| e.get("source").is_some() || e.get("path").is_some())
+                .unwrap_or(false);
+            if looks_like_waczs {
+                let mut waczs: Vec<Wacz> = serde_json::from_value(value)?;
+                let mut collections = Vec::new();
+                for w in &mut waczs {
+                    if w.collection.is_empty() {
+                        w.collection = w.id.clone();
+                    }
+                    collections.push(Collection {
+                        id: w.id.clone(),
+                        name: w.name.clone(),
+                        description: w.description.clone(),
+                        created: w.date_indexed.clone(),
+                        curator: None,
+                    });
+                }
+                return Ok(Self { index_dir: index_dir.to_path_buf(), collections, waczs });
+            }
+            // Otherwise collections.json already holds groups (waczs.json just missing).
+            return Ok(Self {
+                index_dir: index_dir.to_path_buf(),
+                collections: serde_json::from_value(value).unwrap_or_default(),
+                waczs: Vec::new(),
+            });
+        }
+
         Ok(Self {
-            manifest_path,
-            collections,
+            index_dir: index_dir.to_path_buf(),
+            collections: Vec::new(),
+            waczs: Vec::new(),
         })
     }
 
-    pub fn upsert(&mut self, collection: Collection) {
+    /// Insert or replace a WACZ member by id.
+    pub fn upsert_wacz(&mut self, wacz: Wacz) {
+        if let Some(pos) = self.waczs.iter().position(|w| w.id == wacz.id) {
+            self.waczs[pos] = wacz;
+        } else {
+            self.waczs.push(wacz);
+        }
+    }
+
+    /// Insert or replace a collection by id.
+    pub fn upsert_collection(&mut self, collection: Collection) {
         if let Some(pos) = self.collections.iter().position(|c| c.id == collection.id) {
             self.collections[pos] = collection;
         } else {
@@ -173,15 +250,54 @@ impl CollectionManifest {
         }
     }
 
+    /// Ensure a collection with `id` exists, creating a default one (named
+    /// `name`) if it doesn't. Returns the collection id for convenience.
+    pub fn ensure_collection(&mut self, id: &str, name: &str, created: &str) -> String {
+        if !self.collections.iter().any(|c| c.id == id) {
+            self.collections.push(Collection {
+                id: id.to_string(),
+                name: name.to_string(),
+                description: None,
+                created: created.to_string(),
+                curator: None,
+            });
+        }
+        id.to_string()
+    }
+
     pub fn save(&self) -> Result<()> {
-        let json = serde_json::to_string_pretty(&self.collections)?;
-        std::fs::write(&self.manifest_path, json)?;
+        std::fs::write(
+            self.index_dir.join("collections.json"),
+            serde_json::to_string_pretty(&self.collections)?,
+        )?;
+        std::fs::write(
+            self.index_dir.join("waczs.json"),
+            serde_json::to_string_pretty(&self.waczs)?,
+        )?;
         Ok(())
     }
 
-    pub fn find_by_id(&self, id: &str) -> Option<&Collection> {
+    pub fn wacz_by_id(&self, id: &str) -> Option<&Wacz> {
+        self.waczs.iter().find(|w| w.id == id)
+    }
+
+    pub fn collection_by_id(&self, id: &str) -> Option<&Collection> {
         self.collections.iter().find(|c| c.id == id)
     }
+
+    /// The WACZ members of a collection.
+    pub fn members_of<'a>(&'a self, collection_id: &'a str) -> impl Iterator<Item = &'a Wacz> {
+        self.waczs.iter().filter(move |w| w.collection == collection_id)
+    }
+}
+
+/// Read and parse a JSON file if it exists (`None` when absent).
+fn read_json<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read_to_string(path)?;
+    Ok(Some(serde_json::from_str(&data)?))
 }
 
 /// Deserialize `software` as either a single string (older manifests wrote one)
@@ -283,18 +399,18 @@ mod tests {
     #[test]
     fn software_accepts_string_or_list() {
         // Older manifests wrote `software` as a single string; newer ones a list.
-        let legacy: Collection = serde_json::from_str(
+        let legacy: Wacz = serde_json::from_str(
             r#"{"id":"a","source":"archive/x.wacz","name":"x","date_indexed":"t","file_size":1,"sha256":"h","software":"py-wacz 0.4.6"}"#,
         ).unwrap();
         assert_eq!(legacy.software, vec!["py-wacz 0.4.6".to_string()]);
 
-        let listy: Collection = serde_json::from_str(
+        let listy: Wacz = serde_json::from_str(
             r#"{"id":"a","source":"archive/x.wacz","name":"x","date_indexed":"t","file_size":1,"sha256":"h","software":["Heritrix/3.4.0","py-wacz 0.4.6"]}"#,
         ).unwrap();
         assert_eq!(listy.software, vec!["Heritrix/3.4.0".to_string(), "py-wacz 0.4.6".to_string()]);
 
         // Absent -> empty, and empty is not serialized back out.
-        let none: Collection = serde_json::from_str(
+        let none: Wacz = serde_json::from_str(
             r#"{"id":"a","source":"archive/x.wacz","name":"x","date_indexed":"t","file_size":1,"sha256":"h"}"#,
         ).unwrap();
         assert!(none.software.is_empty());
@@ -307,9 +423,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let legacy = r#"[{"id":"abc12345","path":"/data/old.wacz","name":"old","date_indexed":"2026-07-01T00:00:00Z","file_size":10,"sha256":"deadbeef"}]"#;
         std::fs::write(tmp.path().join("collections.json"), legacy).unwrap();
-        let m = CollectionManifest::open(tmp.path()).unwrap();
+        let m = Manifest::open(tmp.path()).unwrap();
+        assert_eq!(m.waczs.len(), 1);
+        assert_eq!(m.waczs[0].source, Source::File(PathBuf::from("/data/old.wacz")));
+        // Migration synthesizes a singleton collection per legacy WACZ.
         assert_eq!(m.collections.len(), 1);
-        assert_eq!(m.collections[0].source, Source::File(PathBuf::from("/data/old.wacz")));
     }
 
     #[test]
@@ -330,20 +448,17 @@ mod tests {
         assert_ne!(h1, h3, "a changed byte must change the digest");
     }
 
-    #[test]
-    fn manifest_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let mut m = CollectionManifest::open(tmp.path()).unwrap();
-        assert!(m.collections.is_empty());
-
-        let col = Collection {
-            id: "abc12345".to_string(),
+    /// A WACZ member with the given id/name and defaults elsewhere.
+    fn wacz(id: &str, name: &str, description: Option<&str>) -> Wacz {
+        Wacz {
+            id: id.to_string(),
+            collection: id.to_string(),
             source: Source::File(PathBuf::from("/data/test.wacz")),
-            name: "test".to_string(),
+            name: name.to_string(),
             date_indexed: "2026-07-01T00:00:00Z".to_string(),
             file_size: 1024,
             sha256: "deadbeef".to_string(),
-            description: Some("A test collection".to_string()),
+            description: description.map(str::to_string),
             crawl_date: None,
             seed_pages: vec![],
             software: Vec::new(),
@@ -353,59 +468,35 @@ mod tests {
             page_count: None,
             capture_start: None,
             capture_end: None,
-        };
-        m.upsert(col);
+        }
+    }
+
+    #[test]
+    fn manifest_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let mut m = Manifest::open(tmp.path()).unwrap();
+        assert!(m.waczs.is_empty());
+
+        m.upsert_wacz(wacz("abc12345", "test", Some("A test collection")));
         m.save().unwrap();
 
-        let m2 = CollectionManifest::open(tmp.path()).unwrap();
-        assert_eq!(m2.collections.len(), 1);
-        assert_eq!(m2.collections[0].id, "abc12345");
-        assert_eq!(m2.collections[0].description.as_deref(), Some("A test collection"));
+        let m2 = Manifest::open(tmp.path()).unwrap();
+        assert_eq!(m2.waczs.len(), 1);
+        assert_eq!(m2.waczs[0].id, "abc12345");
+        assert_eq!(m2.waczs[0].description.as_deref(), Some("A test collection"));
     }
 
     #[test]
     fn manifest_upsert_updates_existing() {
         let tmp = TempDir::new().unwrap();
-        let mut m = CollectionManifest::open(tmp.path()).unwrap();
+        let mut m = Manifest::open(tmp.path()).unwrap();
 
-        let col = Collection {
-            id: "abc12345".to_string(),
-            source: Source::File(PathBuf::from("/data/test.wacz")),
-            name: "test".to_string(),
-            date_indexed: "2026-07-01T00:00:00Z".to_string(),
-            file_size: 1024,
-            sha256: "deadbeef".to_string(),
-            description: None,
-            crawl_date: None,
-            seed_pages: vec![],
-            software: Vec::new(),
-            operator: None,
-            user_agent: None,
-            robots: None,
-            page_count: None,
-            capture_start: None,
-            capture_end: None,
-        };
-        m.upsert(col);
-        m.upsert(Collection {
-            id: "abc12345".to_string(),
-            source: Source::File(PathBuf::from("/data/test.wacz")),
-            name: "test-updated".to_string(),
-            date_indexed: "2026-07-02T00:00:00Z".to_string(),
-            file_size: 2048,
-            sha256: "cafebabe".to_string(),
-            description: Some("updated".to_string()),
-            crawl_date: None,
-            seed_pages: vec![],
-            software: Vec::new(),
-            operator: None,
-            user_agent: None,
-            robots: None,
-            page_count: None,
-            capture_start: None,
-            capture_end: None,
-        });
-        assert_eq!(m.collections.len(), 1);
-        assert_eq!(m.collections[0].name, "test-updated");
+        m.upsert_wacz(wacz("abc12345", "test", None));
+        let mut updated = wacz("abc12345", "test-updated", Some("updated"));
+        updated.sha256 = "cafebabe".to_string();
+        m.upsert_wacz(updated);
+
+        assert_eq!(m.waczs.len(), 1);
+        assert_eq!(m.waczs[0].name, "test-updated");
     }
 }

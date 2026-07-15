@@ -220,11 +220,11 @@ async fn main() -> Result<()> {
 /// recorded at index time. Reports each collection as OK / MODIFIED / MISSING
 /// and returns `false` if any collection failed its fixity check.
 fn run_verify(home: &std::path::Path) -> Result<bool> {
-    use rustyweb_lib::collections::{file_sha256, CollectionManifest, Source};
+    use rustyweb_lib::collections::{file_sha256, Manifest, Source};
 
     let index_dir = rustyweb_lib::index::index_dir(home);
-    let manifest = CollectionManifest::open(&index_dir)?;
-    if manifest.collections.is_empty() {
+    let manifest = Manifest::open(&index_dir)?;
+    if manifest.waczs.is_empty() {
         println!("No collections registered in {}", index_dir.display());
         return Ok(true);
     }
@@ -234,7 +234,7 @@ fn run_verify(home: &std::path::Path) -> Result<bool> {
     let mut modified = 0usize;
     let mut remote = 0usize;
 
-    for col in &manifest.collections {
+    for col in &manifest.waczs {
         let loc = col.source.location();
         // Remote sources would have to be re-downloaded to re-hash; skip them.
         if matches!(col.source, Source::Url(_)) {
@@ -279,18 +279,18 @@ fn short_hash(hash: &str) -> &str {
 }
 
 fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
-    use rustyweb_lib::collections::{CollectionManifest, Source};
+    use rustyweb_lib::collections::{Manifest, Source};
     use rustyweb_lib::wacz::search_cdx;
 
     let index_dir = rustyweb_lib::index::index_dir(home);
-    let manifest = CollectionManifest::open(&index_dir)?;
-    if manifest.collections.is_empty() {
+    let manifest = Manifest::open(&index_dir)?;
+    if manifest.waczs.is_empty() {
         println!("No collections registered in {}", index_dir.display());
         return Ok(());
     }
 
     let mut found_any = false;
-    for col in &manifest.collections {
+    for col in &manifest.waczs {
         // This debugging aid reads the CDX from the local WACZ; skip remote
         // sources rather than re-downloading them.
         if matches!(col.source, Source::Url(_)) {

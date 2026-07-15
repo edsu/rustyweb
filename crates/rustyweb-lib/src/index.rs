@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use tracing::{debug, info};
 
-use crate::collections::{Collection, CollectionManifest, Source, collection_id, file_sha256};
+use crate::collections::{Manifest, Source, Wacz, collection_id, file_sha256};
 use crate::search::{SearchIndex, extract_html_text};
 use crate::warc::{Warcinfo, WarcRecord, iter_records};
 use crate::wacz::{extract_warc_from_wacz, iter_warc_paths, read_datapackage};
@@ -51,7 +51,7 @@ pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result
             .with_context(|| format!("opening search index at {}", index_dir.display()))?,
     );
 
-    let mut manifest = CollectionManifest::open(&index_dir)?;
+    let mut manifest = Manifest::open(&index_dir)?;
 
     for source in &sources {
         index_one(source, home, &mut manifest, &search, name)?;
@@ -74,17 +74,17 @@ pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result
 /// aborting the whole run.
 pub fn reindex(home: &Path) -> Result<()> {
     let index_dir = index_dir(home);
-    let mut manifest = CollectionManifest::open(&index_dir)?;
-    if manifest.collections.is_empty() {
-        info!("no collections registered; nothing to reindex");
+    let mut manifest = Manifest::open(&index_dir)?;
+    if manifest.waczs.is_empty() {
+        info!("no WACZs registered; nothing to reindex");
         return Ok(());
     }
 
-    // Snapshot (source, name) before we start upserting back into the manifest.
+    // Snapshot each WACZ (source, name) before we start upserting back.
     let targets: Vec<(Source, String)> = manifest
-        .collections
+        .waczs
         .iter()
-        .map(|c| (c.source.clone(), c.name.clone()))
+        .map(|w| (w.source.clone(), w.name.clone()))
         .collect();
 
     // Drop the old full-text index so it is recreated with the current schema.
@@ -197,7 +197,7 @@ fn resolve_archive_file(path: &Path, home: &Path) -> Result<Source> {
 fn index_one(
     source: &Source,
     home: &Path,
-    manifest: &mut CollectionManifest,
+    manifest: &mut Manifest,
     search: &Mutex<SearchIndex>,
     name: Option<&str>,
 ) -> Result<()> {
@@ -255,8 +255,12 @@ fn index_one(
             software.push(s);
         }
     }
-    manifest.upsert(Collection {
-        id,
+    // For now each WACZ is its own singleton collection (group id == WACZ id),
+    // so existing routes/links are unchanged; explicit grouping comes later.
+    manifest.ensure_collection(&id, &display_name, &date_indexed);
+    manifest.upsert_wacz(Wacz {
+        id: id.clone(),
+        collection: id,
         source: source.clone(),
         name: display_name,
         date_indexed,
@@ -642,9 +646,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), Some("my-collection"));
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections.len(), 1);
-        let col = &manifest.collections[0];
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs.len(), 1);
+        let col = &manifest.waczs[0];
         assert_eq!(col.name, "my-collection");
         assert!(!col.sha256.is_empty());
         assert!(col.file_size > 0);
@@ -657,17 +661,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), None);
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections[0].name, "simple");
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs[0].name, "simple");
     }
 
     #[test]
     fn indexed_local_wacz_is_stored_relative_to_home() {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), None);
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(
-            manifest.collections[0].source,
+            manifest.waczs[0].source,
             Source::File(PathBuf::from("archive/simple.wacz")),
             "a local WACZ under archive/ should be stored relative to home"
         );
@@ -680,8 +684,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("a.wacz", tmp.path(), None);
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        let col = &manifest.collections[0];
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let col = &manifest.waczs[0];
         assert!(
             col.software.iter().any(|s| s.contains("Browsertrix-Crawler")),
             "unexpected software: {:?}",
@@ -725,8 +729,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("pdf-doc.wacz", tmp.path(), None);
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections[0].name, "PDF Test Collection");
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs[0].name, "PDF Test Collection");
     }
 
     #[test]
@@ -735,8 +739,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("pdf-doc.wacz", tmp.path(), Some("Custom Name"));
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections[0].name, "Custom Name");
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs[0].name, "Custom Name");
     }
 
     #[test]
@@ -753,9 +757,9 @@ mod tests {
         reindex(tmp.path()).unwrap();
 
         // The manifest (and the custom name) is preserved...
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections.len(), 1);
-        assert_eq!(manifest.collections[0].name, "keepname");
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs.len(), 1);
+        assert_eq!(manifest.waczs[0].name, "keepname");
 
         // ...and the content is searchable again.
         let idx = crate::search::SearchIndex::open(full_text.as_path()).unwrap();
@@ -816,8 +820,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), None);
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        let col = &manifest.collections[0];
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let col = &manifest.waczs[0];
         assert!(
             !col.seed_pages.is_empty(),
             "simple.wacz has pages in pages.jsonl"

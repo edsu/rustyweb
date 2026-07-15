@@ -14,7 +14,7 @@ use tokio_util::io::ReaderStream;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::collections::{Collection, CollectionManifest};
+use crate::collections::{Manifest, Wacz};
 use crate::search::SearchIndex;
 
 // ── Embedded static assets ────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ pub async fn serve(bind: &str, home: &Path) -> Result<()> {
 // ── Homepage ──────────────────────────────────────────────────────────────────
 
 async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let collections = load_collections(&state);
+    let collections = load_waczs(&state);
 
     let cards: String = collections
         .iter()
@@ -267,7 +267,7 @@ async fn search_page(
 
     // Map each collection id to the wabac `source` to use: /files/{id} for a
     // local WACZ, or the remote URL directly for an http source.
-    let collections = load_collections(&state);
+    let collections = load_waczs(&state);
     let source_for = |cid: &str| -> String {
         collections
             .iter()
@@ -423,7 +423,7 @@ async fn collection_page(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let collections = load_collections(&state);
+    let collections = load_waczs(&state);
     let Some(c) = collections.iter().find(|c| c.id == id) else {
         return (StatusCode::NOT_FOUND, "collection not found").into_response();
     };
@@ -607,7 +607,7 @@ async fn serve_file(
     axum::extract::Path(id): axum::extract::Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let collections = load_collections(&state);
+    let collections = load_waczs(&state);
     let Some(col) = collections.iter().find(|c| c.id == id) else {
         return (StatusCode::NOT_FOUND, "collection not found").into_response();
     };
@@ -801,15 +801,15 @@ fn mime_guess_from_path(path: &str) -> &'static str {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn load_collections(state: &AppState) -> Vec<Collection> {
-    CollectionManifest::open(&state.index_dir)
-        .map(|m| m.collections)
+fn load_waczs(state: &AppState) -> Vec<Wacz> {
+    Manifest::open(&state.index_dir)
+        .map(|m| m.waczs)
         .unwrap_or_default()
 }
 
 /// The `source` value to hand wabac.js for a collection: our local byte-range
 /// endpoint for a file, or the remote URL directly (read client-side) for a URL.
-fn viewer_source(col: &Collection) -> String {
+fn viewer_source(col: &Wacz) -> String {
     match &col.source {
         crate::collections::Source::File(_) => format!("/files/{}", col.id),
         crate::collections::Source::Url(u) => u.clone(),
@@ -865,7 +865,7 @@ fn ymd(ts: &str) -> String {
 
 /// The capture date range of a collection as a display string (`start → end`, or
 /// a single date when they coincide), or `None` when no range was recorded.
-fn capture_range(c: &Collection) -> Option<String> {
+fn capture_range(c: &Wacz) -> Option<String> {
     match (c.capture_start.as_deref(), c.capture_end.as_deref()) {
         (Some(s), Some(e)) => {
             let (sd, ed) = (ymd(s), ymd(e));
@@ -879,7 +879,7 @@ fn capture_range(c: &Collection) -> Option<String> {
 
 /// A compact one-line provenance summary (`Captured with X · N pages · dates`)
 /// for homepage cards and search results. Empty when nothing is known.
-fn provenance_line(c: &Collection) -> String {
+fn provenance_line(c: &Wacz) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !c.software.is_empty() {
         parts.push(format!("Software: {}", html_escape(&c.software.join(", "))));
