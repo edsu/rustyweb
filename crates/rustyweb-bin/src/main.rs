@@ -61,10 +61,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index WACZ files, directories, or http(s) URLs (defaults to <home>/archive).
+    /// Index one or more WACZ files (kept in <home>/archive) or http(s) URLs.
     Index {
-        /// WACZ files, directories, or http(s) URLs. If omitted, indexes every
-        /// .wacz under <home>/archive.
+        /// WACZ files or http(s) URLs to index (at least one). A local WACZ must
+        /// live under <home>/archive; for several, glob it: `index archive/*.wacz`.
         paths: Vec<String>,
 
         /// rustyweb home directory (holds archive/ and index/).
@@ -81,6 +81,12 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         bind: String,
 
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
+    },
+    /// Rebuild the search index from collections.json (re-fetches remote sources).
+    Reindex {
         /// rustyweb home directory (holds archive/ and index/).
         #[arg(long, default_value = ".")]
         home: PathBuf,
@@ -119,12 +125,24 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Index { paths, home, name } => {
-            // With no paths, index everything under <home>/archive.
-            let locations: Vec<String> = if paths.is_empty() {
-                vec![rustyweb_lib::index::archive_dir(&home).to_string_lossy().into_owned()]
-            } else {
-                paths
-            };
+            // `index` no longer auto-scans <home>/archive; a bare invocation is
+            // almost always a mistake, so guide the user to the two things they
+            // probably meant instead.
+            if paths.is_empty() {
+                eprintln!(
+                    "index needs at least one WACZ file (kept in <home>/archive) or an\n\
+                     http(s) URL. For example:\n\
+                     \n\
+                     \x20 rustyweb index archive/site.wacz      index a local WACZ (must be in archive/)\n\
+                     \x20 rustyweb index archive/*.wacz         index several at once\n\
+                     \x20 rustyweb index https://ex.org/b.wacz  index a remote WACZ\n\
+                     \n\
+                     To rebuild the existing index from collections.json (including\n\
+                     remote sources), use: rustyweb reindex"
+                );
+                std::process::exit(2);
+            }
+            let locations = paths;
             let total = locations.len();
             for (i, location) in locations.iter().enumerate() {
                 tracing::info!(
@@ -171,6 +189,16 @@ async fn main() -> Result<()> {
                 _ = ctrl_c => {}
                 _ = terminate => {}
             }
+        }
+
+        Commands::Reindex { home } => {
+            // Like `index`, silence stdout to hide third-party PDF extraction
+            // noise; our logs are on stderr.
+            let quiet = gag::Gag::stdout().ok();
+            let result = rustyweb_lib::index::reindex(&home);
+            drop(quiet);
+            result?;
+            tracing::info!("reindex complete");
         }
 
         Commands::SearchUrl { url, home } => {

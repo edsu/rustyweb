@@ -19,24 +19,29 @@ pub fn archive_dir(home: &Path) -> PathBuf {
     home.join("archive")
 }
 
-/// Index a local WACZ file or directory of WACZ files under the given home dir.
-/// Thin wrapper over [`index_location`].
+/// Index a local WACZ file (which must live under `<home>/archive`) under the
+/// given home dir. Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
     index_location(&path.to_string_lossy(), home, name)
 }
 
-/// Index WACZ(s) from a location into the home directory's `index/`. The
-/// location is a local file, a local directory (scanned for `.wacz`), or a
-/// remote `http(s)://` URL (downloaded to a temp file for indexing).
+/// Index a WACZ from a location into the home directory's `index/`. The location
+/// is either a local `.wacz` file that already lives under `<home>/archive`, or
+/// a remote `http(s)://` URL (downloaded to a temp file for indexing).
 ///
-/// Local WACZ paths are stored relative to `home` when they live under it, so
-/// the home folder (archive + index together) is portable.
+/// Local WACZ paths are stored relative to `home`, so the home folder (archive +
+/// index together) is portable. rustyweb does not copy files for you: a local
+/// WACZ outside the archive folder, a directory, or a non-`.wacz` path is an
+/// error (see [`resolve_sources`]).
 ///
 /// Idempotent: re-indexing the same source upserts its manifest entry and
 /// replaces its documents in Tantivy.
 /// `name` overrides the collection display name; otherwise it comes from the
 /// WACZ metadata, falling back to the filename/URL stem.
 pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result<()> {
+    // Validate the argument first (a bad path errors before we touch the index).
+    let sources = resolve_sources(location, home)?;
+
     let index_dir = index_dir(home);
     std::fs::create_dir_all(&index_dir)
         .with_context(|| format!("creating index dir {}", index_dir.display()))?;
@@ -46,7 +51,6 @@ pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result
             .with_context(|| format!("opening search index at {}", index_dir.display()))?,
     );
 
-    let sources = resolve_sources(location, home)?;
     let mut manifest = CollectionManifest::open(&index_dir)?;
 
     for source in &sources {
@@ -59,33 +63,133 @@ pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result
     Ok(())
 }
 
-/// Expand a location into the concrete WACZ sources to index. A directory is
-/// scanned (non-recursively) for `.wacz` files; a URL or single file yields one
-/// source. Local file paths are canonicalized, then stored relative to `home`
-/// when under it (see [`Source::for_file`]).
+/// Rebuild the full-text index from the sources already recorded in
+/// `collections.json`, preserving the manifest (including each collection's
+/// display name).
+///
+/// Unlike [`index_location`] (which scans `<home>/archive`), this re-indexes
+/// every registered source - including remote URLs, which are re-fetched - and
+/// recreates the Tantivy index from scratch, so a schema change is picked up.
+/// Local files that have gone missing are skipped with a warning rather than
+/// aborting the whole run.
+pub fn reindex(home: &Path) -> Result<()> {
+    let index_dir = index_dir(home);
+    let mut manifest = CollectionManifest::open(&index_dir)?;
+    if manifest.collections.is_empty() {
+        info!("no collections registered; nothing to reindex");
+        return Ok(());
+    }
+
+    // Snapshot (source, name) before we start upserting back into the manifest.
+    let targets: Vec<(Source, String)> = manifest
+        .collections
+        .iter()
+        .map(|c| (c.source.clone(), c.name.clone()))
+        .collect();
+
+    // Drop the old full-text index so it is recreated with the current schema.
+    let full_text = index_dir.join("full_text");
+    if full_text.exists() {
+        std::fs::remove_dir_all(&full_text)
+            .with_context(|| format!("removing stale index at {}", full_text.display()))?;
+    }
+    let search = Mutex::new(
+        SearchIndex::open(full_text.as_path())
+            .with_context(|| format!("creating search index at {}", index_dir.display()))?,
+    );
+
+    let total = targets.len();
+    let mut done = 0usize;
+    for (source, name) in &targets {
+        // Skip local files that no longer exist rather than failing the run;
+        // their manifest entry is preserved (see `rustyweb verify`).
+        if !source.is_url() {
+            match source.resolve(home) {
+                Some(p) if p.exists() => {}
+                _ => {
+                    tracing::warn!(source = %source.location(), "skipping missing local WACZ");
+                    continue;
+                }
+            }
+        }
+        info!(
+            source = %source.location(),
+            progress = format!("{}/{}", done + 1, total),
+            "reindexing"
+        );
+        // Fail fast, but say which collection failed and make clear the index is
+        // now partially rebuilt (the old one was already dropped) so the user
+        // knows to fix the cause and run reindex again.
+        index_one(source, home, &mut manifest, &search, Some(name)).with_context(|| {
+            format!(
+                "reindexing collection \"{}\" ({}) failed after {}/{} done; \
+                 the search index is now incomplete - fix the problem and run \
+                 `rustyweb reindex` again",
+                name,
+                source.location(),
+                done,
+                total,
+            )
+        })?;
+        done += 1;
+    }
+
+    search.into_inner().unwrap().commit()?;
+    manifest.save()?;
+    info!(reindexed = done, total, "reindex complete");
+    Ok(())
+}
+
+/// Turn one `index` argument into a source to index. An `http(s)://` URL yields
+/// a URL source. Otherwise the argument must be a `.wacz` file that already lives
+/// under `<home>/archive` - rustyweb keeps local archives there so the home
+/// directory is self-contained and portable, and does not copy files for you.
+/// Directories, non-`.wacz` paths, and files outside the archive folder are
+/// errors with guidance.
 fn resolve_sources(location: &str, home: &Path) -> Result<Vec<Source>> {
     match Source::parse(location) {
         url @ Source::Url(_) => Ok(vec![url]),
-        Source::File(p) => {
-            if p.is_dir() {
-                let mut sources = Vec::new();
-                for entry in std::fs::read_dir(&p)? {
-                    let path = entry?.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("wacz") {
-                        let abs = path.canonicalize().unwrap_or(path);
-                        sources.push(Source::for_file(&abs, home));
-                    }
-                }
-                Ok(sources)
-            } else if p.extension().and_then(|e| e.to_str()) == Some("wacz") {
-                let abs = p.canonicalize().unwrap_or(p);
-                Ok(vec![Source::for_file(&abs, home)])
-            } else {
-                debug!("skipping non-WACZ path: {}", p.display());
-                Ok(Vec::new())
-            }
-        }
+        Source::File(p) => Ok(vec![resolve_archive_file(&p, home)?]),
     }
+}
+
+/// Validate a local WACZ argument and return it as a home-relative [`Source`].
+fn resolve_archive_file(path: &Path, home: &Path) -> Result<Source> {
+    if path.is_dir() {
+        anyhow::bail!(
+            "{} is a directory; pass individual .wacz files instead \
+             (e.g. `rustyweb index archive/*.wacz`)",
+            path.display()
+        );
+    }
+    if path.extension().and_then(|e| e.to_str()) != Some("wacz") {
+        anyhow::bail!("{} is not a .wacz file or an http(s) URL", path.display());
+    }
+    if !path.exists() {
+        anyhow::bail!("{} does not exist", path.display());
+    }
+
+    let abs = path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", path.display()))?;
+    let archive = archive_dir(home);
+    let in_archive = archive
+        .canonicalize()
+        .map(|a| abs.starts_with(&a))
+        .unwrap_or(false);
+    if !in_archive {
+        anyhow::bail!(
+            "{} is not inside the archive folder {}\n\
+             rustyweb only indexes local WACZ files kept in the archive folder, so the \
+             home directory stays self-contained. Move the file into {} and index it \
+             from there, or pass an http(s) URL instead.",
+            abs.display(),
+            archive.display(),
+            archive.display()
+        );
+    }
+
+    Ok(Source::for_file(&abs, home))
 }
 
 /// Index a single WACZ source: obtain a local readable copy (downloading a URL
@@ -198,12 +302,20 @@ fn build_collection_body(meta: &crate::wacz::WaczMetadata) -> String {
 
 /// A raw contribution to a page's search document, parsed from one WARC record.
 enum RawRecord {
-    /// An HTML response: source of the page title and a scraped-text fallback body.
+    /// An HTML response: source of the page title, description, headings, and a
+    /// scraped-text fallback body. (PDF responses reuse this variant with just a
+    /// title and body.)
     Html {
         url: String,
         timestamp: String,
         title: String,
         body: String,
+        description: String,
+        headings: String,
+        /// `"html"` or `"pdf"`.
+        media_type: String,
+        /// `<html lang>` value (empty for PDFs).
+        lang: String,
     },
     /// A `urn:text:` resource record: Browsertrix's fully rendered (post-JS)
     /// page text. Richer than scraped HTML, especially for SPAs.
@@ -221,6 +333,10 @@ struct MergedPage {
     title: Option<String>,
     html_body: Option<String>,
     rendered_text: Option<String>,
+    description: Option<String>,
+    headings: Option<String>,
+    media_type: Option<String>,
+    lang: Option<String>,
 }
 
 /// Index all WARC entries inside a WACZ file into the Tantivy full-text index.
@@ -252,7 +368,7 @@ fn index_wacz(
     let mut pages: HashMap<String, MergedPage> = HashMap::new();
     for raw in per_warc.into_iter().flatten() {
         match raw {
-            RawRecord::Html { url, timestamp, title, body } => {
+            RawRecord::Html { url, timestamp, title, body, description, headings, media_type, lang } => {
                 let e = pages.entry(url).or_default();
                 // The HTML capture is the authoritative timestamp for replay.
                 e.timestamp = timestamp;
@@ -262,6 +378,18 @@ fn index_wacz(
                 if !body.is_empty() {
                     e.html_body = Some(body);
                 }
+                if !description.is_empty() {
+                    e.description = Some(description);
+                }
+                if !headings.is_empty() {
+                    e.headings = Some(headings);
+                }
+                if !media_type.is_empty() {
+                    e.media_type = Some(media_type);
+                }
+                if !lang.is_empty() {
+                    e.lang = Some(lang);
+                }
             }
             RawRecord::Text { url, timestamp, text } => {
                 let e = pages.entry(url).or_default();
@@ -269,21 +397,39 @@ fn index_wacz(
                     e.timestamp = timestamp;
                 }
                 e.rendered_text = Some(text);
+                // Rendered text always comes from an HTML page.
+                e.media_type.get_or_insert_with(|| "html".to_string());
             }
         }
     }
 
     let mut count = 0u64;
     {
+        use crate::search::Page;
         let mut s = search.lock().unwrap();
         for (url, m) in pages {
             // Prefer the fully rendered text; fall back to scraped HTML.
             let body = m.rendered_text.or(m.html_body).unwrap_or_default();
             let title = m.title.unwrap_or_default();
-            if title.is_empty() && body.is_empty() {
+            let description = m.description.unwrap_or_default();
+            let headings = m.headings.unwrap_or_default();
+            let media_type = m.media_type.unwrap_or_default();
+            let lang = m.lang.unwrap_or_default();
+            if title.is_empty() && body.is_empty() && description.is_empty() {
                 continue;
             }
-            s.index_page(&url, &m.timestamp, &title, &body, collection_id, collection_name)?;
+            s.index_page(&Page {
+                url: &url,
+                timestamp: &m.timestamp,
+                title: &title,
+                body: &body,
+                description: &description,
+                headings: &headings,
+                media_type: &media_type,
+                lang: &lang,
+                collection_id,
+                collection_name,
+            })?;
             count += 1;
         }
     }
@@ -347,6 +493,10 @@ fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
                         timestamp: record.timestamp.clone(),
                         title: pdf_title_from_url(uri),
                         body: text,
+                        description: String::new(),
+                        headings: String::new(),
+                        media_type: "pdf".to_string(),
+                        lang: String::new(),
                     });
                 } else {
                     debug!(url = uri, "PDF text extraction yielded nothing; skipping");
@@ -358,15 +508,19 @@ fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
         if !mime.contains("html") || record.payload.is_empty() {
             continue;
         }
-        let (title, body) = extract_html_text(&record.payload);
-        if title.is_empty() && body.is_empty() {
+        let html = extract_html_text(&record.payload);
+        if html.title.is_empty() && html.body.is_empty() && html.description.is_empty() {
             continue;
         }
         out.push(RawRecord::Html {
             url: uri.to_string(),
             timestamp: record.timestamp.clone(),
-            title,
-            body,
+            title: html.title,
+            body: html.body,
+            description: html.description,
+            headings: html.headings,
+            media_type: "html".to_string(),
+            lang: html.lang,
         });
     }
 
@@ -409,10 +563,21 @@ mod tests {
         Path::new(FIXTURES).join(name)
     }
 
+    /// Copy a fixture WACZ into `<home>/archive` and index it from there, which
+    /// the archive requirement demands for local files. Returns the copied path.
+    fn index_fixture(name: &str, home: &Path, display: Option<&str>) -> std::path::PathBuf {
+        let archive = home.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let dest = archive.join(name);
+        std::fs::copy(fixture(name), &dest).unwrap();
+        index_path(&dest, home, display).unwrap();
+        dest
+    }
+
     #[test]
     fn index_path_wacz_writes_manifest() {
         let tmp = TempDir::new().unwrap();
-        index_path(&fixture("simple.wacz"), tmp.path(), Some("my-collection")).unwrap();
+        index_fixture("simple.wacz", tmp.path(), Some("my-collection"));
 
         let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections.len(), 1);
@@ -427,10 +592,50 @@ mod tests {
         // simple.wacz has no title in its datapackage, so the name falls back
         // to the filename stem.
         let tmp = TempDir::new().unwrap();
-        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
+        index_fixture("simple.wacz", tmp.path(), None);
 
         let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections[0].name, "simple");
+    }
+
+    #[test]
+    fn indexed_local_wacz_is_stored_relative_to_home() {
+        let tmp = TempDir::new().unwrap();
+        index_fixture("simple.wacz", tmp.path(), None);
+        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(
+            manifest.collections[0].source,
+            Source::File(PathBuf::from("archive/simple.wacz")),
+            "a local WACZ under archive/ should be stored relative to home"
+        );
+    }
+
+    #[test]
+    fn index_rejects_wacz_outside_archive() {
+        // A valid WACZ that is not under <home>/archive is refused with guidance.
+        let home = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let stray = elsewhere.path().join("simple.wacz");
+        std::fs::copy(fixture("simple.wacz"), &stray).unwrap();
+
+        let err = index_path(&stray, home.path(), None)
+            .err()
+            .expect("indexing a WACZ outside the archive folder should fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("archive"), "error should mention the archive folder: {msg}");
+    }
+
+    #[test]
+    fn index_rejects_a_directory() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+
+        let err = index_path(&archive, tmp.path(), None)
+            .err()
+            .expect("indexing a directory should fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("directory"), "error should say it is a directory: {msg}");
     }
 
     #[test]
@@ -438,7 +643,7 @@ mod tests {
         // pdf-doc.wacz has "title": "PDF Test Collection" in its datapackage,
         // which should name the collection when --name is not given.
         let tmp = TempDir::new().unwrap();
-        index_path(&fixture("pdf-doc.wacz"), tmp.path(), None).unwrap();
+        index_fixture("pdf-doc.wacz", tmp.path(), None);
 
         let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections[0].name, "PDF Test Collection");
@@ -448,16 +653,77 @@ mod tests {
     fn explicit_name_overrides_datapackage_title() {
         // --name wins even when the WACZ has a title.
         let tmp = TempDir::new().unwrap();
-        index_path(&fixture("pdf-doc.wacz"), tmp.path(), Some("Custom Name")).unwrap();
+        index_fixture("pdf-doc.wacz", tmp.path(), Some("Custom Name"));
 
         let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections[0].name, "Custom Name");
     }
 
     #[test]
+    fn reindex_rebuilds_from_manifest() {
+        // Index once with a custom name, then blow away just the full-text index
+        // (as a schema change / corruption would require) and reindex from the
+        // manifest.
+        let tmp = TempDir::new().unwrap();
+        index_fixture("simple.wacz", tmp.path(), Some("keepname"));
+
+        let full_text = tmp.path().join("index").join("full_text");
+        std::fs::remove_dir_all(&full_text).unwrap();
+
+        reindex(tmp.path()).unwrap();
+
+        // The manifest (and the custom name) is preserved...
+        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.collections.len(), 1);
+        assert_eq!(manifest.collections[0].name, "keepname");
+
+        // ...and the content is searchable again.
+        let idx = crate::search::SearchIndex::open(full_text.as_path()).unwrap();
+        assert!(!idx.search("example", 10).unwrap().is_empty(), "reindexed content should be searchable");
+    }
+
+    #[test]
+    fn reindex_with_no_collections_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        // No collections.json yet: reindex should be a no-op, not an error.
+        reindex(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn reindex_failure_names_the_collection_and_suggests_rerun() {
+        // A manifest that points at a file which exists but isn't a valid WACZ.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("index")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("archive")).unwrap();
+        std::fs::write(tmp.path().join("archive/bad.wacz"), b"not a zip file").unwrap();
+        let manifest = r#"[{"id":"deadbeef","source":"archive/bad.wacz","name":"BadOne","date_indexed":"2026-01-01T00:00:00Z","file_size":14,"sha256":"00"}]"#;
+        std::fs::write(tmp.path().join("index/collections.json"), manifest).unwrap();
+
+        let err = reindex(tmp.path()).err().expect("reindex should fail on a corrupt WACZ");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("BadOne"), "error should name the failing collection: {msg}");
+        assert!(msg.contains("reindex"), "error should tell the user to reindex again: {msg}");
+    }
+
+    #[test]
+    fn pdf_pages_are_filterable_by_type() {
+        // End-to-end: a PDF response in the WACZ should be tagged type:pdf so
+        // it can be filtered from the search box.
+        let tmp = TempDir::new().unwrap();
+        index_fixture("pdf-doc.wacz", tmp.path(), None);
+
+        let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+        let results = idx.search("type:pdf", 10).unwrap();
+        assert!(
+            results.iter().any(|r| r.doc_type == "page"),
+            "PDF page should be reachable via type:pdf"
+        );
+    }
+
+    #[test]
     fn index_wacz_html_is_searchable() {
         let tmp = TempDir::new().unwrap();
-        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
+        index_fixture("simple.wacz", tmp.path(), None);
 
         let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
         let results = idx.search("example", 10).unwrap();
@@ -468,7 +734,7 @@ mod tests {
     #[test]
     fn index_wacz_stores_seed_pages_in_manifest() {
         let tmp = TempDir::new().unwrap();
-        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
+        index_fixture("simple.wacz", tmp.path(), None);
 
         let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         let col = &manifest.collections[0];
@@ -482,7 +748,7 @@ mod tests {
     #[test]
     fn index_wacz_collection_is_searchable() {
         let tmp = TempDir::new().unwrap();
-        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
+        index_fixture("simple.wacz", tmp.path(), None);
 
         let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
         // The seed page URL "http://example.com/" is part of the collection body.
@@ -496,8 +762,8 @@ mod tests {
     #[test]
     fn reindexing_does_not_duplicate_documents() {
         let tmp = TempDir::new().unwrap();
-        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
-        index_path(&fixture("simple.wacz"), tmp.path(), None).unwrap();
+        index_fixture("simple.wacz", tmp.path(), None);
+        index_fixture("simple.wacz", tmp.path(), None);
 
         let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
         let results = idx.search("example", 50).unwrap();

@@ -170,6 +170,8 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         ""
     };
 
+    let tips = search_tips_html();
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -185,6 +187,14 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     .search-form {{ display: flex; gap: 0.5rem; margin-bottom: 3rem; }}
     .search-form input {{ flex: 1; padding: 0.6rem 0.8rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 4px; }}
     .search-form button {{ padding: 0.6rem 1.2rem; font-size: 1rem; cursor: pointer; background: #0066cc; color: #fff; border: none; border-radius: 4px; }}
+    .tips {{ margin: -2rem 0 2.5rem; font-size: 0.88rem; }}
+    .tips summary {{ cursor: pointer; color: #0066cc; width: fit-content; }}
+    .tips-body {{ margin-top: 0.6rem; padding: 0.8rem 1rem; background: #f6f8fa; border: 1px solid #e5e7eb; border-radius: 6px; color: #333; }}
+    .tips-body p {{ margin: 0.4rem 0; }}
+    .tips-body ul {{ margin: 0.5rem 0; padding-left: 1.2rem; }}
+    .tips-body li {{ margin: 0.25rem 0; }}
+    .tips-body code {{ background: #eef1f4; padding: 0.05rem 0.3rem; border-radius: 3px; font-family: monospace; font-size: 0.85em; }}
+    .tips-note {{ color: #666; margin-bottom: 0 !important; }}
     h2 {{ font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 0.4rem; }}
     .cards {{ display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }}
     .card {{ border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.2rem; background: #fafafa; }}
@@ -214,6 +224,7 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     <input type="search" name="q" placeholder="Search archived pages…" autofocus>
     <button type="submit">Search</button>
   </form>
+  {tips}
   <h2>Collections</h2>
   {empty_msg}
   <div class="cards">{cards}</div>
@@ -287,10 +298,15 @@ async fn search_page(
                 )
             };
 
-            let snippet_html = if r.snippet.is_empty() {
-                String::new()
-            } else {
+            // Prefer the hit-highlighted body snippet; if the query didn't match
+            // the body (e.g. a title-only or URL-only hit), fall back to the
+            // page's description so the result still has context.
+            let snippet_html = if !r.snippet.is_empty() {
                 format!("<div class=\"snippet\">{}</div>", r.snippet)
+            } else if !r.description.is_empty() {
+                format!("<div class=\"snippet\">{}</div>", html_escape(&r.description))
+            } else {
+                String::new()
             };
 
             let url_display = if is_collection {
@@ -337,6 +353,7 @@ async fn search_page(
     };
 
     let q_escaped = html_escape(&q);
+    let tips = search_tips_html();
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -353,6 +370,14 @@ async fn search_page(
     .search-form input {{ flex: 1; padding: 0.5rem 0.8rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 4px; }}
     .search-form button {{ padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; background: #0066cc; color: #fff; border: none; border-radius: 4px; }}
     .count {{ color: #666; font-size: 0.9rem; margin-bottom: 1rem; }}
+    .tips {{ margin: 0 0 1.5rem; font-size: 0.85rem; }}
+    .tips summary {{ cursor: pointer; color: #0066cc; width: fit-content; }}
+    .tips-body {{ margin-top: 0.6rem; padding: 0.8rem 1rem; background: #f6f8fa; border: 1px solid #e5e7eb; border-radius: 6px; color: #333; }}
+    .tips-body p {{ margin: 0.4rem 0; }}
+    .tips-body ul {{ margin: 0.5rem 0; padding-left: 1.2rem; }}
+    .tips-body li {{ margin: 0.25rem 0; }}
+    .tips-body code {{ background: #eef1f4; padding: 0.05rem 0.3rem; border-radius: 3px; font-family: monospace; font-size: 0.85em; }}
+    .tips-note {{ color: #666; margin-bottom: 0 !important; }}
     table {{ width: 100%; border-collapse: collapse; }}
     tr {{ border-bottom: 1px solid #eee; }}
     td {{ padding: 0.8rem 0.4rem; vertical-align: top; }}
@@ -378,6 +403,7 @@ async fn search_page(
       <button type="submit">Search</button>
     </form>
   </div>
+  {tips}
   <div class="count">{count_msg}</div>
   {table}
 </body>
@@ -640,6 +666,7 @@ async fn search_api(
                 "results": results.iter().map(|r| serde_json::json!({
                     "doc_type": r.doc_type,
                     "url": r.url,
+                    "domain": r.domain,
                     "timestamp": r.timestamp,
                     "title": r.title,
                     "collection_id": r.collection_id,
@@ -753,6 +780,38 @@ fn viewer_source(col: &Collection) -> String {
 fn error_response(e: anyhow::Error) -> Response {
     tracing::error!("{e:#}");
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+}
+
+/// A collapsible "Search tips" panel documenting the query syntax the search
+/// box actually supports. Rendered as a `<details>` element (no JavaScript) so
+/// it can sit unobtrusively on the homepage and the results page. The examples
+/// here must stay in sync with how `SearchIndex::search` configures the query
+/// parser (AND-by-default, title/body/URL default fields, `domain:` filtering).
+fn search_tips_html() -> &'static str {
+    r#"<details class="tips">
+  <summary>Search tips</summary>
+  <div class="tips-body">
+    <p>Type words to search page titles, headings, page text, descriptions, and
+    URLs. <strong>All words must match</strong> - <code>climate policy</code>
+    finds pages containing both.</p>
+    <ul>
+      <li><code>"climate policy"</code> - an exact phrase (use quotes)</li>
+      <li><code>climate OR weather</code> - either word</li>
+      <li><code>climate -policy</code> - has "climate", excludes "policy"</li>
+      <li><code>(climate OR weather) risk</code> - group with parentheses</li>
+      <li><code>title:climate</code> - match only in the page title</li>
+      <li><code>domain:example.com</code> - only pages from that exact host</li>
+      <li><code>year:2021</code> or <code>year:[2020 TO 2023]</code> - filter by crawl year</li>
+      <li><code>type:pdf</code> - only PDFs (or <code>type:html</code>)</li>
+      <li><code>lang:en</code> - only pages in that language</li>
+      <li><code>climate^2 change</code> - rank "climate" matches higher</li>
+    </ul>
+    <p class="tips-note">Searches are case-insensitive. Title matches rank
+    above body matches. <code>domain:</code> needs the exact host (e.g.
+    <code>www.example.com</code>); to match host words loosely, just type them
+    (e.g. <code>example</code>).</p>
+  </div>
+</details>"#
 }
 
 fn html_escape(s: &str) -> String {

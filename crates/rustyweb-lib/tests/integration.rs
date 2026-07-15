@@ -14,9 +14,19 @@ fn fixture(name: &str) -> std::path::PathBuf {
 fn make_index(paths: &[&str]) -> TempDir {
     let tmp = TempDir::new().unwrap();
     for path in paths {
-        rustyweb_lib::index::index_path(&fixture(path), tmp.path(), None).unwrap();
+        index_into(tmp.path(), path);
     }
     tmp
+}
+
+/// Copy a fixture WACZ into `<home>/archive` and index it from there. Local
+/// WACZs must live under the archive folder, so tests stage them there first.
+fn index_into(home: &Path, name: &str) {
+    let archive = home.join("archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    let dest = archive.join(name);
+    std::fs::copy(fixture(name), &dest).unwrap();
+    rustyweb_lib::index::index_path(&dest, home, None).unwrap();
 }
 
 // ── Indexing ──────────────────────────────────────────────────────────────────
@@ -404,7 +414,7 @@ async fn can_index_while_server_holds_the_index() {
     let _app = rustyweb_lib::server::router(tmp.path()).unwrap(); // held, like a live server
 
     // This previously failed with a Tantivy LockBusy error.
-    rustyweb_lib::index::index_path(&fixture("pdf-doc.wacz"), tmp.path(), None).unwrap();
+    index_into(tmp.path(), "pdf-doc.wacz");
 
     // The newly indexed content is searchable.
     let idx = rustyweb_lib::search::SearchIndex::open_read_only(

@@ -55,7 +55,8 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index      [--home <DIR>] [--name <NAME>] [<PATH|URL>...]
+rustyweb index      [--home <DIR>] [--name <NAME>] <PATH|URL>...
+rustyweb reindex    [--home <DIR>]
 rustyweb serve      [--home <DIR>] [--bind <ADDR>]
 rustyweb search-url [--home <DIR>] <URL>
 rustyweb verify     [--home <DIR>]
@@ -66,7 +67,8 @@ derived siblings: `<home>/archive/` (WACZ files) and `<home>/index/` (Tantivy
 index + `collections.json`). Keeping them together makes a home folder portable
 - move it to another disk or machine and it still resolves.
 
-- `index`: with no path, indexes every `.wacz` under `<home>/archive`. Also accepts explicit `.wacz` files, directories (scanned for `.wacz`), or `http(s)://` URLs (downloaded to a temp file for indexing). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. A `Source` is a local file (stored relative to home when under it) or a remote URL.
+- `index`: indexes one or more `.wacz` files or `http(s)://` URLs (downloaded to a temp file for indexing) - at least one argument is required. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. A `Source` is a local file (stored relative to home) or a remote URL. (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
+- `reindex`: rebuild the full-text index from the sources already recorded in `collections.json`, preserving the manifest and each collection's name. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. Missing local files are skipped with a warning. This is the intended way to migrate the index after the searchable-field schema changes (see below).
 - `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
 - `verify`: re-hashes every WACZ in `collections.json` and compares against the stored SHA-256, reporting each collection as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
@@ -99,23 +101,32 @@ Two document types share the same index, distinguished by `doc_type`.
 | `timestamp` | STRING | ✓ | - | 14-digit crawl timestamp |
 | `title` | TEXT | ✓ | BM25 | Page title or collection name |
 | `body` | TEXT | ✓ | BM25 | Page body text or collection description + seed URLs |
+| `description` | TEXT | ✓ | BM25 | Page `<meta description>` / og:description; shown as a snippet fallback |
+| `headings` | TEXT | - | BM25 | Page `<h1>`/`<h2>` text; boosted at query time |
 | `domain` | STRING | ✓ | exact | Lowercased host of the page URL, for `domain:` filtering (empty for collection docs) |
 | `url_tokens` | TEXT | - | BM25 | URL host + path split into words, so URL words are searchable as ordinary terms |
+| `year` | u64 | ✓ | numeric | Four-digit crawl year from the page timestamp, for `year:2021` / `year:[2020 TO 2023]` |
+| `type` | STRING | ✓ | exact | Coarse media type (`html` or `pdf`), for `type:pdf` filtering |
+| `lang` | STRING | ✓ | exact | Primary language subtag from `<html lang>` (e.g. `en`), for `lang:en` filtering |
 
-`body` is stored (not just indexed) so that Tantivy's `SnippetGenerator` can produce hit-highlighted excerpts without re-reading the source files. `url_tokens` is indexed but not stored: it exists only to make URL words findable; the canonical URL is kept in `url`.
+`body` and `description` are stored (not just indexed) so that Tantivy's `SnippetGenerator` can produce hit-highlighted excerpts without re-reading the source files, and so a result can show the description when the query didn't match the body. `headings` and `url_tokens` are indexed but not stored: they exist only to make that text findable; the canonical URL is kept in `url`.
 
 ### Query behavior
 
 Queries go through Tantivy's `QueryParser`, configured in `SearchIndex::search`:
 
-- **Default fields** are `title`, `body`, and `url_tokens`, so a bare word matches the title, page text, or URL words. Other fields are reachable with explicit `field:` syntax (`title:climate`, `domain:example.com`).
+- **Default fields** are `title`, `headings`, `body`, `description`, and `url_tokens`, so a bare word matches any of them. Other fields are reachable with explicit `field:` syntax (`title:climate`, `domain:example.com`).
 - **AND by default** (`set_conjunction_by_default`): `climate policy` requires both terms. Users can still write `OR`, `-`, `+`, `"phrases"`, `(groups)`, and `^boost`.
-- **Title boost**: title matches are boosted (`set_field_boost`) so they rank above body-only matches.
+- **Field boosts** (`set_field_boost`): title matches rank highest, headings next, then body/description/URL.
 - **Lenient parsing** (`parse_query_lenient`): a malformed query (stray quote, empty `field:`) yields a best-effort query rather than an error, so the search box never returns a 500 while a user experiments with syntax.
 
 The `<details>` "Search tips" panel on the homepage and results page documents this syntax for end users; its examples must stay in sync with this configuration.
 
-Adding `domain`/`url_tokens` (or any future field) means existing indexes must be rebuilt with `rustyweb index`; re-indexing is an idempotent upsert, so this is safe to re-run.
+### Schema changes and migration
+
+Tantivy persists the schema inside the index directory (`index/full_text/meta.json`) and reuses it when the index is opened. Adding a searchable field (as `domain`, `year`, `type`, etc. did) therefore makes an index built by an older binary *stale*: it lacks the new fields. To avoid writing/querying against a mismatched schema, `SearchIndex::open` compares the stored schema to the current one and, if they differ, returns an error telling the user to run `rustyweb reindex` rather than proceeding (which would otherwise panic on a missing field).
+
+`rustyweb reindex` performs the migration: it reads `collections.json`, deletes the old `index/full_text`, recreates it with the current schema, and re-indexes every registered source (files and remote URLs). The manifest and collection names are preserved.
 
 ### Collection documents
 
