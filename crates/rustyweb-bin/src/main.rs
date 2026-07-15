@@ -61,10 +61,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index one or more WACZ files, directories, or http(s) URLs.
+    /// Index one or more WACZ files (kept in <home>/archive) or http(s) URLs.
     Index {
-        /// WACZ files, directories (scanned for .wacz), or http(s) URLs.
-        /// At least one is required; to index a whole folder use `index archive/`.
+        /// WACZ files or http(s) URLs to index (at least one). A local WACZ must
+        /// live under <home>/archive; for several, glob it: `index archive/*.wacz`.
         paths: Vec<String>,
 
         /// rustyweb home directory (holds archive/ and index/).
@@ -130,10 +130,12 @@ async fn main() -> Result<()> {
             // probably meant instead.
             if paths.is_empty() {
                 eprintln!(
-                    "index needs at least one WACZ file, directory, or URL. For example:\n\
+                    "index needs at least one WACZ file (kept in <home>/archive) or an\n\
+                     http(s) URL. For example:\n\
                      \n\
-                     \x20 rustyweb index archive/                     index every .wacz in a folder\n\
-                     \x20 rustyweb index site.wacz https://ex.org/b.wacz   index specific files/URLs\n\
+                     \x20 rustyweb index archive/site.wacz      index a local WACZ (must be in archive/)\n\
+                     \x20 rustyweb index archive/*.wacz         index several at once\n\
+                     \x20 rustyweb index https://ex.org/b.wacz  index a remote WACZ\n\
                      \n\
                      To rebuild the existing index from collections.json (including\n\
                      remote sources), use: rustyweb reindex"

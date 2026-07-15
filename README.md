@@ -95,23 +95,24 @@ directory):
 └── index/     search index + metadata (created by `rustyweb index`)
 ```
 
-Put your WACZ files in `archive/`, then index and serve:
+Keep your WACZ files in `archive/`, then index and serve:
 
 ```sh
 mkdir -p archive
 cp my-archive.wacz archive/
 
-rustyweb index archive/   # index every .wacz in the folder
-rustyweb serve            # http://127.0.0.1:8080
+rustyweb index archive/*.wacz   # index the WACZs in your archive folder
+rustyweb serve                  # http://127.0.0.1:8080
 ```
 
-Point at a different home with `--home <DIR>` (both `index` and `serve` take
-it). Because the archive and its index live together under one folder, you can
-move or copy the whole `<home>` directory to another disk or machine and it
-still works - the paths are stored relative to home.
+Local WACZ files must live under `<home>/archive` - rustyweb indexes them in
+place (it does not copy them) and stores each source relative to home, so you
+can move or copy the whole `<home>` directory to another disk or machine and it
+still works. Point at a different home with `--home <DIR>` (every command takes
+it).
 
-`index` takes one or more WACZ files, directories (each scanned for `.wacz`),
-or URLs - so you can also index specific files or a URL:
+`index` takes one or more archived WACZ files or `http(s)` URLs, so you can also
+index a single file or a remote WACZ:
 
 ```sh
 rustyweb index archive/my-archive.wacz
@@ -180,16 +181,17 @@ rustyweb verify     [--home <DIR>]
 Every command takes `--home <DIR>` (default `.`); `archive/` and `index/` are
 derived siblings under it.
 
-- **`index`** - indexes the WACZ files, directories, or `http(s)://` URLs you
-  give it (at least one; a directory is scanned for `.wacz`, and a remote WACZ is
-  downloaded to a temp file for indexing). To index a whole folder, pass it as a
-  path: `rustyweb index archive/`. Extracts searchable text from each page (HTML,
-  Browsertrix's rendered `urn:text` records, and PDFs), reads `datapackage.json`
-  for collection metadata, and records everything in
-  `<home>/index/collections.json`, including the SHA-256 of each WACZ. Local WACZ
-  paths are stored relative to home so the folder is portable. The collection
-  name comes from `--name` if given, otherwise the WACZ's `datapackage.json`
-  title, otherwise the filename.
+- **`index`** - indexes one or more archived WACZ files or `http(s)://` URLs (at
+  least one; a remote WACZ is downloaded to a temp file for indexing). A local
+  WACZ must live under `<home>/archive`; rustyweb indexes it in place rather than
+  copying it, and a path outside the archive folder (or a directory) is an error.
+  Index several with a shell glob: `rustyweb index archive/*.wacz`. Extracts
+  searchable text from each page (HTML, Browsertrix's rendered `urn:text`
+  records, and PDFs), reads `datapackage.json` for collection metadata, and
+  records everything in `<home>/index/collections.json`, including the SHA-256 of
+  each WACZ. Local WACZ paths are stored relative to home so the folder is
+  portable. The collection name comes from `--name` if given, otherwise the
+  WACZ's `datapackage.json` title, otherwise the filename.
 - **`reindex`** - rebuild the search index from the collections already in
   `collections.json`, preserving their names. Re-fetches remote URL sources and
   recreates the index from scratch, so it's the way to migrate after an upgrade
