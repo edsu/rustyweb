@@ -50,6 +50,7 @@ pub fn router(home: &Path) -> Result<Router> {
         .route("/", get(homepage))
         .route("/search", get(search_page))
         .route("/collection/{id}", get(collection_page))
+        .route("/wacz/{id}", get(wacz_page))
         .route("/files/{id}", get(serve_file))
         .route("/replay/viewer", get(replay_viewer))
         .route("/api/search", get(search_api))
@@ -106,69 +107,57 @@ pub async fn serve(bind: &str, home: &Path) -> Result<()> {
 // ── Homepage ──────────────────────────────────────────────────────────────────
 
 async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let collections = load_waczs(&state);
+    let manifest = match Manifest::open(&state.index_dir) {
+        Ok(m) => m,
+        Err(e) => return error_response(e).into_response(),
+    };
 
-    let cards: String = collections
+    let cards: String = manifest
+        .collections
         .iter()
         .map(|c| {
-            let present = c.is_present(&state.home);
-            let status_class = if present { "ok" } else { "missing" };
-            let status_text = if present { "✓ present" } else { "✗ missing" };
+            let members: Vec<&Wacz> = manifest.members_of(&c.id).collect();
             let name = html_escape(&c.name);
-            let path = html_escape(&c.source.location());
-            let date = c.date_indexed.get(..10).unwrap_or(&c.date_indexed);
-            let source_enc = url_encode(&viewer_source(c));
+            let title_link = format!("/collection/{}", c.id);
+            let n = members.len();
+            let count_label = format!("{n} WACZ{}", if n == 1 { "" } else { "s" });
 
-            let description = c.description.as_deref()
+            let description = c
+                .description
+                .as_deref()
                 .map(|d| format!("<p class=\"desc\">{}</p>", html_escape(d)))
                 .unwrap_or_default();
 
-            let crawl_date = c.crawl_date.as_deref()
-                .map(|d| {
-                    let short = d.get(..10).unwrap_or(d);
-                    format!("<div class=\"meta-row\">Crawled: {short}</div>")
-                })
-                .unwrap_or_default();
-
-            let seed_links: String = c.seed_pages.iter().take(5).map(|p| {
-                let title = p.title.as_deref().unwrap_or(&p.url);
-                let url_enc = url_encode(&p.url);
-                let ts = ts_to_14digit(&p.ts);
-                let viewer_href = format!("/replay/viewer?source={source_enc}&url={url_enc}&ts={ts}&name={}", url_encode(&c.name));
-                format!("<li><a href=\"{viewer_href}\">{}</a></li>", html_escape(title))
-            }).collect();
-
-            let seed_section = if seed_links.is_empty() {
+            // Aggregate provenance across the collection's members.
+            let mut parts: Vec<String> = Vec::new();
+            let software = collection_software(&members);
+            if !software.is_empty() {
+                parts.push(format!("Software: {}", html_escape(&software.join(", "))));
+            }
+            if let Some(r) = members_capture_range(&members) {
+                parts.push(html_escape(&r));
+            }
+            let prov = if parts.is_empty() {
                 String::new()
             } else {
-                format!("<ul class=\"seeds\">{seed_links}</ul>")
+                format!("<div class=\"prov\">{}</div>", parts.join(" · "))
             };
 
-            let prov = provenance_line(c);
-
-            // The collection name links to its detail page.
-            let title_link = format!("/collection/{}", c.id);
             format!(
                 r#"<div class="card">
   <div class="card-header">
     <a class="card-title" href="{title_link}">{name}</a>
-    <span class="status {status_class}">{status_text}</span>
+    <span class="status muted">{count_label}</span>
   </div>
   {prov}
   {description}
-  {seed_section}
-  <div class="card-footer">
-    <span class="meta-row mono">{path}</span>
-    {crawl_date}
-    <span class="meta-row muted">Indexed: {date}</span>
-  </div>
 </div>"#
             )
         })
         .collect();
 
-    let empty_msg = if collections.is_empty() {
-        "<p class=\"muted\">No collections indexed yet. Run <code>rustyweb index &lt;path&gt;</code> to get started.</p>"
+    let empty_msg = if manifest.collections.is_empty() {
+        "<p class=\"muted\">No collections indexed yet. Run <code>rustyweb index archive/*.wacz</code> to get started.</p>"
     } else {
         ""
     };
@@ -236,7 +225,7 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 </html>"#,
     );
 
-    (StatusCode::OK, [("content-type", "text/html; charset=utf-8")], html)
+    (StatusCode::OK, [("content-type", "text/html; charset=utf-8")], html).into_response()
 }
 
 // ── Search results page ───────────────────────────────────────────────────────
@@ -331,7 +320,7 @@ async fn search_page(
                      <div class=\"result-title\"><a href=\"{href}\">{title}</a></div>\
                      <div class=\"result-meta\">{url_display}{ts_display}</div>\
                      {snippet_html}\
-                     <div class=\"result-coll\">in <a href=\"/collection/{coll_id}\"><em>{col_name}</em></a></div>\
+                     <div class=\"result-coll\">in <a href=\"/wacz/{coll_id}\"><em>{col_name}</em></a></div>\
                    </td>\
                    <td class=\"replay-col\">\
                      <a class=\"replay-btn\" href=\"{href}\">Replay →</a>\
@@ -423,10 +412,139 @@ async fn collection_page(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let collections = load_waczs(&state);
-    let Some(c) = collections.iter().find(|c| c.id == id) else {
+    let manifest = match Manifest::open(&state.index_dir) {
+        Ok(m) => m,
+        Err(e) => return error_response(e).into_response(),
+    };
+    let Some(c) = manifest.collection_by_id(&id) else {
         return (StatusCode::NOT_FOUND, "collection not found").into_response();
     };
+    let members: Vec<&Wacz> = manifest.members_of(&id).collect();
+
+    let name = html_escape(&c.name);
+    let description = c
+        .description
+        .as_deref()
+        .map(|d| format!("<p class=\"desc\">{}</p>", html_escape(d)))
+        .unwrap_or_default();
+
+    // Aggregates derived from members.
+    let total_size: u64 = members.iter().map(|w| w.file_size).sum();
+    let software = collection_software(&members);
+    let range = members_capture_range(&members);
+
+    let mut meta_rows = String::new();
+    if let Some(cur) = &c.curator {
+        meta_rows.push_str(&format!("<tr><th>Curator</th><td>{}</td></tr>", html_escape(cur)));
+    }
+    meta_rows.push_str(&format!("<tr><th>WACZs</th><td>{}</td></tr>", members.len()));
+    meta_rows.push_str(&format!("<tr><th>Size</th><td>{}</td></tr>", human_size(total_size)));
+    if !software.is_empty() {
+        meta_rows.push_str(&format!("<tr><th>Software</th><td>{}</td></tr>", html_escape(&software.join(", "))));
+    }
+    if let Some(r) = &range {
+        meta_rows.push_str(&format!("<tr><th>Capture dates</th><td>{}</td></tr>", html_escape(r)));
+    }
+    let created = c.created.get(..10).unwrap_or(&c.created);
+    meta_rows.push_str(&format!("<tr><th>Created</th><td>{}</td></tr>", html_escape(created)));
+
+    let items: String = members
+        .iter()
+        .map(|w| {
+            let status = if w.is_present(&state.home) {
+                "<span class=\"ok\">✓</span>"
+            } else {
+                "<span class=\"missing\">✗</span>"
+            };
+            format!(
+                "<li><a href=\"/wacz/{}\">{}</a> {status}{}</li>",
+                w.id,
+                html_escape(&w.name),
+                provenance_line(w),
+            )
+        })
+        .collect();
+    let members_section = if items.is_empty() {
+        "<p class=\"muted\">No WACZs in this collection.</p>".to_string()
+    } else {
+        format!("<ul class=\"pages\">{items}</ul>")
+    };
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{name} - rustyweb</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #222; }}
+    .top {{ display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; }}
+    .top a.home {{ font-size: 1.4rem; font-weight: bold; text-decoration: none; color: #222; }}
+    .search-form {{ display: flex; gap: 0.5rem; flex: 1; }}
+    .search-form input {{ flex: 1; padding: 0.5rem 0.8rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 4px; }}
+    .search-form button {{ padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; background: #0066cc; color: #fff; border: none; border-radius: 4px; }}
+    h1 {{ font-size: 1.6rem; margin: 0.3rem 0; }}
+    .desc {{ color: #444; margin: 0.5rem 0 1rem; }}
+    table.meta {{ border-collapse: collapse; font-size: 0.9rem; margin-bottom: 2rem; }}
+    table.meta th {{ text-align: left; padding: 0.3rem 1rem 0.3rem 0; color: #666; font-weight: 600; vertical-align: top; white-space: nowrap; }}
+    table.meta td {{ padding: 0.3rem 0; }}
+    h2 {{ font-size: 1.1rem; border-bottom: 1px solid #eee; padding-bottom: 0.4rem; }}
+    ul.pages {{ list-style: none; padding: 0; }}
+    ul.pages li {{ padding: 0.5rem 0; border-bottom: 1px solid #f0f0f0; }}
+    ul.pages a {{ color: #1a0dab; font-size: 1.02rem; text-decoration: none; }}
+    ul.pages a:hover {{ text-decoration: underline; }}
+    .prov {{ font-size: 0.82rem; color: #1a4d7a; background: #eef4fb; border: 1px solid #d6e4f2; border-radius: 4px; padding: 0.2rem 0.5rem; margin: 0.25rem 0 0; display: inline-block; }}
+    .ok {{ color: #2a7; }} .missing {{ color: #c33; }} .muted {{ color: #888; }}
+    a {{ color: #0066cc; }}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <a class="home" href="/">rustyweb</a>
+    <form class="search-form" action="/search" method="get">
+      <input type="search" name="q" placeholder="Search all collections…">
+      <button type="submit">Search</button>
+    </form>
+  </div>
+
+  <h1>{name}</h1>
+  {description}
+  <table class="meta">{meta_rows}</table>
+
+  <h2>WACZs</h2>
+  {members_section}
+</body>
+</html>"#
+    );
+
+    (StatusCode::OK, [("content-type", "text/html; charset=utf-8")], html).into_response()
+}
+
+async fn wacz_page(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let manifest = match Manifest::open(&state.index_dir) {
+        Ok(m) => m,
+        Err(e) => return error_response(e).into_response(),
+    };
+    let Some(c) = manifest.wacz_by_id(&id) else {
+        return (StatusCode::NOT_FOUND, "WACZ not found").into_response();
+    };
+
+    // Breadcrumb back to the containing collection.
+    let crumb = manifest
+        .collection_by_id(&c.collection)
+        .map(|col| {
+            format!(
+                "<div class=\"crumb\">in <a href=\"/collection/{}\">{}</a></div>",
+                col.id,
+                html_escape(&col.name)
+            )
+        })
+        .unwrap_or_default();
 
     let name = html_escape(&c.name);
     let source_enc = url_encode(&viewer_source(c));
@@ -533,6 +651,7 @@ async fn collection_page(
     .search-form input {{ flex: 1; padding: 0.5rem 0.8rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 4px; }}
     .search-form button {{ padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; background: #0066cc; color: #fff; border: none; border-radius: 4px; }}
     h1 {{ font-size: 1.6rem; margin: 0.3rem 0; }}
+    .crumb {{ font-size: 0.85rem; color: #666; margin-bottom: 0.3rem; }}
     .desc {{ color: #444; margin: 0.5rem 0 1rem; }}
     .replay-btn {{ display: inline-block; padding: 0.5rem 1rem; background: #0066cc; color: #fff; border-radius: 4px; text-decoration: none; margin-bottom: 1.5rem; }}
     .replay-btn:hover {{ background: #0052a3; }}
@@ -559,6 +678,7 @@ async fn collection_page(
     </form>
   </div>
 
+  {crumb}
   <h1>{name}</h1>
   {description}
   <a class="replay-btn" href="{replay_href}">Replay →</a>
@@ -873,6 +993,34 @@ fn capture_range(c: &Wacz) -> Option<String> {
         }
         (Some(s), None) => Some(ymd(s)),
         (None, Some(e)) => Some(ymd(e)),
+        (None, None) => None,
+    }
+}
+
+/// The deduped union of software across a collection's member WACZs.
+fn collection_software(members: &[&Wacz]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in members {
+        for s in &w.software {
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The capture date range spanning a collection's member WACZs.
+fn members_capture_range(members: &[&Wacz]) -> Option<String> {
+    let start = members.iter().filter_map(|w| w.capture_start.clone()).min();
+    let end = members.iter().filter_map(|w| w.capture_end.clone()).max();
+    match (start, end) {
+        (Some(s), Some(e)) => {
+            let (sd, ed) = (ymd(&s), ymd(&e));
+            Some(if sd == ed { sd } else { format!("{sd} → {ed}") })
+        }
+        (Some(s), None) => Some(ymd(&s)),
+        (None, Some(e)) => Some(ymd(&e)),
         (None, None) => None,
     }
 }

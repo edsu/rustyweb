@@ -341,14 +341,14 @@ async fn homepage_card_links_to_collection_page() {
 }
 
 #[tokio::test]
-async fn collection_page_shows_metadata_and_pages() {
+async fn wacz_page_shows_metadata_and_pages() {
     let tmp = make_index(&["a.wacz"]);
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
     let id = manifest.waczs[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     let resp = app
-        .oneshot(Request::get(format!("/collection/{id}")).body(Body::empty()).unwrap())
+        .oneshot(Request::get(format!("/wacz/{id}")).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -360,6 +360,30 @@ async fn collection_page_shows_metadata_and_pages() {
     assert!(html.contains("Pages"), "should have a pages section");
     // a.wacz's seed page (title "2Tone: The Sound of Britain").
     assert!(html.contains("2Tone"), "should list the WACZ's pages");
+}
+
+#[tokio::test]
+async fn collection_page_lists_members() {
+    let tmp = make_index(&["a.wacz"]);
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    // Singleton collection: its id equals the WACZ's id.
+    let coll_id = manifest.collections[0].id.clone();
+    let wacz_id = manifest.waczs[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let resp = app
+        .oneshot(Request::get(format!("/collection/{coll_id}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(html.contains("WACZs"), "collection page should have a members section");
+    assert!(
+        html.contains(&format!("/wacz/{wacz_id}")),
+        "collection page should link to its member WACZ"
+    );
 }
 
 #[tokio::test]
@@ -485,9 +509,12 @@ async fn index_from_http_url_and_link_directly() {
         assert!(!idx.search("example", 10).unwrap().is_empty());
     }
 
-    // The homepage links wabac directly at the remote URL, not through /files/{id}.
+    // The WACZ page links wabac directly at the remote URL, not through /files/{id}.
     let app2 = rustyweb_lib::server::router(tmp.path()).unwrap();
-    let resp = app2.oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+    let resp = app2
+        .oneshot(Request::get(format!("/wacz/{}", col.id)).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(
