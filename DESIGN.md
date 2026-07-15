@@ -194,6 +194,81 @@ The homepage displays this metadata per collection, giving users a preview of wh
 
 ---
 
+## Discovery, Provenance & Collections (design direction)
+
+This section records the intended direction for discovery, provenance, and the collection
+model. It is a roadmap - much of it is not implemented yet - and is tracked by three beads
+epics: `rustyweb-provenance-imd`, `rustyweb-collections-model-5co`, and
+`rustyweb-faceted-discovery-4js`.
+
+### Why (grounded in the literature)
+
+- **Needs are mostly navigational and temporal.** Costa & Silva's query-log study of the
+  Portuguese Web Archive found web-archive needs are ~53-81% *navigational* (see a page/site
+  as it was, or how it changed over time), 14-38% *informational* (find information on a
+  topic from the past), 5-16% *transactional*. So **time is a first-class axis**, and both
+  known-item lookup (URL + date + versions) and topical full-text search matter.
+- **Faceted "slice and dice" scales navigation better than clever ranking.** SHINE (UK Web
+  Archive), built on the same warc-indexer, offers facets for content-type, domain, crawl
+  year, links, and public suffix. Facets are the established answer to a growing, unwieldy
+  list.
+- **Provenance is essential and usually buried.** Maemura, Worby, Milligan & Becker, *If
+  These Crawls Could Talk* (JASIST 2018): to trust and interpret an archive you must be able
+  to evaluate its provenance, scope, and absences (curatorial intent, seeds/scope, crawler
+  software/parameters, operator, dates).
+
+### Two-level collection model
+
+rustyweb currently treats **one WACZ as one "collection"**, listed in a flat grid. The
+direction is a **two-level model**:
+
+- **Collection** - a curated grouping with *curatorial* provenance (name, description,
+  intent/scope). This becomes the primary unit users browse and facet by.
+- **WACZ / crawl members** - each carries *technical* provenance (crawler software,
+  operator, user-agent, crawl date range, seeds, page/capture counts, fixity + optional
+  signature).
+
+This single change serves both audiences: an **individual** self-hosting WACZs made with
+wget or browsertrix-crawler gets context and verifiable authenticity with no hosted-service
+dependency; an **institution** (e.g. TBs of WARC behind pywb) can reorganize crawls into
+navigable, provenance-bearing collections. It is also the structural fix for the "long
+list" problem. (Tracked by `rustyweb-collections-model-5co`.)
+
+### Provenance sources rustyweb should use
+
+Available in WACZ/WARC today but largely unused by the current indexer:
+
+- **`datapackage.json`** (WACZ 1.1.1): `title`, `description`, `created`, `modified`,
+  `software`, `mainPageUrl`.
+- **`datapackage-digest.json` + signature** (WACZ auth spec): verifiable authenticity
+  without trusting a service.
+- **WARC `warcinfo` record** (`application/warc-fields`, one per WARC): `software`,
+  `operator`, `http-header-user-agent`, `isPartOf`, `conformsTo`, `robots`, hostname.
+- **Per-record**: `WARC-Date`, HTTP status, payload digest, `WARC-IP-Address`.
+
+The goal is to extract these and present them **prominently** - a provenance panel on the
+collection page and a compact provenance line on results - not tucked away. (Tracked by
+`rustyweb-provenance-imd`.)
+
+### Faceted, temporal discovery
+
+The search experience moves from a fixed 20-result list toward a **search-first, faceted**
+interface: a facet sidebar (collection, year, domain/site, content type, language, crawler)
+with counts, date-range filtering and a result timeline, grouping of repeat captures of a
+URL, and pagination. Facets reuse fields from the search-enrichment work
+(`rustyweb-search-enrichment-6by`) plus the crawler/collection fields above. (Tracked by
+`rustyweb-faceted-discovery-4js`.)
+
+### References
+
+- Costa & Silva, *Understanding the Information Needs of Web Archive Users*, IWAW 2010.
+- Maemura, Worby, Milligan & Becker, *If These Crawls Could Talk: Studying and Documenting
+  Web Archives Provenance*, JASIST 2018.
+- SHINE / webarchive-discovery (UK Web Archive); WACZ 1.1.1 and the WACZ auth spec; the WARC
+  1.0 format specification.
+
+---
+
 ## Replay Viewer
 
 `GET /replay/viewer` serves a thin HTML shell (`static/replay/viewer.html`) that:
