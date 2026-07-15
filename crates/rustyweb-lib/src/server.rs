@@ -144,6 +144,8 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 format!("<ul class=\"seeds\">{seed_links}</ul>")
             };
 
+            let prov = provenance_line(c);
+
             // The collection name links to its detail page.
             let title_link = format!("/collection/{}", c.id);
             format!(
@@ -152,6 +154,7 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     <a class="card-title" href="{title_link}">{name}</a>
     <span class="status {status_class}">{status_text}</span>
   </div>
+  {prov}
   {description}
   {seed_section}
   <div class="card-footer">
@@ -202,6 +205,7 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     .card-title {{ font-size: 1.1rem; font-weight: 600; color: #0066cc; text-decoration: none; }}
     .card-title:hover {{ text-decoration: underline; }}
     .desc {{ color: #444; font-size: 0.9rem; margin: 0.4rem 0; }}
+    .prov {{ font-size: 0.82rem; color: #1a4d7a; background: #eef4fb; border: 1px solid #d6e4f2; border-radius: 4px; padding: 0.3rem 0.55rem; margin: 0.2rem 0 0.6rem; line-height: 1.4; }}
     .seeds {{ margin: 0.5rem 0; padding-left: 1.2rem; font-size: 0.88rem; }}
     .seeds li {{ margin: 0.2rem 0; }}
     .seeds a {{ color: #0066cc; text-decoration: none; }}
@@ -480,6 +484,39 @@ async fn collection_page(
         format!("<ul class=\"pages\">{pages}</ul>")
     };
 
+    // Provenance panel: how this WACZ was produced. Only rows with data show.
+    let prov_rows = {
+        let mut rows = String::new();
+        let mut row = |label: &str, value: &str, mono: bool| {
+            let class = if mono { " class=\"mono\"" } else { "" };
+            rows.push_str(&format!("<tr><th>{label}</th><td{class}>{}</td></tr>", html_escape(value)));
+        };
+        if let Some(sw) = &c.software {
+            row("Captured with", sw, false);
+        }
+        if let Some(op) = &c.operator {
+            row("Operator", op, false);
+        }
+        if let Some(ua) = &c.user_agent {
+            row("User-Agent", ua, true);
+        }
+        if let Some(rb) = &c.robots {
+            row("Robots", rb, false);
+        }
+        if let Some(n) = c.page_count {
+            row("Pages", &n.to_string(), false);
+        }
+        if let Some(range) = capture_range(c) {
+            row("Capture dates", &range, false);
+        }
+        rows
+    };
+    let provenance_section = if prov_rows.is_empty() {
+        String::new()
+    } else {
+        format!("<h2>Provenance</h2>\n  <table class=\"meta\">{prov_rows}</table>")
+    };
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -526,6 +563,8 @@ async fn collection_page(
   {description}
   <a class="replay-btn" href="{replay_href}">Replay →</a>
 
+  {provenance_section}
+  <h2>File</h2>
   <table class="meta">
     <tr><th>Source</th><td class="mono">{source_disp}</td></tr>
     <tr><th>Size</th><td>{size}</td></tr>
@@ -812,6 +851,50 @@ fn search_tips_html() -> &'static str {
     (e.g. <code>example</code>).</p>
   </div>
 </details>"#
+}
+
+/// `YYYY-MM-DD` from the first 8 digits of a 14-digit timestamp; the input as-is
+/// if it is too short.
+fn ymd(ts: &str) -> String {
+    if ts.len() >= 8 && ts[..8].bytes().all(|b| b.is_ascii_digit()) {
+        format!("{}-{}-{}", &ts[0..4], &ts[4..6], &ts[6..8])
+    } else {
+        ts.to_string()
+    }
+}
+
+/// The capture date range of a collection as a display string (`start → end`, or
+/// a single date when they coincide), or `None` when no range was recorded.
+fn capture_range(c: &Collection) -> Option<String> {
+    match (c.capture_start.as_deref(), c.capture_end.as_deref()) {
+        (Some(s), Some(e)) => {
+            let (sd, ed) = (ymd(s), ymd(e));
+            Some(if sd == ed { sd } else { format!("{sd} → {ed}") })
+        }
+        (Some(s), None) => Some(ymd(s)),
+        (None, Some(e)) => Some(ymd(e)),
+        (None, None) => None,
+    }
+}
+
+/// A compact one-line provenance summary (`Captured with X · N pages · dates`)
+/// for homepage cards and search results. Empty when nothing is known.
+fn provenance_line(c: &Collection) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(sw) = &c.software {
+        parts.push(format!("Captured with {}", html_escape(sw)));
+    }
+    if let Some(n) = c.page_count {
+        parts.push(format!("{n} page{}", if n == 1 { "" } else { "s" }));
+    }
+    if let Some(range) = capture_range(c) {
+        parts.push(html_escape(&range));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"prov\">{}</div>", parts.join(" · "))
+    }
 }
 
 fn html_escape(s: &str) -> String {
