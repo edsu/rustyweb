@@ -85,6 +85,12 @@ enum Commands {
         #[arg(long, default_value = ".")]
         home: PathBuf,
     },
+    /// Rebuild the search index from collections.json (re-fetches remote sources).
+    Reindex {
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
+    },
     /// Search indexed WACZ files for CDX records matching a URL.
     SearchUrl {
         /// URL to search for (exact match against archived URLs).
@@ -171,6 +177,16 @@ async fn main() -> Result<()> {
                 _ = ctrl_c => {}
                 _ = terminate => {}
             }
+        }
+
+        Commands::Reindex { home } => {
+            // Like `index`, silence stdout to hide third-party PDF extraction
+            // noise; our logs are on stderr.
+            let quiet = gag::Gag::stdout().ok();
+            let result = rustyweb_lib::index::reindex(&home);
+            drop(quiet);
+            result?;
+            tracing::info!("reindex complete");
         }
 
         Commands::SearchUrl { url, home } => {

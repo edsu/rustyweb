@@ -62,8 +62,19 @@ impl SearchIndex {
         std::fs::create_dir_all(index_dir)?;
         let schema = build_schema();
         if index_dir.join("meta.json").exists() {
-            Index::open_in_dir(index_dir)
-                .with_context(|| format!("opening Tantivy index at {}", index_dir.display()))
+            let index = Index::open_in_dir(index_dir)
+                .with_context(|| format!("opening Tantivy index at {}", index_dir.display()))?;
+            // A stored schema that differs from the current one (e.g. after new
+            // fields were added) can't be written or queried correctly. Fail
+            // with a clear message instead of panicking on a missing field.
+            if index.schema() != schema {
+                anyhow::bail!(
+                    "the search index at {} was built with an older schema; \
+                     run `rustyweb reindex` to rebuild it",
+                    index_dir.display()
+                );
+            }
+            Ok(index)
         } else {
             Index::create_in_dir(index_dir, schema)
                 .with_context(|| format!("creating Tantivy index at {}", index_dir.display()))
@@ -586,6 +597,23 @@ mod tests {
         let results = idx.search("fox", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].snippet.contains("fox"), "snippet should contain matched term: {}", results[0].snippet);
+    }
+
+    #[test]
+    fn open_errors_on_schema_mismatch() {
+        use tantivy::schema::{Schema, TEXT};
+        let tmp = TempDir::new().unwrap();
+        // Create an index with a different (older-style) schema.
+        let mut b = Schema::builder();
+        b.add_text_field("body", TEXT);
+        tantivy::Index::create_in_dir(tmp.path(), b.build()).unwrap();
+
+        // Opening with the current schema must fail cleanly (not panic), and
+        // the message should point the user at reindex.
+        let result = SearchIndex::open(tmp.path());
+        assert!(result.is_err(), "opening a mismatched schema should error");
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("reindex"), "error should suggest reindex: {msg}");
     }
 
     #[test]

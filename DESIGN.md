@@ -56,6 +56,7 @@ rustyweb/
 
 ```
 rustyweb index      [--home <DIR>] [--name <NAME>] [<PATH|URL>...]
+rustyweb reindex    [--home <DIR>]
 rustyweb serve      [--home <DIR>] [--bind <ADDR>]
 rustyweb search-url [--home <DIR>] <URL>
 rustyweb verify     [--home <DIR>]
@@ -67,6 +68,7 @@ index + `collections.json`). Keeping them together makes a home folder portable
 - move it to another disk or machine and it still resolves.
 
 - `index`: with no path, indexes every `.wacz` under `<home>/archive`. Also accepts explicit `.wacz` files, directories (scanned for `.wacz`), or `http(s)://` URLs (downloaded to a temp file for indexing). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. A `Source` is a local file (stored relative to home when under it) or a remote URL.
+- `reindex`: rebuild the full-text index from the sources already recorded in `collections.json`, preserving the manifest and each collection's name. Unlike `index` (which scans `<home>/archive`), this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. Missing local files are skipped with a warning. This is the intended way to migrate the index after the searchable-field schema changes (see below).
 - `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
 - `verify`: re-hashes every WACZ in `collections.json` and compares against the stored SHA-256, reporting each collection as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
@@ -120,7 +122,11 @@ Queries go through Tantivy's `QueryParser`, configured in `SearchIndex::search`:
 
 The `<details>` "Search tips" panel on the homepage and results page documents this syntax for end users; its examples must stay in sync with this configuration.
 
-Adding `domain`/`url_tokens` (or any future field) means existing indexes must be rebuilt with `rustyweb index`; re-indexing is an idempotent upsert, so this is safe to re-run.
+### Schema changes and migration
+
+Tantivy persists the schema inside the index directory (`index/full_text/meta.json`) and reuses it when the index is opened. Adding a searchable field (as `domain`, `year`, `type`, etc. did) therefore makes an index built by an older binary *stale*: it lacks the new fields. To avoid writing/querying against a mismatched schema, `SearchIndex::open` compares the stored schema to the current one and, if they differ, returns an error telling the user to run `rustyweb reindex` rather than proceeding (which would otherwise panic on a missing field).
+
+`rustyweb reindex` performs the migration: it reads `collections.json`, deletes the old `index/full_text`, recreates it with the current schema, and re-indexes every registered source (files and remote URLs). The manifest and collection names are preserved.
 
 ### Collection documents
 

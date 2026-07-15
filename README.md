@@ -167,6 +167,7 @@ Title matches rank above body matches, and searches are case-insensitive.
 
 ```
 rustyweb index      [--home <DIR>] [--name <NAME>] [<PATH|URL>...]
+rustyweb reindex    [--home <DIR>]
 rustyweb serve      [--home <DIR>] [--bind <ADDR>]
 rustyweb search-url [--home <DIR>] <URL>
 rustyweb verify     [--home <DIR>]
@@ -184,6 +185,11 @@ derived siblings under it.
   the SHA-256 of each WACZ. Local WACZ paths are stored relative to home so the
   folder is portable. The collection name comes from `--name` if given,
   otherwise the WACZ's `datapackage.json` title, otherwise the filename.
+- **`reindex`** - rebuild the search index from the collections already in
+  `collections.json`, preserving their names. Re-fetches remote URL sources and
+  recreates the index from scratch, so it's the way to migrate after an upgrade
+  changes the searchable fields. (If you try to `index` or `serve` against an
+  index built by an older version, rustyweb tells you to run this.)
 - **`serve`** - opens the index read-only and starts the HTTP server (so you can
   `index` while it runs). Defaults to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and

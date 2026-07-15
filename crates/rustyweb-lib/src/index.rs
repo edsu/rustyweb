@@ -59,6 +59,83 @@ pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result
     Ok(())
 }
 
+/// Rebuild the full-text index from the sources already recorded in
+/// `collections.json`, preserving the manifest (including each collection's
+/// display name).
+///
+/// Unlike [`index_location`] (which scans `<home>/archive`), this re-indexes
+/// every registered source - including remote URLs, which are re-fetched - and
+/// recreates the Tantivy index from scratch, so a schema change is picked up.
+/// Local files that have gone missing are skipped with a warning rather than
+/// aborting the whole run.
+pub fn reindex(home: &Path) -> Result<()> {
+    let index_dir = index_dir(home);
+    let mut manifest = CollectionManifest::open(&index_dir)?;
+    if manifest.collections.is_empty() {
+        info!("no collections registered; nothing to reindex");
+        return Ok(());
+    }
+
+    // Snapshot (source, name) before we start upserting back into the manifest.
+    let targets: Vec<(Source, String)> = manifest
+        .collections
+        .iter()
+        .map(|c| (c.source.clone(), c.name.clone()))
+        .collect();
+
+    // Drop the old full-text index so it is recreated with the current schema.
+    let full_text = index_dir.join("full_text");
+    if full_text.exists() {
+        std::fs::remove_dir_all(&full_text)
+            .with_context(|| format!("removing stale index at {}", full_text.display()))?;
+    }
+    let search = Mutex::new(
+        SearchIndex::open(full_text.as_path())
+            .with_context(|| format!("creating search index at {}", index_dir.display()))?,
+    );
+
+    let total = targets.len();
+    let mut done = 0usize;
+    for (source, name) in &targets {
+        // Skip local files that no longer exist rather than failing the run;
+        // their manifest entry is preserved (see `rustyweb verify`).
+        if !source.is_url() {
+            match source.resolve(home) {
+                Some(p) if p.exists() => {}
+                _ => {
+                    tracing::warn!(source = %source.location(), "skipping missing local WACZ");
+                    continue;
+                }
+            }
+        }
+        info!(
+            source = %source.location(),
+            progress = format!("{}/{}", done + 1, total),
+            "reindexing"
+        );
+        // Fail fast, but say which collection failed and make clear the index is
+        // now partially rebuilt (the old one was already dropped) so the user
+        // knows to fix the cause and run reindex again.
+        index_one(source, home, &mut manifest, &search, Some(name)).with_context(|| {
+            format!(
+                "reindexing collection \"{}\" ({}) failed after {}/{} done; \
+                 the search index is now incomplete - fix the problem and run \
+                 `rustyweb reindex` again",
+                name,
+                source.location(),
+                done,
+                total,
+            )
+        })?;
+        done += 1;
+    }
+
+    search.into_inner().unwrap().commit()?;
+    manifest.save()?;
+    info!(reindexed = done, total, "reindex complete");
+    Ok(())
+}
+
 /// Expand a location into the concrete WACZ sources to index. A directory is
 /// scanned (non-recursively) for `.wacz` files; a URL or single file yields one
 /// source. Local file paths are canonicalized, then stored relative to `home`
@@ -502,6 +579,52 @@ mod tests {
 
         let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.collections[0].name, "Custom Name");
+    }
+
+    #[test]
+    fn reindex_rebuilds_from_manifest() {
+        // Index once with a custom name, then blow away just the full-text index
+        // (as a schema change / corruption would require) and reindex from the
+        // manifest.
+        let tmp = TempDir::new().unwrap();
+        index_path(&fixture("simple.wacz"), tmp.path(), Some("keepname")).unwrap();
+
+        let full_text = tmp.path().join("index").join("full_text");
+        std::fs::remove_dir_all(&full_text).unwrap();
+
+        reindex(tmp.path()).unwrap();
+
+        // The manifest (and the custom name) is preserved...
+        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.collections.len(), 1);
+        assert_eq!(manifest.collections[0].name, "keepname");
+
+        // ...and the content is searchable again.
+        let idx = crate::search::SearchIndex::open(full_text.as_path()).unwrap();
+        assert!(!idx.search("example", 10).unwrap().is_empty(), "reindexed content should be searchable");
+    }
+
+    #[test]
+    fn reindex_with_no_collections_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        // No collections.json yet: reindex should be a no-op, not an error.
+        reindex(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn reindex_failure_names_the_collection_and_suggests_rerun() {
+        // A manifest that points at a file which exists but isn't a valid WACZ.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("index")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("archive")).unwrap();
+        std::fs::write(tmp.path().join("archive/bad.wacz"), b"not a zip file").unwrap();
+        let manifest = r#"[{"id":"deadbeef","source":"archive/bad.wacz","name":"BadOne","date_indexed":"2026-01-01T00:00:00Z","file_size":14,"sha256":"00"}]"#;
+        std::fs::write(tmp.path().join("index/collections.json"), manifest).unwrap();
+
+        let err = reindex(tmp.path()).err().expect("reindex should fail on a corrupt WACZ");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("BadOne"), "error should name the failing collection: {msg}");
+        assert!(msg.contains("reindex"), "error should tell the user to reindex again: {msg}");
     }
 
     #[test]
