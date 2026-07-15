@@ -55,7 +55,7 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index      [--home <DIR>] [--name <NAME>] [<PATH|URL>...]
+rustyweb index      [--home <DIR>] [--name <NAME>] <PATH|URL>...
 rustyweb reindex    [--home <DIR>]
 rustyweb serve      [--home <DIR>] [--bind <ADDR>]
 rustyweb search-url [--home <DIR>] <URL>
@@ -67,8 +67,8 @@ derived siblings: `<home>/archive/` (WACZ files) and `<home>/index/` (Tantivy
 index + `collections.json`). Keeping them together makes a home folder portable
 - move it to another disk or machine and it still resolves.
 
-- `index`: with no path, indexes every `.wacz` under `<home>/archive`. Also accepts explicit `.wacz` files, directories (scanned for `.wacz`), or `http(s)://` URLs (downloaded to a temp file for indexing). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. A `Source` is a local file (stored relative to home when under it) or a remote URL.
-- `reindex`: rebuild the full-text index from the sources already recorded in `collections.json`, preserving the manifest and each collection's name. Unlike `index` (which scans `<home>/archive`), this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. Missing local files are skipped with a warning. This is the intended way to migrate the index after the searchable-field schema changes (see below).
+- `index`: indexes one or more explicit `.wacz` files, directories (scanned for `.wacz`), or `http(s)://` URLs (downloaded to a temp file for indexing) - at least one argument is required. To index a whole archive folder, pass it: `rustyweb index archive/`. Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. A `Source` is a local file (stored relative to home when under it) or a remote URL. (`index` does *not* auto-scan `<home>/archive`; a bare invocation prints guidance pointing to `index archive/` and `reindex`.)
+- `reindex`: rebuild the full-text index from the sources already recorded in `collections.json`, preserving the manifest and each collection's name. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. Missing local files are skipped with a warning. This is the intended way to migrate the index after the searchable-field schema changes (see below).
 - `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
 - `verify`: re-hashes every WACZ in `collections.json` and compares against the stored SHA-256, reporting each collection as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.

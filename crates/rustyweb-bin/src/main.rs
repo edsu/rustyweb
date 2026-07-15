@@ -61,10 +61,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index WACZ files, directories, or http(s) URLs (defaults to <home>/archive).
+    /// Index one or more WACZ files, directories, or http(s) URLs.
     Index {
-        /// WACZ files, directories, or http(s) URLs. If omitted, indexes every
-        /// .wacz under <home>/archive.
+        /// WACZ files, directories (scanned for .wacz), or http(s) URLs.
+        /// At least one is required; to index a whole folder use `index archive/`.
         paths: Vec<String>,
 
         /// rustyweb home directory (holds archive/ and index/).
@@ -125,12 +125,22 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Index { paths, home, name } => {
-            // With no paths, index everything under <home>/archive.
-            let locations: Vec<String> = if paths.is_empty() {
-                vec![rustyweb_lib::index::archive_dir(&home).to_string_lossy().into_owned()]
-            } else {
-                paths
-            };
+            // `index` no longer auto-scans <home>/archive; a bare invocation is
+            // almost always a mistake, so guide the user to the two things they
+            // probably meant instead.
+            if paths.is_empty() {
+                eprintln!(
+                    "index needs at least one WACZ file, directory, or URL. For example:\n\
+                     \n\
+                     \x20 rustyweb index archive/                     index every .wacz in a folder\n\
+                     \x20 rustyweb index site.wacz https://ex.org/b.wacz   index specific files/URLs\n\
+                     \n\
+                     To rebuild the existing index from collections.json (including\n\
+                     remote sources), use: rustyweb reindex"
+                );
+                std::process::exit(2);
+            }
+            let locations = paths;
             let total = locations.len();
             for (i, location) in locations.iter().enumerate() {
                 tracing::info!(
