@@ -12,6 +12,12 @@ pub struct WaczMetadata {
     pub title: Option<String>,
     pub description: Option<String>,
     pub created: Option<String>,
+    /// Last-modified time of the WACZ, if recorded (WACZ 1.1.1 `modified`).
+    pub modified: Option<String>,
+    /// Tool that produced the WACZ (WACZ 1.1.1 `software`).
+    pub software: Option<String>,
+    /// The collection's main page URL, if declared (WACZ 1.1.1 `mainPageUrl`).
+    pub main_page_url: Option<String>,
     pub seed_pages: Vec<SeedPage>,
 }
 
@@ -45,6 +51,10 @@ pub fn read_datapackage(wacz_path: &Path) -> Result<WaczMetadata> {
         title: Option<String>,
         description: Option<String>,
         created: Option<String>,
+        modified: Option<String>,
+        software: Option<String>,
+        #[serde(rename = "mainPageUrl")]
+        main_page_url: Option<String>,
         /// Epoch-millisecond modification time; a fallback for `created`.
         mtime: Option<i64>,
     }
@@ -53,6 +63,10 @@ pub fn read_datapackage(wacz_path: &Path) -> Result<WaczMetadata> {
         title: Option<String>,
         description: Option<String>,
         created: Option<String>,
+        modified: Option<String>,
+        software: Option<String>,
+        #[serde(rename = "mainPageUrl")]
+        main_page_url: Option<String>,
         #[serde(default)]
         metadata: Option<Metadata>,
     }
@@ -70,6 +84,9 @@ pub fn read_datapackage(wacz_path: &Path) -> Result<WaczMetadata> {
                 .created
                 .or(nested.created)
                 .or_else(|| nested.mtime.and_then(millis_to_rfc3339));
+            meta.modified = clean(dp.modified.or(nested.modified));
+            meta.software = clean(dp.software.or(nested.software));
+            meta.main_page_url = clean(dp.main_page_url.or(nested.main_page_url));
         }
     }
 
@@ -404,6 +421,14 @@ mod tests {
     fn search_cdx_no_match() {
         let records = search_cdx(&fixture("simple.wacz"), "http://notexist.example/").unwrap();
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn read_datapackage_reads_software() {
+        // a.wacz records the crawler in datapackage.json's `software` field.
+        let meta = read_datapackage(&fixture("a.wacz")).unwrap();
+        let software = meta.software.expect("datapackage should carry software");
+        assert!(software.contains("Browsertrix-Crawler"), "unexpected software: {software}");
     }
 
     #[test]
