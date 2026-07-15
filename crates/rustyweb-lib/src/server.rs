@@ -491,8 +491,8 @@ async fn collection_page(
             let class = if mono { " class=\"mono\"" } else { "" };
             rows.push_str(&format!("<tr><th>{label}</th><td{class}>{}</td></tr>", html_escape(value)));
         };
-        if let Some(sw) = &c.software {
-            row("Captured with", sw, false);
+        if !c.software.is_empty() {
+            row("Software", &c.software.join(", "), false);
         }
         if let Some(op) = &c.operator {
             row("Operator", op, false);
@@ -881,8 +881,8 @@ fn capture_range(c: &Collection) -> Option<String> {
 /// for homepage cards and search results. Empty when nothing is known.
 fn provenance_line(c: &Collection) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(sw) = &c.software {
-        parts.push(format!("Captured with {}", html_escape(sw)));
+    if !c.software.is_empty() {
+        parts.push(format!("Software: {}", html_escape(&c.software.join(", "))));
     }
     if let Some(n) = c.page_count {
         parts.push(format!("{n} page{}", if n == 1 { "" } else { "s" }));

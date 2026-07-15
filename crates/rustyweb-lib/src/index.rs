@@ -245,9 +245,16 @@ fn index_one(
     let file_size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
     let date_indexed = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    // Provenance: prefer datapackage `software`, fall back to the warcinfo
-    // record; operator/user-agent/robots come from warcinfo when present.
+    // Provenance: collect the software reported by the datapackage and by the
+    // warcinfo record (deduped) - we don't label which crawled vs packaged.
+    // operator/user-agent/robots come from warcinfo when present.
     let warcinfo = stats.warcinfo.unwrap_or_default();
+    let mut software: Vec<String> = Vec::new();
+    for s in meta.software.into_iter().chain(warcinfo.software) {
+        if !software.contains(&s) {
+            software.push(s);
+        }
+    }
     manifest.upsert(Collection {
         id,
         source: source.clone(),
@@ -258,7 +265,7 @@ fn index_one(
         description: meta.description,
         crawl_date: meta.created,
         seed_pages: meta.seed_pages,
-        software: meta.software.or(warcinfo.software),
+        software,
         operator: warcinfo.operator,
         user_agent: warcinfo.user_agent,
         robots: warcinfo.robots,
@@ -675,8 +682,11 @@ mod tests {
 
         let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
         let col = &manifest.collections[0];
-        let software = col.software.as_deref().expect("software should be recorded");
-        assert!(software.contains("Browsertrix-Crawler"), "unexpected software: {software}");
+        assert!(
+            col.software.iter().any(|s| s.contains("Browsertrix-Crawler")),
+            "unexpected software: {:?}",
+            col.software
+        );
         assert!(col.page_count.is_some(), "page_count should be recorded");
     }
 

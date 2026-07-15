@@ -107,9 +107,13 @@ pub struct Collection {
     pub seed_pages: Vec<SeedPage>,
 
     // ── Provenance (from datapackage.json + the WARC warcinfo record) ──
-    /// Crawler software and version (e.g. `Browsertrix-Crawler 1.13.0`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub software: Option<String>,
+    /// Software that produced this archive, as reported by the WACZ
+    /// `datapackage.json` and/or the WARC `warcinfo` record (e.g.
+    /// `Browsertrix-Crawler 1.13.0`, `py-wacz 0.4.6`). We do not try to label
+    /// which entry crawled vs packaged - the formats don't distinguish - so this
+    /// is just the set of tools involved, joined for display at the UI level.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_seq")]
+    pub software: Vec<String>,
     /// Contact for the operator who ran the crawl.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
@@ -178,6 +182,24 @@ impl CollectionManifest {
     pub fn find_by_id(&self, id: &str) -> Option<&Collection> {
         self.collections.iter().find(|c| c.id == id)
     }
+}
+
+/// Deserialize `software` as either a single string (older manifests wrote one)
+/// or a list of strings, always yielding a `Vec<String>`.
+fn string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 /// Stable short ID for a collection: first 8 hex chars of SHA-256 of the source
@@ -259,6 +281,27 @@ mod tests {
     }
 
     #[test]
+    fn software_accepts_string_or_list() {
+        // Older manifests wrote `software` as a single string; newer ones a list.
+        let legacy: Collection = serde_json::from_str(
+            r#"{"id":"a","source":"archive/x.wacz","name":"x","date_indexed":"t","file_size":1,"sha256":"h","software":"py-wacz 0.4.6"}"#,
+        ).unwrap();
+        assert_eq!(legacy.software, vec!["py-wacz 0.4.6".to_string()]);
+
+        let listy: Collection = serde_json::from_str(
+            r#"{"id":"a","source":"archive/x.wacz","name":"x","date_indexed":"t","file_size":1,"sha256":"h","software":["Heritrix/3.4.0","py-wacz 0.4.6"]}"#,
+        ).unwrap();
+        assert_eq!(listy.software, vec!["Heritrix/3.4.0".to_string(), "py-wacz 0.4.6".to_string()]);
+
+        // Absent -> empty, and empty is not serialized back out.
+        let none: Collection = serde_json::from_str(
+            r#"{"id":"a","source":"archive/x.wacz","name":"x","date_indexed":"t","file_size":1,"sha256":"h"}"#,
+        ).unwrap();
+        assert!(none.software.is_empty());
+        assert!(!serde_json::to_string(&none).unwrap().contains("software"));
+    }
+
+    #[test]
     fn manifest_reads_legacy_path_key() {
         // Older manifests used "path" instead of "source".
         let tmp = TempDir::new().unwrap();
@@ -303,7 +346,7 @@ mod tests {
             description: Some("A test collection".to_string()),
             crawl_date: None,
             seed_pages: vec![],
-            software: None,
+            software: Vec::new(),
             operator: None,
             user_agent: None,
             robots: None,
@@ -335,7 +378,7 @@ mod tests {
             description: None,
             crawl_date: None,
             seed_pages: vec![],
-            software: None,
+            software: Vec::new(),
             operator: None,
             user_agent: None,
             robots: None,
@@ -354,7 +397,7 @@ mod tests {
             description: Some("updated".to_string()),
             crawl_date: None,
             seed_pages: vec![],
-            software: None,
+            software: Vec::new(),
             operator: None,
             user_agent: None,
             robots: None,
