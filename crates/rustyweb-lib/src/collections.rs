@@ -105,6 +105,29 @@ pub struct Collection {
     pub crawl_date: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seed_pages: Vec<SeedPage>,
+
+    // ── Provenance (from datapackage.json + the WARC warcinfo record) ──
+    /// Crawler software and version (e.g. `Browsertrix-Crawler 1.13.0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software: Option<String>,
+    /// Contact for the operator who ran the crawl.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+    /// User-Agent the crawler sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// How the crawler handled robots.txt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub robots: Option<String>,
+    /// Number of pages indexed from this WACZ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<u64>,
+    /// Earliest capture timestamp seen (14-digit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_start: Option<String>,
+    /// Latest capture timestamp seen (14-digit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_end: Option<String>,
 }
 
 impl Collection {
@@ -280,6 +303,13 @@ mod tests {
             description: Some("A test collection".to_string()),
             crawl_date: None,
             seed_pages: vec![],
+            software: None,
+            operator: None,
+            user_agent: None,
+            robots: None,
+            page_count: None,
+            capture_start: None,
+            capture_end: None,
         };
         m.upsert(col);
         m.save().unwrap();
@@ -305,6 +335,13 @@ mod tests {
             description: None,
             crawl_date: None,
             seed_pages: vec![],
+            software: None,
+            operator: None,
+            user_agent: None,
+            robots: None,
+            page_count: None,
+            capture_start: None,
+            capture_end: None,
         };
         m.upsert(col);
         m.upsert(Collection {
@@ -317,6 +354,13 @@ mod tests {
             description: Some("updated".to_string()),
             crawl_date: None,
             seed_pages: vec![],
+            software: None,
+            operator: None,
+            user_agent: None,
+            robots: None,
+            page_count: None,
+            capture_start: None,
+            capture_end: None,
         });
         assert_eq!(m.collections.len(), 1);
         assert_eq!(m.collections[0].name, "test-updated");

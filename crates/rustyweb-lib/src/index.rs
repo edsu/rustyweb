@@ -8,7 +8,7 @@ use tracing::{debug, info};
 
 use crate::collections::{Collection, CollectionManifest, Source, collection_id, file_sha256};
 use crate::search::{SearchIndex, extract_html_text};
-use crate::warc::{WarcRecord, iter_records};
+use crate::warc::{Warcinfo, WarcRecord, iter_records};
 use crate::wacz::{extract_warc_from_wacz, iter_warc_paths, read_datapackage};
 
 /// Paths derived from a rustyweb home directory.
@@ -229,8 +229,9 @@ fn index_one(
     search.lock().unwrap().delete_collection(&id);
 
     // Use the resolved name for page documents so page and collection results
-    // agree on the collection's name.
-    index_wacz(&local, &id, &display_name, search)?;
+    // agree on the collection's name. The pass also collects provenance (the
+    // WARC warcinfo record) and capture stats so we don't re-read the WARCs.
+    let stats = index_wacz(&local, &id, &display_name, search)?;
 
     // Index the collection itself as a searchable document.
     let coll_body = build_collection_body(&meta);
@@ -244,6 +245,9 @@ fn index_one(
     let file_size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
     let date_indexed = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
+    // Provenance: prefer datapackage `software`, fall back to the warcinfo
+    // record; operator/user-agent/robots come from warcinfo when present.
+    let warcinfo = stats.warcinfo.unwrap_or_default();
     manifest.upsert(Collection {
         id,
         source: source.clone(),
@@ -254,6 +258,13 @@ fn index_one(
         description: meta.description,
         crawl_date: meta.created,
         seed_pages: meta.seed_pages,
+        software: meta.software.or(warcinfo.software),
+        operator: warcinfo.operator,
+        user_agent: warcinfo.user_agent,
+        robots: warcinfo.robots,
+        page_count: Some(stats.pages),
+        capture_start: stats.earliest_capture,
+        capture_end: stats.latest_capture,
     });
 
     Ok(())
@@ -339,6 +350,16 @@ struct MergedPage {
     lang: Option<String>,
 }
 
+/// Provenance and capture stats gathered during one WACZ indexing pass, so the
+/// manifest can record them without re-reading the WARCs.
+#[derive(Default)]
+struct CrawlStats {
+    pages: u64,
+    earliest_capture: Option<String>,
+    latest_capture: Option<String>,
+    warcinfo: Option<Warcinfo>,
+}
+
 /// Index all WARC entries inside a WACZ file into the Tantivy full-text index.
 ///
 /// Records are collected across every inner WARC (rendered `urn:text:` records
@@ -350,12 +371,12 @@ fn index_wacz(
     collection_id: &str,
     collection_name: &str,
     search: &Mutex<SearchIndex>,
-) -> Result<()> {
+) -> Result<CrawlStats> {
     let warc_paths: Vec<_> = iter_warc_paths(wacz_path)?
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("listing WARC entries in {}", wacz_path.display()))?;
 
-    let per_warc: Vec<Vec<RawRecord>> = warc_paths
+    let per_warc: Vec<(Vec<RawRecord>, Option<Warcinfo>)> = warc_paths
         .par_iter()
         .map(|entry_name| {
             let tmp = extract_warc_from_wacz(wacz_path, entry_name)
@@ -364,10 +385,16 @@ fn index_wacz(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Merge all records into one entry per URL.
+    // Merge all records into one entry per URL, keeping the first warcinfo found
+    // (warcinfo leads its WARC, so the first WARC's is the crawl-level record).
+    let mut warcinfo: Option<Warcinfo> = None;
     let mut pages: HashMap<String, MergedPage> = HashMap::new();
-    for raw in per_warc.into_iter().flatten() {
-        match raw {
+    for (raws, wi) in per_warc {
+        if warcinfo.is_none() {
+            warcinfo = wi;
+        }
+        for raw in raws {
+            match raw {
             RawRecord::Html { url, timestamp, title, body, description, headings, media_type, lang } => {
                 let e = pages.entry(url).or_default();
                 // The HTML capture is the authoritative timestamp for replay.
@@ -400,10 +427,13 @@ fn index_wacz(
                 // Rendered text always comes from an HTML page.
                 e.media_type.get_or_insert_with(|| "html".to_string());
             }
+            }
         }
     }
 
     let mut count = 0u64;
+    let mut earliest: Option<String> = None;
+    let mut latest: Option<String> = None;
     {
         use crate::search::Page;
         let mut s = search.lock().unwrap();
@@ -431,23 +461,49 @@ fn index_wacz(
                 collection_name,
             })?;
             count += 1;
+            // Track the capture date range (14-digit timestamps sort
+            // chronologically as plain strings).
+            if !m.timestamp.is_empty() {
+                if earliest.as_deref().is_none_or(|e| m.timestamp.as_str() < e) {
+                    earliest = Some(m.timestamp.clone());
+                }
+                if latest.as_deref().is_none_or(|l| m.timestamp.as_str() > l) {
+                    latest = Some(m.timestamp.clone());
+                }
+            }
         }
     }
 
     info!(pages = count, wacz = %wacz_path.display(), "indexed pages from WACZ");
-    Ok(())
+    Ok(CrawlStats {
+        pages: count,
+        earliest_capture: earliest,
+        latest_capture: latest,
+        warcinfo,
+    })
 }
 
 /// Parse an extracted WARC file into raw per-record contributions (HTML
 /// responses and `urn:text:` rendered-text resources). Other record types
 /// (images, JS, CSS, redirects, other `urn:` pseudo-records) are ignored.
-fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
+fn collect_page_records(warc_path: &Path) -> Result<(Vec<RawRecord>, Option<Warcinfo>)> {
     let records: Vec<WarcRecord> = iter_records(warc_path)
         .with_context(|| format!("reading {}", warc_path.display()))?
         .collect::<Result<Vec<_>>>()?;
 
     let mut out = Vec::new();
+    let mut warcinfo: Option<Warcinfo> = None;
     for record in &records {
+        // Capture the crawl's warcinfo (checked before the URI gate below, since
+        // warcinfo records carry no WARC-Target-URI).
+        if warcinfo.is_none() {
+            if let Some(info) = Warcinfo::from_record(record) {
+                if !info.is_empty() {
+                    warcinfo = Some(info);
+                }
+            }
+        }
+
         let uri = record.target_uri.as_str();
         if uri.is_empty() || uri.starts_with("dns:") {
             continue;
@@ -524,7 +580,7 @@ fn collect_page_records(warc_path: &Path) -> Result<Vec<RawRecord>> {
         });
     }
 
-    Ok(out)
+    Ok((out, warcinfo))
 }
 
 /// Derive a page title for a PDF from the last path segment of its URL
@@ -608,6 +664,20 @@ mod tests {
             Source::File(PathBuf::from("archive/simple.wacz")),
             "a local WACZ under archive/ should be stored relative to home"
         );
+    }
+
+    #[test]
+    fn provenance_is_recorded_on_the_manifest() {
+        // a.wacz carries crawler software (datapackage + warcinfo) and real
+        // captures, so the manifest entry should record provenance.
+        let tmp = TempDir::new().unwrap();
+        index_fixture("a.wacz", tmp.path(), None);
+
+        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
+        let col = &manifest.collections[0];
+        let software = col.software.as_deref().expect("software should be recorded");
+        assert!(software.contains("Browsertrix-Crawler"), "unexpected software: {software}");
+        assert!(col.page_count.is_some(), "page_count should be recorded");
     }
 
     #[test]
