@@ -64,9 +64,9 @@ fn index_wacz_result_has_collection_fields() {
 #[test]
 fn index_wacz_writes_manifest_with_metadata() {
     let tmp = make_index(&["simple.wacz"]);
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
-    assert_eq!(manifest.collections.len(), 1);
-    let col = &manifest.collections[0];
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    assert_eq!(manifest.waczs.len(), 1);
+    let col = &manifest.waczs[0];
     assert_eq!(col.name, "simple");
     assert!(!col.id.is_empty());
     assert!(!col.sha256.is_empty());
@@ -128,8 +128,8 @@ async fn search_api_no_results() {
 #[tokio::test]
 async fn files_route_serves_registered_wacz() {
     let tmp = make_index(&["simple.wacz"]);
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
-    let id = &manifest.collections[0].id;
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let id = &manifest.waczs[0].id;
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     let req = Request::get(format!("/files/{id}"))
@@ -141,8 +141,8 @@ async fn files_route_serves_registered_wacz() {
 #[tokio::test]
 async fn files_route_range_request() {
     let tmp = make_index(&["simple.wacz"]);
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
-    let id = &manifest.collections[0].id;
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let id = &manifest.waczs[0].id;
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     let req = Request::get(format!("/files/{id}"))
@@ -175,8 +175,8 @@ async fn files_route_unknown_id_404() {
 #[tokio::test]
 async fn served_wacz_is_byte_identical_to_disk() {
     let tmp = make_index(&["a.wacz"]);
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
-    let id = manifest.collections[0].id.clone();
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let id = manifest.waczs[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     let req = Request::get(format!("/files/{id}")).body(Body::empty()).unwrap();
@@ -192,8 +192,8 @@ async fn served_wacz_is_byte_identical_to_disk() {
 #[tokio::test]
 async fn served_range_matches_the_file_slice() {
     let tmp = make_index(&["a.wacz"]);
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
-    let id = manifest.collections[0].id.clone();
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let id = manifest.waczs[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     // Request an interior slice and verify the exact bytes, not just the length.
@@ -215,8 +215,8 @@ async fn served_range_matches_the_file_slice() {
 #[tokio::test]
 async fn served_wacz_cdx_resolves_a_replayable_page() {
     let tmp = make_index(&["a.wacz"]);
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
-    let id = manifest.collections[0].id.clone();
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let id = manifest.waczs[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     // Pull the whole WACZ through the HTTP endpoint the browser would use...
@@ -328,8 +328,8 @@ async fn homepage_shows_collection_name() {
 #[tokio::test]
 async fn homepage_card_links_to_collection_page() {
     let tmp = make_index(&["simple.wacz"]);
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
-    let id = manifest.collections[0].id.clone();
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let id = manifest.waczs[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
     let resp = app.oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -341,14 +341,14 @@ async fn homepage_card_links_to_collection_page() {
 }
 
 #[tokio::test]
-async fn collection_page_shows_metadata_and_pages() {
+async fn wacz_page_shows_metadata_and_pages() {
     let tmp = make_index(&["a.wacz"]);
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
-    let id = manifest.collections[0].id.clone();
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let id = manifest.waczs[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     let resp = app
-        .oneshot(Request::get(format!("/collection/{id}")).body(Body::empty()).unwrap())
+        .oneshot(Request::get(format!("/wacz/{id}")).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -360,6 +360,30 @@ async fn collection_page_shows_metadata_and_pages() {
     assert!(html.contains("Pages"), "should have a pages section");
     // a.wacz's seed page (title "2Tone: The Sound of Britain").
     assert!(html.contains("2Tone"), "should list the WACZ's pages");
+}
+
+#[tokio::test]
+async fn collection_page_lists_members() {
+    let tmp = make_index(&["a.wacz"]);
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    // Singleton collection: its id equals the WACZ's id.
+    let coll_id = manifest.collections[0].id.clone();
+    let wacz_id = manifest.waczs[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let resp = app
+        .oneshot(Request::get(format!("/collection/{coll_id}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(html.contains("WACZs"), "collection page should have a members section");
+    assert!(
+        html.contains(&format!("/wacz/{wacz_id}")),
+        "collection page should link to its member WACZ"
+    );
 }
 
 #[tokio::test]
@@ -375,7 +399,7 @@ async fn collection_page_unknown_id_404() {
 
 #[tokio::test]
 async fn home_directory_is_portable() {
-    use rustyweb_lib::collections::{CollectionManifest, Source};
+    use rustyweb_lib::collections::{Manifest, Source};
 
     // Build a home dir with the WACZ under <home>/archive, then index it.
     let base = TempDir::new().unwrap();
@@ -386,10 +410,10 @@ async fn home_directory_is_portable() {
     rustyweb_lib::index::index_path(&archive.join("simple.wacz"), &home_a, None).unwrap();
 
     // The source is stored relative to home (portable), not absolute.
-    let manifest = CollectionManifest::open(&home_a.join("index")).unwrap();
-    let id = manifest.collections[0].id.clone();
+    let manifest = Manifest::open(&home_a.join("index")).unwrap();
+    let id = manifest.waczs[0].id.clone();
     assert_eq!(
-        manifest.collections[0].source,
+        manifest.waczs[0].source,
         Source::File(Path::new("archive/simple.wacz").to_path_buf()),
         "local WACZ should be stored relative to home"
     );
@@ -466,16 +490,16 @@ async fn index_from_http_url_and_link_directly() {
     // index_location uses a blocking HTTP client; run it off the async runtime.
     let (url_c, dir_c) = (url.clone(), tmp.path().to_path_buf());
     tokio::task::spawn_blocking(move || {
-        rustyweb_lib::index::index_location(&url_c, &dir_c, None).unwrap();
+        rustyweb_lib::index::index_location(&url_c, &dir_c, None, None).unwrap();
     })
     .await
     .unwrap();
     server.abort();
 
     // The manifest records the URL as the source (not a local path).
-    let manifest = rustyweb_lib::collections::CollectionManifest::open(&tmp.path().join("index")).unwrap();
-    assert_eq!(manifest.collections.len(), 1);
-    let col = &manifest.collections[0];
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    assert_eq!(manifest.waczs.len(), 1);
+    let col = &manifest.waczs[0];
     assert_eq!(col.source, rustyweb_lib::collections::Source::Url(url.clone()));
 
     // The downloaded WACZ was indexed and is searchable. Scope the index so its
@@ -485,9 +509,12 @@ async fn index_from_http_url_and_link_directly() {
         assert!(!idx.search("example", 10).unwrap().is_empty());
     }
 
-    // The homepage links wabac directly at the remote URL, not through /files/{id}.
+    // The WACZ page links wabac directly at the remote URL, not through /files/{id}.
     let app2 = rustyweb_lib::server::router(tmp.path()).unwrap();
-    let resp = app2.oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+    let resp = app2
+        .oneshot(Request::get(format!("/wacz/{}", col.id)).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(

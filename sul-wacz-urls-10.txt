@@ -1,0 +1,10 @@
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:ct300ch5150/joannafrueh.wacz
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:cx310ts2798/Wilma%20Chan%202011%20facebook%20posts.wacz
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:zm258hp2279/Stanford%20Report%20-%20January%202017.wacz
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:yw081st3848/stanford-20210816.wacz
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:zk562zs8345/stanfordsoftball1.wacz
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:nx818wt5042/StanfordDV8.wacz
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:ww180gg9763/the_quaranzine-20210609.wacz
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:rr656wf6799/stanfordalumni-20210813.wacz
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:cz425dy3728/stanford_2016.wacz
+target/release/rustyweb index --collection sul https://stacks.stanford.edu/file/druid:kt359gw9208/stanford2013.wacz

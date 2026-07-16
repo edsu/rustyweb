@@ -35,6 +35,16 @@
       color: #9ecbff;
       white-space: nowrap;
     }
+    #banner a#collection {
+      background: #16213e;
+      padding: 0.15rem 0.5rem;
+      border-radius: 3px;
+      color: #9ecbff;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    #banner a#collection:hover { text-decoration: underline; }
+    #banner .sep { color: #667; }
     #current-url {
       color: #bbb;
       font-family: monospace;
@@ -54,6 +64,7 @@
 <body>
   <div id="banner">
     <a class="home" href="/">rustyweb</a>
+    <a id="collection"></a>
     <span id="collection-name"></span>
     <span id="current-url"></span>
   </div>
@@ -66,6 +77,8 @@
       const url    = params.get('url') || '';
       const ts     = params.get('ts') || '';
       const name   = params.get('name') || '';
+      const collection   = params.get('collection') || '';
+      const collectionId = params.get('collection_id') || '';
 
       if (!source) {
         document.body.innerHTML =
@@ -75,6 +88,15 @@
 
       const collId = source.split('/').pop();
 
+      // Breadcrumb: rustyweb › <collection> › <WACZ name> › <url>. The
+      // collection crumb links back to its collection page when known.
+      const collEl = document.getElementById('collection');
+      if (collection) {
+        collEl.textContent = collection;
+        if (collectionId) collEl.href = '/collection/' + encodeURIComponent(collectionId);
+      } else {
+        collEl.style.display = 'none';
+      }
       document.getElementById('collection-name').textContent = name || collId;
       document.getElementById('current-url').textContent = url;
 

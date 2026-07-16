@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use tracing::{debug, info};
 
-use crate::collections::{Collection, CollectionManifest, Source, collection_id, file_sha256};
+use crate::collections::{Manifest, Source, Wacz, file_sha256, wacz_id};
 use crate::search::{SearchIndex, extract_html_text};
 use crate::warc::{Warcinfo, WarcRecord, iter_records};
 use crate::wacz::{extract_warc_from_wacz, iter_warc_paths, read_datapackage};
@@ -22,7 +22,7 @@ pub fn archive_dir(home: &Path) -> PathBuf {
 /// Index a local WACZ file (which must live under `<home>/archive`) under the
 /// given home dir. Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
-    index_location(&path.to_string_lossy(), home, name)
+    index_location(&path.to_string_lossy(), home, name, None)
 }
 
 /// Index a WACZ from a location into the home directory's `index/`. The location
@@ -38,7 +38,12 @@ pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
 /// replaces its documents in Tantivy.
 /// `name` overrides the collection display name; otherwise it comes from the
 /// WACZ metadata, falling back to the filename/URL stem.
-pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result<()> {
+pub fn index_location(
+    location: &str,
+    home: &Path,
+    name: Option<&str>,
+    collection: Option<&str>,
+) -> Result<()> {
     // Validate the argument first (a bad path errors before we touch the index).
     let sources = resolve_sources(location, home)?;
 
@@ -51,10 +56,14 @@ pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result
             .with_context(|| format!("opening search index at {}", index_dir.display()))?,
     );
 
-    let mut manifest = CollectionManifest::open(&index_dir)?;
+    let mut manifest = Manifest::open(&index_dir)?;
+
+    // Resolve `--collection NAME` to (id, name); `None` => a singleton per WACZ.
+    let group = collection.map(|cn| (crate::collections::slugify(cn), cn.to_string()));
 
     for source in &sources {
-        index_one(source, home, &mut manifest, &search, name)?;
+        let c = group.as_ref().map(|(id, n)| (id.as_str(), n.as_str()));
+        index_one(source, home, &mut manifest, &search, name, c)?;
     }
 
     search.into_inner().unwrap().commit()?;
@@ -74,17 +83,24 @@ pub fn index_location(location: &str, home: &Path, name: Option<&str>) -> Result
 /// aborting the whole run.
 pub fn reindex(home: &Path) -> Result<()> {
     let index_dir = index_dir(home);
-    let mut manifest = CollectionManifest::open(&index_dir)?;
-    if manifest.collections.is_empty() {
-        info!("no collections registered; nothing to reindex");
+    let mut manifest = Manifest::open(&index_dir)?;
+    if manifest.waczs.is_empty() {
+        info!("no WACZs registered; nothing to reindex");
         return Ok(());
     }
 
-    // Snapshot (source, name) before we start upserting back into the manifest.
-    let targets: Vec<(Source, String)> = manifest
-        .collections
+    // Snapshot each WACZ (source, name, collection id + name) before upserting
+    // back, so its collection membership and the collection's metadata survive.
+    let targets: Vec<(Source, String, String, String)> = manifest
+        .waczs
         .iter()
-        .map(|c| (c.source.clone(), c.name.clone()))
+        .map(|w| {
+            let coll_name = manifest
+                .collection_by_id(&w.collection)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| w.name.clone());
+            (w.source.clone(), w.name.clone(), w.collection.clone(), coll_name)
+        })
         .collect();
 
     // Drop the old full-text index so it is recreated with the current schema.
@@ -100,7 +116,7 @@ pub fn reindex(home: &Path) -> Result<()> {
 
     let total = targets.len();
     let mut done = 0usize;
-    for (source, name) in &targets {
+    for (source, name, collection_id, collection_name) in &targets {
         // Skip local files that no longer exist rather than failing the run;
         // their manifest entry is preserved (see `rustyweb verify`).
         if !source.is_url() {
@@ -119,8 +135,17 @@ pub fn reindex(home: &Path) -> Result<()> {
         );
         // Fail fast, but say which collection failed and make clear the index is
         // now partially rebuilt (the old one was already dropped) so the user
-        // knows to fix the cause and run reindex again.
-        index_one(source, home, &mut manifest, &search, Some(name)).with_context(|| {
+        // knows to fix the cause and run reindex again. Membership is preserved
+        // by re-supplying each WACZ's existing collection.
+        index_one(
+            source,
+            home,
+            &mut manifest,
+            &search,
+            Some(name),
+            Some((collection_id, collection_name)),
+        )
+        .with_context(|| {
             format!(
                 "reindexing collection \"{}\" ({}) failed after {}/{} done; \
                  the search index is now incomplete - fix the problem and run \
@@ -138,6 +163,25 @@ pub fn reindex(home: &Path) -> Result<()> {
     manifest.save()?;
     info!(reindexed = done, total, "reindex complete");
     Ok(())
+}
+
+/// Create or update a collection's curatorial metadata (its id is the slug of
+/// `name`). Only the provided fields change. Returns the collection id.
+pub fn set_collection(
+    home: &Path,
+    name: &str,
+    description: Option<String>,
+    curator: Option<String>,
+) -> Result<String> {
+    let index_dir = index_dir(home);
+    std::fs::create_dir_all(&index_dir)
+        .with_context(|| format!("creating index dir {}", index_dir.display()))?;
+    let mut manifest = Manifest::open(&index_dir)?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let id = manifest.set_collection(name, description, curator, &now);
+    manifest.save()?;
+    info!(collection = %id, "collection metadata updated");
+    Ok(id)
 }
 
 /// Turn one `index` argument into a source to index. An `http(s)://` URL yields
@@ -197,9 +241,12 @@ fn resolve_archive_file(path: &Path, home: &Path) -> Result<Source> {
 fn index_one(
     source: &Source,
     home: &Path,
-    manifest: &mut CollectionManifest,
+    manifest: &mut Manifest,
     search: &Mutex<SearchIndex>,
     name: Option<&str>,
+    // The collection (id, display name) this WACZ joins. `None` makes the WACZ
+    // its own singleton collection (id == WACZ id, name == WACZ name).
+    collection: Option<(&str, &str)>,
 ) -> Result<()> {
     // A URL is downloaded to a temp file for indexing; the temp file is kept
     // alive (`_tmp`) for the duration of this function. File sources are
@@ -213,7 +260,7 @@ fn index_one(
         }
     };
 
-    let id = collection_id(source);
+    let id = wacz_id(source);
 
     // Read metadata from the WACZ datapackage.json up front so its title can
     // name the collection. Precedence: explicit --name, then the WACZ title,
@@ -224,21 +271,26 @@ fn index_one(
         .or_else(|| meta.title.clone().filter(|t| !t.trim().is_empty()))
         .unwrap_or_else(|| source_display_name(source));
 
-    // Drop any prior documents for this collection so re-indexing upserts
-    // instead of appending duplicates.
+    // Resolve the curated collection this WACZ joins: the one given, else a
+    // singleton of its own (id == WACZ id, name == WACZ name).
+    let (collection_id, collection_name) = match collection {
+        Some((cid, cname)) => (cid.to_string(), cname.to_string()),
+        None => (id.clone(), display_name.clone()),
+    };
+
+    // Drop this WACZ's prior documents so re-indexing upserts, not appends.
     search.lock().unwrap().delete_collection(&id);
 
-    // Use the resolved name for page documents so page and collection results
-    // agree on the collection's name. The pass also collects provenance (the
-    // WARC warcinfo record) and capture stats so we don't re-read the WARCs.
-    let stats = index_wacz(&local, &id, &display_name, search)?;
+    // Index pages, tagging each with this WACZ (id/name) and its collection. The
+    // pass also collects provenance and capture stats (no re-read of the WARCs).
+    let stats = index_wacz(&local, &id, &display_name, &collection_id, search)?;
 
-    // Index the collection itself as a searchable document.
+    // Index the WACZ's metadata as a searchable document, tagged with its collection.
     let coll_body = build_collection_body(&meta);
     search
         .lock()
         .unwrap()
-        .index_collection(&id, &display_name, &coll_body)?;
+        .index_collection(&id, &display_name, &collection_id, &coll_body)?;
 
     let sha = file_sha256(&local)
         .with_context(|| format!("computing sha256 of {}", local.display()))?;
@@ -255,8 +307,10 @@ fn index_one(
             software.push(s);
         }
     }
-    manifest.upsert(Collection {
+    manifest.ensure_collection(&collection_id, &collection_name, &date_indexed);
+    manifest.upsert_wacz(Wacz {
         id,
+        collection: collection_id,
         source: source.clone(),
         name: display_name,
         date_indexed,
@@ -375,8 +429,11 @@ struct CrawlStats {
 /// text and falls back to scraped HTML; the title comes from the HTML.
 fn index_wacz(
     wacz_path: &Path,
+    // WACZ id/name (tagged on each page as collection_id/collection_name).
     collection_id: &str,
     collection_name: &str,
+    // Curated collection id (slug) the WACZ belongs to.
+    collection: &str,
     search: &Mutex<SearchIndex>,
 ) -> Result<CrawlStats> {
     let warc_paths: Vec<_> = iter_warc_paths(wacz_path)?
@@ -466,6 +523,7 @@ fn index_wacz(
                 lang: &lang,
                 collection_id,
                 collection_name,
+                collection,
             })?;
             count += 1;
             // Track the capture date range (14-digit timestamps sort
@@ -642,9 +700,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), Some("my-collection"));
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections.len(), 1);
-        let col = &manifest.collections[0];
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs.len(), 1);
+        let col = &manifest.waczs[0];
         assert_eq!(col.name, "my-collection");
         assert!(!col.sha256.is_empty());
         assert!(col.file_size > 0);
@@ -657,17 +715,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), None);
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections[0].name, "simple");
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs[0].name, "simple");
     }
 
     #[test]
     fn indexed_local_wacz_is_stored_relative_to_home() {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), None);
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(
-            manifest.collections[0].source,
+            manifest.waczs[0].source,
             Source::File(PathBuf::from("archive/simple.wacz")),
             "a local WACZ under archive/ should be stored relative to home"
         );
@@ -680,14 +738,33 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("a.wacz", tmp.path(), None);
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        let col = &manifest.collections[0];
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let col = &manifest.waczs[0];
         assert!(
             col.software.iter().any(|s| s.contains("Browsertrix-Crawler")),
             "unexpected software: {:?}",
             col.software
         );
         assert!(col.page_count.is_some(), "page_count should be recorded");
+    }
+
+    #[test]
+    fn index_into_named_collection_groups_the_wacz() {
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let dest = archive.join("simple.wacz");
+        std::fs::copy(fixture("simple.wacz"), &dest).unwrap();
+
+        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project")).unwrap();
+
+        let m = crate::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+        assert!(
+            m.collections.iter().any(|c| c.id == "my-project" && c.name == "My Project"),
+            "collection should be created: {:?}",
+            m.collections.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+        assert_eq!(m.waczs[0].collection, "my-project", "WACZ should reference the collection");
     }
 
     #[test]
@@ -725,8 +802,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("pdf-doc.wacz", tmp.path(), None);
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections[0].name, "PDF Test Collection");
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs[0].name, "PDF Test Collection");
     }
 
     #[test]
@@ -735,8 +812,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("pdf-doc.wacz", tmp.path(), Some("Custom Name"));
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections[0].name, "Custom Name");
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs[0].name, "Custom Name");
     }
 
     #[test]
@@ -753,9 +830,9 @@ mod tests {
         reindex(tmp.path()).unwrap();
 
         // The manifest (and the custom name) is preserved...
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        assert_eq!(manifest.collections.len(), 1);
-        assert_eq!(manifest.collections[0].name, "keepname");
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(manifest.waczs.len(), 1);
+        assert_eq!(manifest.waczs[0].name, "keepname");
 
         // ...and the content is searchable again.
         let idx = crate::search::SearchIndex::open(full_text.as_path()).unwrap();
@@ -816,8 +893,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), None);
 
-        let manifest = CollectionManifest::open(&tmp.path().join("index")).unwrap();
-        let col = &manifest.collections[0];
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let col = &manifest.waczs[0];
         assert!(
             !col.seed_pages.is_empty(),
             "simple.wacz has pages in pages.jsonl"
