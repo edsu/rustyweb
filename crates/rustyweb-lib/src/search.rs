@@ -28,6 +28,8 @@ const FIELD_YEAR: &str = "year";
 const FIELD_MEDIA_TYPE: &str = "type";
 /// Primary language subtag from `<html lang>` (e.g. `en`), for `lang:` filtering.
 const FIELD_LANG: &str = "lang";
+/// Curated collection id (slug) this document belongs to, for `collection:` filtering.
+const FIELD_COLLECTION: &str = "collection";
 
 /// How much more a title match counts than a body/url match when ranking.
 const TITLE_BOOST: tantivy::Score = 3.0;
@@ -107,6 +109,7 @@ impl SearchIndex {
         doc.add_text(schema.get_field(FIELD_DOC_TYPE).unwrap(), "page");
         doc.add_text(schema.get_field(FIELD_COLLECTION_ID).unwrap(), page.collection_id);
         doc.add_text(schema.get_field(FIELD_COLLECTION_NAME).unwrap(), page.collection_name);
+        doc.add_text(schema.get_field(FIELD_COLLECTION).unwrap(), page.collection);
         doc.add_text(schema.get_field(FIELD_URL).unwrap(), page.url);
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), page.timestamp);
         doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), page.title);
@@ -133,6 +136,7 @@ impl SearchIndex {
         &mut self,
         collection_id: &str,
         collection_name: &str,
+        collection: &str,
         body: &str,
     ) -> Result<()> {
         let schema = self.index.schema();
@@ -140,6 +144,7 @@ impl SearchIndex {
         doc.add_text(schema.get_field(FIELD_DOC_TYPE).unwrap(), "collection");
         doc.add_text(schema.get_field(FIELD_COLLECTION_ID).unwrap(), collection_id);
         doc.add_text(schema.get_field(FIELD_COLLECTION_NAME).unwrap(), collection_name);
+        doc.add_text(schema.get_field(FIELD_COLLECTION).unwrap(), collection);
         doc.add_text(schema.get_field(FIELD_URL).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), collection_name);
@@ -176,6 +181,7 @@ impl SearchIndex {
         let url_tokens_f = schema.get_field(FIELD_URL_TOKENS).unwrap();
         let description_f = schema.get_field(FIELD_DESCRIPTION).unwrap();
         let headings_f = schema.get_field(FIELD_HEADINGS).unwrap();
+        let collection_f = schema.get_field(FIELD_COLLECTION).unwrap();
 
         // Bare words search the title, headings, body, description, and URL
         // words. Other fields (domain:, url:, title:) are reachable by explicit
@@ -210,6 +216,7 @@ impl SearchIndex {
                 doc_type: get_text(&doc, doc_type_f),
                 collection_id: get_text(&doc, coll_id_f),
                 collection_name: get_text(&doc, coll_name_f),
+                collection: get_text(&doc, collection_f),
                 url: get_text(&doc, url_f),
                 domain: get_text(&doc, domain_f),
                 timestamp: get_text(&doc, ts_f),
@@ -238,15 +245,22 @@ pub struct Page<'a> {
     pub media_type: &'a str,
     /// Page language tag, e.g. `"en-US"` (stored as its primary subtag).
     pub lang: &'a str,
+    /// The WACZ this page came from (id and display name).
     pub collection_id: &'a str,
     pub collection_name: &'a str,
+    /// The curated collection id (slug) this page's WACZ belongs to.
+    pub collection: &'a str,
 }
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub doc_type: String,
+    /// The WACZ this result came from (id and display name).
     pub collection_id: String,
     pub collection_name: String,
+    /// The curated collection id (slug) the WACZ belongs to, for `collection:`
+    /// filtering and linking to the collection page.
+    pub collection: String,
     pub url: String,
     /// Exact host of the page URL (empty for collection results).
     pub domain: String,
@@ -262,6 +276,8 @@ fn build_schema() -> Schema {
     builder.add_text_field(FIELD_DOC_TYPE, STRING | STORED);
     builder.add_text_field(FIELD_COLLECTION_ID, STRING | STORED);
     builder.add_text_field(FIELD_COLLECTION_NAME, STRING | STORED);
+    // Curated collection id (slug), for `collection:` filtering.
+    builder.add_text_field(FIELD_COLLECTION, STRING | STORED);
     builder.add_text_field(FIELD_URL, STRING | STORED);
     builder.add_text_field(FIELD_TS, STRING | STORED);
     builder.add_text_field(FIELD_TITLE, TEXT | STORED);
@@ -570,6 +586,7 @@ mod tests {
         idx.index_collection(
             "abc12345",
             "My Archive",
+            "my-archive",
             "A collection about digital preservation and web archiving",
         ).unwrap();
         idx.commit().unwrap();
@@ -677,6 +694,30 @@ mod tests {
         let results = idx.search("domain:example.com shared", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].url, "https://example.com/one");
+    }
+
+    #[test]
+    fn collection_filter_restricts_results() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page(&Page {
+            url: "https://a.com/1", title: "A", body: "shared",
+            collection_id: "w1", collection_name: "W1", collection: "demo", ..Default::default()
+        }).unwrap();
+        idx.index_page(&Page {
+            url: "https://b.com/1", title: "B", body: "shared",
+            collection_id: "w2", collection_name: "W2", collection: "other", ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        let r = idx.search("collection:demo", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].collection, "demo");
+
+        // Combined with a term, still scoped to the collection.
+        let r = idx.search("collection:demo shared", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://a.com/1");
     }
 
     #[test]

@@ -271,21 +271,26 @@ fn index_one(
         .or_else(|| meta.title.clone().filter(|t| !t.trim().is_empty()))
         .unwrap_or_else(|| source_display_name(source));
 
-    // Drop any prior documents for this collection so re-indexing upserts
-    // instead of appending duplicates.
+    // Resolve the curated collection this WACZ joins: the one given, else a
+    // singleton of its own (id == WACZ id, name == WACZ name).
+    let (collection_id, collection_name) = match collection {
+        Some((cid, cname)) => (cid.to_string(), cname.to_string()),
+        None => (id.clone(), display_name.clone()),
+    };
+
+    // Drop this WACZ's prior documents so re-indexing upserts, not appends.
     search.lock().unwrap().delete_collection(&id);
 
-    // Use the resolved name for page documents so page and collection results
-    // agree on the collection's name. The pass also collects provenance (the
-    // WARC warcinfo record) and capture stats so we don't re-read the WARCs.
-    let stats = index_wacz(&local, &id, &display_name, search)?;
+    // Index pages, tagging each with this WACZ (id/name) and its collection. The
+    // pass also collects provenance and capture stats (no re-read of the WARCs).
+    let stats = index_wacz(&local, &id, &display_name, &collection_id, search)?;
 
-    // Index the collection itself as a searchable document.
+    // Index the WACZ's metadata as a searchable document, tagged with its collection.
     let coll_body = build_collection_body(&meta);
     search
         .lock()
         .unwrap()
-        .index_collection(&id, &display_name, &coll_body)?;
+        .index_collection(&id, &display_name, &collection_id, &coll_body)?;
 
     let sha = file_sha256(&local)
         .with_context(|| format!("computing sha256 of {}", local.display()))?;
@@ -302,12 +307,6 @@ fn index_one(
             software.push(s);
         }
     }
-    // Assign the WACZ to its collection: the one given, else a singleton
-    // collection of its own (id == WACZ id, name == WACZ name).
-    let (collection_id, collection_name) = match collection {
-        Some((cid, cname)) => (cid.to_string(), cname.to_string()),
-        None => (id.clone(), display_name.clone()),
-    };
     manifest.ensure_collection(&collection_id, &collection_name, &date_indexed);
     manifest.upsert_wacz(Wacz {
         id,
@@ -430,8 +429,11 @@ struct CrawlStats {
 /// text and falls back to scraped HTML; the title comes from the HTML.
 fn index_wacz(
     wacz_path: &Path,
+    // WACZ id/name (tagged on each page as collection_id/collection_name).
     collection_id: &str,
     collection_name: &str,
+    // Curated collection id (slug) the WACZ belongs to.
+    collection: &str,
     search: &Mutex<SearchIndex>,
 ) -> Result<CrawlStats> {
     let warc_paths: Vec<_> = iter_warc_paths(wacz_path)?
@@ -521,6 +523,7 @@ fn index_wacz(
                 lang: &lang,
                 collection_id,
                 collection_name,
+                collection,
             })?;
             count += 1;
             // Track the capture date range (14-digit timestamps sort

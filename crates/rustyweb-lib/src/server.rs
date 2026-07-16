@@ -247,16 +247,20 @@ async fn search_page(
         Err(e) => return error_response(e).into_response(),
     };
 
-    // Map each collection id to the wabac `source` to use: /files/{id} for a
-    // local WACZ, or the remote URL directly for an http source.
-    let collections = load_waczs(&state);
-    let source_for = |cid: &str| -> String {
-        collections
+    // Map each WACZ id to the wabac `source` to use: /files/{id} for a local
+    // WACZ, or the remote URL directly for an http source.
+    let waczs = load_waczs(&state);
+    let source_for = |wacz_id: &str| -> String {
+        waczs
             .iter()
-            .find(|c| c.id == cid)
+            .find(|w| w.id == wacz_id)
             .map(viewer_source)
-            .unwrap_or_else(|| format!("/files/{cid}"))
+            .unwrap_or_else(|| format!("/files/{wacz_id}"))
     };
+    // Curated collection id -> display name, for the "in <collection>" link.
+    let collection_names: std::collections::HashMap<String, String> = Manifest::open(&state.index_dir)
+        .map(|m| m.collections.iter().map(|c| (c.id.clone(), c.name.clone())).collect())
+        .unwrap_or_default();
 
     let rows: String = results
         .iter()
@@ -268,8 +272,12 @@ async fn search_page(
                 &r.title
             });
 
-            let col_name = html_escape(&r.collection_name);
-            let coll_id = html_escape(&r.collection_id);
+            // The curated collection this result belongs to (falls back to the
+            // slug/id if the name isn't found).
+            let coll_display = html_escape(
+                collection_names.get(&r.collection).map(String::as_str).unwrap_or(&r.collection),
+            );
+            let coll_href = url_encode(&r.collection);
             let url_enc = url_encode(&r.url);
             let name_enc = url_encode(&r.collection_name);
             let source_enc = url_encode(&source_for(&r.collection_id));
@@ -313,7 +321,7 @@ async fn search_page(
                      <div class=\"result-title\"><a href=\"{href}\">{title}</a></div>\
                      <div class=\"result-meta\">{url_display}{ts_display}</div>\
                      {snippet_html}\
-                     <div class=\"result-coll\">in <a href=\"/wacz/{coll_id}\"><em>{col_name}</em></a></div>\
+                     <div class=\"result-coll\">in <a href=\"/collection/{coll_href}\"><em>{coll_display}</em></a></div>\
                    </td>\
                    <td class=\"replay-col\">\
                      <a class=\"replay-btn\" href=\"{href}\">Replay →</a>\
@@ -823,6 +831,7 @@ async fn search_api(
                     "title": r.title,
                     "collection_id": r.collection_id,
                     "collection_name": r.collection_name,
+                    "collection": r.collection,
                     "snippet": r.snippet,
                 })).collect::<Vec<_>>()
             });
@@ -953,6 +962,7 @@ fn search_tips_html() -> &'static str {
       <li><code>(climate OR weather) risk</code> - group with parentheses</li>
       <li><code>title:climate</code> - match only in the page title</li>
       <li><code>domain:example.com</code> - only pages from that exact host</li>
+      <li><code>collection:demo</code> - only pages in that collection</li>
       <li><code>year:2021</code> or <code>year:[2020 TO 2023]</code> - filter by crawl year</li>
       <li><code>type:pdf</code> - only PDFs (or <code>type:html</code>)</li>
       <li><code>lang:en</code> - only pages in that language</li>
