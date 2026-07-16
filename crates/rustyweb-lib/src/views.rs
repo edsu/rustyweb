@@ -88,8 +88,23 @@ pub struct CollectionCard {
     pub date_range: Option<String>,
 }
 
-/// The homepage: search box, tips, and a card per collection.
-pub fn home(cards: &[CollectionCard]) -> Markup {
+/// A single browse entry point on the homepage: a label, its count, and the
+/// search link it leads to (e.g. a year or a site).
+pub struct BrowseLink {
+    pub label: String,
+    pub count: u64,
+    pub href: String,
+}
+
+/// Archive-wide browse entry points shown on the homepage.
+pub struct HomeBrowse {
+    pub years: Vec<BrowseLink>,
+    pub sites: Vec<BrowseLink>,
+}
+
+/// The homepage: search box, tips, browse-by entry points, and a card per
+/// collection.
+pub fn home(cards: &[CollectionCard], browse: &HomeBrowse) -> Markup {
     let body = html! {
         h1 { "rustyweb" }
         p.tagline { "Web archive search and replay" }
@@ -98,6 +113,34 @@ pub fn home(cards: &[CollectionCard]) -> Markup {
             button type="submit" { "Search" }
         }
         (search_tips())
+        @if !browse.years.is_empty() || !browse.sites.is_empty() {
+            div.browse {
+                @if !browse.years.is_empty() {
+                    div.browse-group {
+                        h3 { "Browse by year" }
+                        div.browse-links {
+                            @for y in &browse.years {
+                                a.browse-link href=(y.href) {
+                                    (y.label) " " span.browse-count { (y.count) }
+                                }
+                            }
+                        }
+                    }
+                }
+                @if !browse.sites.is_empty() {
+                    div.browse-group {
+                        h3 { "Top sites" }
+                        div.browse-links {
+                            @for s in &browse.sites {
+                                a.browse-link href=(s.href) {
+                                    (s.label) " " span.browse-count { (s.count) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         h2 { "Collections" }
         @if cards.is_empty() {
             p.muted {

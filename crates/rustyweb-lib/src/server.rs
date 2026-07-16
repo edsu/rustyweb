@@ -136,7 +136,44 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         })
         .collect();
 
-    views::home(&cards).into_response()
+    // Browse entry points: years (most recent first) and the busiest sites,
+    // each a search link. Derived from an archive-wide facet overview.
+    let overview = state.search.facet_overview().unwrap_or_default();
+    let browse = views::HomeBrowse {
+        years: browse_links(&overview, "year", "year", 12, true),
+        sites: browse_links(&overview, "domain", "domain", 8, false),
+    };
+
+    views::home(&cards, &browse).into_response()
+}
+
+/// Build homepage browse links from one facet dimension: `field` is the facet
+/// group to read, `query_field` the `field:value` used in the search link.
+/// `by_value_desc` sorts by the value (e.g. year, newest first) instead of by
+/// count; `max` caps how many are shown.
+fn browse_links(
+    overview: &[crate::search::FacetGroup],
+    field: &str,
+    query_field: &str,
+    max: usize,
+    by_value_desc: bool,
+) -> Vec<views::BrowseLink> {
+    let Some(group) = overview.iter().find(|g| g.field == field) else {
+        return Vec::new();
+    };
+    let mut buckets: Vec<&crate::search::FacetBucket> = group.buckets.iter().collect();
+    if by_value_desc {
+        buckets.sort_by(|a, b| b.value.cmp(&a.value));
+    }
+    buckets
+        .into_iter()
+        .take(max)
+        .map(|b| views::BrowseLink {
+            label: b.value.clone(),
+            count: b.count,
+            href: format!("/search?q={}", url_encode(&format!("{query_field}:{}", b.value))),
+        })
+        .collect()
 }
 
 // ── Search results page ───────────────────────────────────────────────────────

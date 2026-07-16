@@ -53,6 +53,15 @@ h2 { font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 0.4rem; }
 }
 .tips-note { color: #666; margin-bottom: 0 !important; }
 
+/* Homepage browse entry points */
+.browse { display: flex; flex-wrap: wrap; gap: 2rem; margin: 0 0 2.5rem; }
+.browse-group { flex: 1 1 260px; }
+.browse-group h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin: 0 0 0.5rem; }
+.browse-links { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.browse-link { display: inline-flex; align-items: baseline; gap: 0.3rem; background: #f2f6fb; color: #0066cc; padding: 0.25rem 0.6rem; border-radius: 4px; text-decoration: none; font-size: 0.85rem; }
+.browse-link:hover { background: #e2ecf8; text-decoration: none; }
+.browse-count { color: #999; font-size: 0.78rem; }
+
 /* Collection cards (homepage) */
 .cards { display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
 .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.2rem; background: #fafafa; }

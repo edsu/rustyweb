@@ -182,6 +182,18 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Facet counts across the whole archive (a match-all query), for homepage
+    /// browse entry points. Runs only the aggregation — no result fetching or
+    /// URL grouping — so it is cheap.
+    pub fn facet_overview(&self) -> Result<Vec<FacetGroup>> {
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let agg_collector =
+            AggregationCollector::from_aggs(facet_aggregations(), AggContextParams::default());
+        let agg_results = searcher.search(&tantivy::query::AllQuery, &agg_collector)?;
+        Ok(facets_from_aggregations(&agg_results))
+    }
+
     /// Search the top `limit` results by relevance. A thin wrapper over
     /// [`search_faceted`](Self::search_faceted) that returns only the hits (no
     /// facet counts, no pagination); kept for callers that don't need them.
