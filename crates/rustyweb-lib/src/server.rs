@@ -142,8 +142,8 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     <a class="card-title" href="{title_link}">{name}</a>
     <span class="status muted">{count_label}</span>
   </div>
-  {prov}
   {description}
+  {prov}
 </div>"#
             )
         })
