@@ -41,6 +41,11 @@ const FIELD_COLLECTION: &str = "collection";
 
 /// How much more a title match counts than a body/url match when ranking.
 const TITLE_BOOST: tantivy::Score = 3.0;
+/// Upper bound on captures scanned per query for URL grouping (field collapsing
+/// has no native Tantivy support, so we group over the top-scored window). When
+/// a query matches more captures than this, results are grouped over the top
+/// `CANDIDATE_CAP` only and [`SearchResponse::capped`] is set.
+const CANDIDATE_CAP: usize = 1000;
 /// Headings rank above body text but below the title.
 const HEADINGS_BOOST: tantivy::Score = 2.0;
 
@@ -229,22 +234,51 @@ impl SearchIndex {
         // 500s while someone is experimenting with syntax.
         let (query, _errors) = query_parser.parse_query_lenient(query_str);
 
-        // One pass computes all three things over the same query: the page of
-        // hits (TopDocs + offset), the total match count, and the facet counts
-        // (a terms aggregation per dimension over the fast fields).
-        let top_collector = TopDocs::with_limit(limit.max(1)).and_offset(offset).order_by_score();
+        // One pass over the query: a bounded window of top-scored captures (for
+        // grouping), the total capture count, and the facet counts (a terms
+        // aggregation per dimension over the fast fields).
+        let top_collector = TopDocs::with_limit(CANDIDATE_CAP).order_by_score();
         let agg_collector = AggregationCollector::from_aggs(facet_aggregations(), AggContextParams::default());
-        let (top_docs, total_hits, agg_results) =
+        let (candidates, total_captures, agg_results) =
             searcher.search(&query, &(top_collector, Count, agg_collector))?;
 
+        // Collapse repeat captures of the same URL: walking the candidates in
+        // score order, the first (best-ranked) capture of a URL becomes the
+        // result and later captures just bump its count. Collection-level docs
+        // and any capture with no URL are never merged. Grouping is over the
+        // top `CANDIDATE_CAP` captures, so `capped` flags when more matched.
+        struct Group {
+            addr: tantivy::DocAddress,
+            captures: usize,
+        }
+        let mut groups: Vec<Group> = Vec::new();
+        let mut by_url: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (_score, addr) in &candidates {
+            let doc: TantivyDocument = searcher.doc(*addr)?;
+            let url = get_text(&doc, url_f);
+            let is_page = get_text(&doc, doc_type_f) == "page";
+            if is_page && !url.is_empty() {
+                if let Some(&gi) = by_url.get(&url) {
+                    groups[gi].captures += 1;
+                    continue;
+                }
+                by_url.insert(url, groups.len());
+            }
+            groups.push(Group { addr: *addr, captures: 1 });
+        }
+        let total_hits = groups.len();
+        let capped = total_captures > CANDIDATE_CAP;
+
+        // Generate snippets only for the requested page of groups (snippet
+        // generation re-analyzes text, so we defer it past grouping).
         let mut snippet_gen = SnippetGenerator::create(&searcher, &query, body_f)?;
         // Tantivy's default snippet window is 150 chars; widen it for more
         // context around the matched terms in search results.
         snippet_gen.set_max_num_chars(350);
 
-        let mut results = Vec::with_capacity(top_docs.len());
-        for (_score, addr) in top_docs {
-            let doc: TantivyDocument = searcher.doc(addr)?;
+        let mut results = Vec::new();
+        for g in groups.iter().skip(offset).take(limit) {
+            let doc: TantivyDocument = searcher.doc(g.addr)?;
             let snippet = snippet_gen.snippet_from_doc(&doc);
             results.push(SearchResult {
                 doc_type: get_text(&doc, doc_type_f),
@@ -257,11 +291,13 @@ impl SearchIndex {
                 title: get_text(&doc, title_f),
                 description: get_text(&doc, description_f),
                 snippet: snippet.to_html(),
+                capture_count: g.captures,
             });
         }
 
         Ok(SearchResponse {
             total_hits,
+            capped,
             results,
             facets: facets_from_aggregations(&agg_results),
             timeline: timeline_from_aggregations(&agg_results),
@@ -308,14 +344,20 @@ pub struct SearchResult {
     /// Page description (`<meta description>` / og:description), if any.
     pub description: String,
     pub snippet: String,
+    /// How many captures of this URL matched (1 when there are no repeats). The
+    /// result shown is the best-ranked capture; the rest are collapsed into it.
+    pub capture_count: usize,
 }
 
 /// One page of search results plus the facet counts and total match count for
 /// the whole query (not just this page).
 #[derive(Debug, Clone)]
 pub struct SearchResponse {
-    /// Total number of matching documents across all pages.
+    /// Total number of distinct results (URLs grouped) across all pages.
     pub total_hits: usize,
+    /// Whether more captures matched than were scanned for grouping, so
+    /// `total_hits` is a floor and deep pages may be incomplete.
+    pub capped: bool,
     /// The requested page of results.
     pub results: Vec<SearchResult>,
     /// Facet counts per dimension, in display order.
@@ -1050,6 +1092,33 @@ mod tests {
     }
 
     #[test]
+    fn repeat_captures_of_a_url_are_grouped() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        // The same URL captured three times (different crawls), plus a distinct URL.
+        for ts in ["20210101000000", "20220101000000", "20230101000000"] {
+            idx.index_page(&Page {
+                url: "https://ex.com/a", title: "A", body: "shared",
+                timestamp: ts, collection_id: "c1", collection_name: "C1", ..Default::default()
+            }).unwrap();
+        }
+        idx.index_page(&Page {
+            url: "https://ex.com/b", title: "B", body: "shared",
+            collection_id: "c1", collection_name: "C1", ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        let resp = idx.search_faceted("shared", 10, 0).unwrap();
+        // Two distinct results, not four captures.
+        assert_eq!(resp.total_hits, 2);
+        assert!(!resp.capped);
+        let a = resp.results.iter().find(|r| r.url == "https://ex.com/a").unwrap();
+        assert_eq!(a.capture_count, 3, "three captures of /a collapse into one result");
+        let b = resp.results.iter().find(|r| r.url == "https://ex.com/b").unwrap();
+        assert_eq!(b.capture_count, 1);
+    }
+
+    #[test]
     fn month_of_parses_year_and_month() {
         assert_eq!(month_of("20210417120000"), Some(202104));
         assert_eq!(month_of("202412"), Some(202412));
@@ -1062,9 +1131,15 @@ mod tests {
     fn timeline_is_chronological_and_counts_months() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        // Two captures in 2021-03, one in 2021-01, one in 2023-07.
-        for ts in ["20210301000000", "20210315000000", "20210101000000", "20230701000000"] {
-            idx.index_page(&page_ts("https://ex.com/x", ts)).unwrap();
+        // Two captures in 2021-03, one in 2021-01, one in 2023-07 (distinct URLs
+        // so month counts aren't affected by URL grouping).
+        for (url, ts) in [
+            ("https://ex.com/1", "20210301000000"),
+            ("https://ex.com/2", "20210315000000"),
+            ("https://ex.com/3", "20210101000000"),
+            ("https://ex.com/4", "20230701000000"),
+        ] {
+            idx.index_page(&page_ts(url, ts)).unwrap();
         }
         idx.commit().unwrap();
 

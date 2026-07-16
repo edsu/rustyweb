@@ -307,6 +307,7 @@ async fn search_page(
                 snippet_html,
                 coll_href,
                 coll_display,
+                capture_count: r.capture_count,
             }
         })
         .collect();
@@ -316,6 +317,7 @@ async fn search_page(
         page,
         total_pages,
         total_hits: response.total_hits,
+        capped: response.capped,
         query_encoded: url_encode(&q),
     };
 
@@ -641,6 +643,7 @@ async fn search_api(
         Ok(response) => {
             let body = serde_json::json!({
                 "total": response.total_hits,
+                "capped": response.capped,
                 "results": response.results.iter().map(|r| serde_json::json!({
                     "doc_type": r.doc_type,
                     "url": r.url,
@@ -651,6 +654,7 @@ async fn search_api(
                     "collection_name": r.collection_name,
                     "collection": r.collection,
                     "snippet": r.snippet,
+                    "capture_count": r.capture_count,
                 })).collect::<Vec<_>>(),
                 "facets": response.facets.iter().map(|g| serde_json::json!({
                     "field": g.field,

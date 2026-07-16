@@ -145,6 +145,8 @@ pub struct SearchResultRow {
     pub coll_href: String,
     /// Display name of the curated collection.
     pub coll_display: String,
+    /// How many captures of this URL matched (>1 shows a "captured N times" note).
+    pub capture_count: usize,
 }
 
 /// Pagination state for the results page: the current 1-based page, the total
@@ -153,6 +155,9 @@ pub struct PageNav {
     pub page: usize,
     pub total_pages: usize,
     pub total_hits: usize,
+    /// True when more captures matched than were scanned for grouping, so the
+    /// total is shown as a floor (e.g. "1000+").
+    pub capped: bool,
     /// The URL-encoded query, so page links can preserve it.
     pub query_encoded: String,
 }
@@ -215,7 +220,7 @@ pub fn search_results(
             @if nav.total_hits == 0 {
                 "No results for " em { (query) }
             } @else {
-                (nav.total_hits) " result" @if nav.total_hits != 1 { "s" } " for " em { (query) }
+                (nav.total_hits) @if nav.capped { "+" } " result" @if nav.total_hits != 1 { "s" } " for " em { (query) }
                 @if nav.total_pages > 1 {
                     " · page " (nav.page) " of " (nav.total_pages)
                 }
@@ -277,7 +282,12 @@ pub fn search_results(
                                                 div.result-url { (r.url) }
                                             }
                                             @if !r.is_collection && !r.timestamp_display.is_empty() {
-                                                div.result-ts { (r.timestamp_display) }
+                                                div.result-ts {
+                                                    (r.timestamp_display)
+                                                    @if r.capture_count > 1 {
+                                                        span.capture-count { " · captured " (r.capture_count) " times" }
+                                                    }
+                                                }
                                             }
                                         }
                                         @if let Some(s) = &r.snippet_html {
