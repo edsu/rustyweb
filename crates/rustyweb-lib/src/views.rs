@@ -156,9 +156,43 @@ pub struct PageNav {
     pub query_encoded: String,
 }
 
-/// The search results page: top bar, tips, a count line, the results table, and
-/// prev/next pagination.
-pub fn search_results(query: &str, nav: &PageNav, rows: &[SearchResultRow]) -> Markup {
+/// The facet sidebar: the filters currently active in the query, plus a group
+/// of clickable counts per facet dimension.
+pub struct FacetSidebar {
+    pub active: Vec<ActiveFilter>,
+    pub groups: Vec<FacetGroupView>,
+}
+
+/// A `field:value` filter currently applied, with a link that removes it.
+pub struct ActiveFilter {
+    pub label: String,
+    pub value: String,
+    pub remove_href: String,
+}
+
+/// One facet dimension in the sidebar.
+pub struct FacetGroupView {
+    pub label: String,
+    pub items: Vec<FacetItem>,
+}
+
+/// One clickable facet value: its count, the link that toggles it, and whether
+/// it is currently applied.
+pub struct FacetItem {
+    pub value: String,
+    pub count: u64,
+    pub href: String,
+    pub active: bool,
+}
+
+/// The search results page: top bar, tips, a count line, an active-filter row,
+/// then a facet sidebar beside the results table with prev/next pagination.
+pub fn search_results(
+    query: &str,
+    nav: &PageNav,
+    sidebar: &FacetSidebar,
+    rows: &[SearchResultRow],
+) -> Markup {
     // Preserve the query when linking to another page.
     let page_href = |p: usize| format!("/search?q={}&page={}", nav.query_encoded, p);
     let body = html! {
@@ -174,50 +208,84 @@ pub fn search_results(query: &str, nav: &PageNav, rows: &[SearchResultRow]) -> M
                 }
             }
         }
-        @if !rows.is_empty() {
-            table.results {
-                tbody {
-                    @for r in rows {
-                        tr {
-                            td {
-                                div.result-title { a href=(r.href) { (r.title) } }
-                                div.result-meta {
-                                    @if r.is_collection {
-                                        span.result-coll-badge { "Collection" }
-                                    } @else {
-                                        div.result-url { (r.url) }
+        @if !sidebar.active.is_empty() {
+            div.active-filters {
+                span.active-label { "Filters:" }
+                @for f in &sidebar.active {
+                    a.filter-chip href=(f.remove_href) {
+                        span.chip-label { (f.label) ": " }
+                        (f.value) " ✕"
+                    }
+                }
+            }
+        }
+        div.results-layout {
+            @if !sidebar.groups.is_empty() {
+                aside.facets {
+                    @for g in &sidebar.groups {
+                        div.facet-group {
+                            h3 { (g.label) }
+                            ul {
+                                @for it in &g.items {
+                                    li.facet-item.active[it.active] {
+                                        a href=(it.href) {
+                                            span.facet-value { (it.value) }
+                                            span.facet-count { (it.count) }
+                                        }
                                     }
-                                    @if !r.is_collection && !r.timestamp_display.is_empty() {
-                                        div.result-ts { (r.timestamp_display) }
-                                    }
                                 }
-                                @if let Some(s) = &r.snippet_html {
-                                    div.snippet { (PreEscaped(s)) }
-                                }
-                                div.result-coll {
-                                    "in " a href=(format!("/collection/{}", r.coll_href)) { em { (r.coll_display) } }
-                                }
-                            }
-                            td.replay-col {
-                                a.result-replay href=(r.href) { "Replay →" }
                             }
                         }
                     }
                 }
             }
-        }
-        @if nav.total_pages > 1 {
-            nav.pagination {
-                @if nav.page > 1 {
-                    a.page-prev href=(page_href(nav.page - 1)) { "← Previous" }
-                } @else {
-                    span.page-prev.disabled { "← Previous" }
+            div.results-main {
+                @if !rows.is_empty() {
+                    table.results {
+                        tbody {
+                            @for r in rows {
+                                tr {
+                                    td {
+                                        div.result-title { a href=(r.href) { (r.title) } }
+                                        div.result-meta {
+                                            @if r.is_collection {
+                                                span.result-coll-badge { "Collection" }
+                                            } @else {
+                                                div.result-url { (r.url) }
+                                            }
+                                            @if !r.is_collection && !r.timestamp_display.is_empty() {
+                                                div.result-ts { (r.timestamp_display) }
+                                            }
+                                        }
+                                        @if let Some(s) = &r.snippet_html {
+                                            div.snippet { (PreEscaped(s)) }
+                                        }
+                                        div.result-coll {
+                                            "in " a href=(format!("/collection/{}", r.coll_href)) { em { (r.coll_display) } }
+                                        }
+                                    }
+                                    td.replay-col {
+                                        a.result-replay href=(r.href) { "Replay →" }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                span.page-info { "Page " (nav.page) " of " (nav.total_pages) }
-                @if nav.page < nav.total_pages {
-                    a.page-next href=(page_href(nav.page + 1)) { "Next →" }
-                } @else {
-                    span.page-next.disabled { "Next →" }
+                @if nav.total_pages > 1 {
+                    nav.pagination {
+                        @if nav.page > 1 {
+                            a.page-prev href=(page_href(nav.page - 1)) { "← Previous" }
+                        } @else {
+                            span.page-prev.disabled { "← Previous" }
+                        }
+                        span.page-info { "Page " (nav.page) " of " (nav.total_pages) }
+                        @if nav.page < nav.total_pages {
+                            a.page-next href=(page_href(nav.page + 1)) { "Next →" }
+                        } @else {
+                            span.page-next.disabled { "Next →" }
+                        }
+                    }
                 }
             }
         }

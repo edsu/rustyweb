@@ -144,6 +144,57 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// Search results per page.
 const PAGE_SIZE: usize = 20;
 
+/// The query fields that appear as facet filters (matching the facet dimensions
+/// in `search.rs`). A token `field:value` with one of these fields is treated
+/// as an active filter for the sidebar.
+const FILTER_FIELDS: [&str; 5] = ["collection", "year", "domain", "type", "lang"];
+
+/// Human label for a facet field, for the active-filter chips.
+fn facet_label(field: &str) -> &'static str {
+    match field {
+        "collection" => "Collection",
+        "year" => "Year",
+        "domain" => "Site",
+        "type" => "Type",
+        "lang" => "Language",
+        _ => "Filter",
+    }
+}
+
+/// The active `field:value` facet filters present in a query, in order.
+fn active_filters(q: &str) -> Vec<(String, String)> {
+    q.split_whitespace()
+        .filter_map(|tok| {
+            let (f, v) = tok.split_once(':')?;
+            (FILTER_FIELDS.contains(&f) && !v.is_empty()).then(|| (f.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Add a `field:value` filter to a query, leaving the rest (including quoted
+/// phrases) untouched. A no-op if that exact filter is already present.
+fn query_with_filter(q: &str, field: &str, value: &str) -> String {
+    let token = format!("{field}:{value}");
+    let base = q.trim();
+    if base.split_whitespace().any(|t| t == token) {
+        return base.to_string();
+    }
+    if base.is_empty() {
+        token
+    } else {
+        format!("{base} {token}")
+    }
+}
+
+/// Remove a `field:value` filter from a query (all occurrences of that token).
+fn query_without_filter(q: &str, field: &str, value: &str) -> String {
+    let token = format!("{field}:{value}");
+    q.split_whitespace()
+        .filter(|t| *t != token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Deserialize)]
 struct SearchPageParams {
     q: String,
@@ -261,7 +312,48 @@ async fn search_page(
         total_hits: response.total_hits,
         query_encoded: url_encode(&q),
     };
-    views::search_results(&q, &page_nav, &rows).into_response()
+
+    // Facet sidebar: clickable buckets that add/remove a `field:value` filter,
+    // plus chips for the filters already active in the query. Refining resets
+    // to page 1.
+    let filters = active_filters(&q);
+    let search_href = |new_q: &str| format!("/search?q={}", url_encode(new_q));
+    let active: Vec<views::ActiveFilter> = filters
+        .iter()
+        .map(|(f, v)| views::ActiveFilter {
+            label: facet_label(f).to_string(),
+            value: v.clone(),
+            remove_href: search_href(&query_without_filter(&q, f, v)),
+        })
+        .collect();
+    let groups: Vec<views::FacetGroupView> = response
+        .facets
+        .iter()
+        .map(|g| views::FacetGroupView {
+            label: g.label.clone(),
+            items: g
+                .buckets
+                .iter()
+                .map(|b| {
+                    let is_active = filters.iter().any(|(f, v)| f == &g.field && v == &b.value);
+                    let new_q = if is_active {
+                        query_without_filter(&q, &g.field, &b.value)
+                    } else {
+                        query_with_filter(&q, &g.field, &b.value)
+                    };
+                    views::FacetItem {
+                        value: b.value.clone(),
+                        count: b.count,
+                        href: search_href(&new_q),
+                        active: is_active,
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    let sidebar = views::FacetSidebar { active, groups };
+
+    views::search_results(&q, &page_nav, &sidebar, &rows).into_response()
 }
 
 // ── Collection detail page ──────────────────────────────────────────────────
@@ -769,5 +861,53 @@ fn format_timestamp(ts: &str) -> String {
         )
     } else {
         ts.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_filters_extracts_facet_tokens_only() {
+        // Free text and non-facet `field:` tokens are ignored.
+        let f = active_filters("climate type:pdf domain:example.com title:foo");
+        assert_eq!(
+            f,
+            vec![
+                ("type".to_string(), "pdf".to_string()),
+                ("domain".to_string(), "example.com".to_string()),
+            ]
+        );
+        assert!(active_filters("just some words").is_empty());
+    }
+
+    #[test]
+    fn query_with_filter_appends_once() {
+        assert_eq!(query_with_filter("climate", "type", "pdf"), "climate type:pdf");
+        // Idempotent: already-present filter is not duplicated.
+        assert_eq!(query_with_filter("climate type:pdf", "type", "pdf"), "climate type:pdf");
+        // Empty base query yields just the filter.
+        assert_eq!(query_with_filter("  ", "year", "2021"), "year:2021");
+    }
+
+    #[test]
+    fn query_without_filter_removes_that_token() {
+        assert_eq!(query_without_filter("climate type:pdf", "type", "pdf"), "climate");
+        // Leaves other filters and free text intact.
+        assert_eq!(
+            query_without_filter("climate type:pdf domain:ex.com", "type", "pdf"),
+            "climate domain:ex.com"
+        );
+        // Removing an absent filter is a no-op (modulo whitespace normalization).
+        assert_eq!(query_without_filter("climate", "type", "pdf"), "climate");
+    }
+
+    #[test]
+    fn toggling_a_filter_round_trips() {
+        let q = "coral reef";
+        let added = query_with_filter(q, "collection", "coralreef-gov");
+        assert_eq!(added, "coral reef collection:coralreef-gov");
+        assert_eq!(query_without_filter(&added, "collection", "coralreef-gov"), "coral reef");
     }
 }
