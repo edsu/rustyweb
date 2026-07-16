@@ -11,6 +11,9 @@ axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.7", features = ["compression-full", "fs", "trace"] }
 
+# HTML templating (compile-time, type-checked)
+maud = { version = "0.27", features = ["axum"] }
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

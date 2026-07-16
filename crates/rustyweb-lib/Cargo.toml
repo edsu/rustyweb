@@ -10,6 +10,7 @@ license = "AGPL-3.0-or-later"
 axum = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
+maud = { workspace = true }
 tantivy = { workspace = true }
 warc = { workspace = true }
 zip = { workspace = true }

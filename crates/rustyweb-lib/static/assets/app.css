@@ -1,0 +1,102 @@
+/* rustyweb — shared stylesheet for the server-rendered pages. */
+
+* { box-sizing: border-box; }
+body {
+  font-family: sans-serif;
+  max-width: 960px;
+  margin: 2.5rem auto;
+  padding: 0 1rem;
+  color: #222;
+}
+a { color: #0066cc; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+h1 { font-size: 2.2rem; margin: 0.3rem 0 0.25rem; }
+h2 { font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 0.4rem; }
+.tagline { color: #666; margin-bottom: 2rem; }
+.muted { color: #888; }
+.mono { font-family: monospace; font-size: 0.82rem; word-break: break-all; }
+.ok { color: #2a7; }
+.missing { color: #c33; }
+
+/* Top bar (search/collection/wacz pages) */
+.top { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; }
+.top a.home { font-size: 1.4rem; font-weight: bold; text-decoration: none; color: #222; }
+.crumb { font-size: 0.85rem; color: #666; margin-bottom: 0.3rem; }
+
+/* Search form */
+.search-form { display: flex; gap: 0.5rem; }
+.search-form.home { margin-bottom: 3rem; }
+.top .search-form { flex: 1; }
+.search-form input {
+  flex: 1; padding: 0.6rem 0.8rem; font-size: 1rem;
+  border: 1px solid #ccc; border-radius: 4px;
+}
+.search-form button {
+  padding: 0.6rem 1.2rem; font-size: 1rem; cursor: pointer;
+  background: #0066cc; color: #fff; border: none; border-radius: 4px;
+}
+
+/* Search tips disclosure */
+.tips { margin: 0 0 2rem; font-size: 0.85rem; }
+.tips summary { cursor: pointer; color: #0066cc; width: fit-content; }
+.tips-body {
+  margin-top: 0.6rem; padding: 0.8rem 1rem; background: #f6f8fa;
+  border: 1px solid #e5e7eb; border-radius: 6px; color: #333;
+}
+.tips-body p { margin: 0.4rem 0; }
+.tips-body ul { margin: 0.5rem 0; padding-left: 1.2rem; }
+.tips-body li { margin: 0.25rem 0; }
+.tips-body code {
+  background: #eef1f4; padding: 0.05rem 0.3rem; border-radius: 3px;
+  font-family: monospace; font-size: 0.85em;
+}
+.tips-note { color: #666; margin-bottom: 0 !important; }
+
+/* Collection cards (homepage) */
+.cards { display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.2rem; background: #fafafa; }
+.card-header { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; margin-bottom: 0.5rem; }
+.card-title { font-size: 1.1rem; font-weight: 600; color: #0066cc; text-decoration: none; }
+.card-title:hover { text-decoration: underline; }
+.desc { color: #444; font-size: 0.9rem; margin: 0.4rem 0; }
+.status { font-size: 0.8rem; white-space: nowrap; }
+
+/* Provenance chip */
+.prov {
+  font-size: 0.82rem; color: #1a4d7a; background: #eef4fb; border: 1px solid #d6e4f2;
+  border-radius: 4px; padding: 0.3rem 0.55rem; margin: 0.25rem 0 0; line-height: 1.4;
+  display: inline-block;
+}
+
+/* Metadata tables (collection/wacz pages) */
+table.meta { border-collapse: collapse; font-size: 0.9rem; margin-bottom: 2rem; }
+table.meta th { text-align: left; padding: 0.3rem 1rem 0.3rem 0; color: #666; font-weight: 600; vertical-align: top; white-space: nowrap; }
+table.meta td { padding: 0.3rem 0; }
+
+/* Replay button */
+.replay-btn { display: inline-block; padding: 0.5rem 1rem; background: #0066cc; color: #fff; border-radius: 4px; text-decoration: none; margin-bottom: 1.5rem; }
+.replay-btn:hover { background: #0052a3; }
+
+/* Lists of pages / members */
+ul.pages { list-style: none; padding: 0; }
+ul.pages li { padding: 0.5rem 0; border-bottom: 1px solid #f0f0f0; }
+ul.pages a { color: #1a0dab; font-size: 1.02rem; text-decoration: none; }
+ul.pages a:hover { text-decoration: underline; }
+
+/* Search results */
+.count { color: #666; font-size: 0.9rem; margin-bottom: 1rem; }
+table.results { width: 100%; border-collapse: collapse; }
+table.results tr { border-bottom: 1px solid #eee; }
+table.results td { padding: 0.8rem 0.4rem; vertical-align: top; }
+.result-title { font-size: 1.05rem; font-weight: 500; }
+.result-title a { color: #1a0dab; }
+.result-url { font-size: 0.8rem; color: #006621; margin: 0.15rem 0; }
+.result-ts { font-size: 0.8rem; color: #888; }
+.result-coll { font-size: 0.8rem; color: #666; margin-top: 0.3rem; }
+.result-coll-badge { display: inline-block; font-size: 0.75rem; background: #e8f0fe; color: #1967d2; padding: 0.1rem 0.4rem; border-radius: 3px; margin-bottom: 0.15rem; }
+.snippet { font-size: 0.88rem; color: #444; margin: 0.4rem 0; line-height: 1.4; }
+.snippet b { background: #fff3cd; font-weight: 600; }
+.replay-col { width: 100px; text-align: right; white-space: nowrap; }
+.result-replay { display: inline-block; padding: 0.3rem 0.7rem; background: #0066cc; color: #fff; border-radius: 4px; font-size: 0.85rem; text-decoration: none; }
+.result-replay:hover { background: #0052a3; }
