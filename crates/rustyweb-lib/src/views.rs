@@ -1,0 +1,345 @@
+//! Server-rendered HTML views, built with [Maud]. Handlers in `server.rs` gather
+//! data and hand it to these functions, which return a [`Markup`] response.
+//! Shared page chrome lives in [`layout`]; styling lives in the served
+//! `/assets/app.css` stylesheet (no inline `<style>`).
+//!
+//! [Maud]: https://maud.lambda.xyz/
+
+use maud::{html, Markup, PreEscaped, DOCTYPE};
+
+/// The shared page shell: doctype, head (with the stylesheet link), and body.
+pub fn layout(title: &str, body: Markup) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="UTF-8";
+                meta name="viewport" content="width=device-width, initial-scale=1.0";
+                title { (title) }
+                link rel="stylesheet" href="/assets/app.css";
+            }
+            body { (body) }
+        }
+    }
+}
+
+/// The "Search tips" disclosure shown on the homepage and results page. The
+/// examples must stay in sync with how `SearchIndex::search` configures the
+/// query parser (AND-by-default, default fields, and the `field:` filters).
+pub fn search_tips() -> Markup {
+    html! {
+        details.tips {
+            summary { "Search tips" }
+            div.tips-body {
+                p {
+                    "Type words to search page titles, headings, page text, descriptions, and URLs. "
+                    strong { "All words must match" } " - " code { "climate policy" }
+                    " finds pages containing both."
+                }
+                ul {
+                    li { code { "\"climate policy\"" } " - an exact phrase (use quotes)" }
+                    li { code { "climate OR weather" } " - either word" }
+                    li { code { "climate -policy" } " - has \"climate\", excludes \"policy\"" }
+                    li { code { "(climate OR weather) risk" } " - group with parentheses" }
+                    li { code { "title:climate" } " - match only in the page title" }
+                    li { code { "domain:example.com" } " - only pages from that exact host" }
+                    li { code { "collection:demo" } " - only pages in that collection" }
+                    li { code { "year:2021" } " or " code { "year:[2020 TO 2023]" } " - filter by crawl year" }
+                    li { code { "type:pdf" } " - only PDFs (or " code { "type:html" } ")" }
+                    li { code { "lang:en" } " - only pages in that language" }
+                    li { code { "climate^2 change" } " - rank \"climate\" matches higher" }
+                }
+                p.tips-note {
+                    "Searches are case-insensitive. Title matches rank above body matches. "
+                    code { "domain:" } " needs the exact host (e.g. " code { "www.example.com" }
+                    "); to match host words loosely, just type them (e.g. " code { "example" } ")."
+                }
+            }
+        }
+    }
+}
+
+/// The top bar on inner pages: the home link plus a search form. On the results
+/// page the box is prefilled with the current query; elsewhere it shows a
+/// placeholder.
+fn top_bar(query: Option<&str>) -> Markup {
+    html! {
+        div.top {
+            a.home href="/" { "rustyweb" }
+            form.search-form action="/search" method="get" {
+                @if let Some(q) = query {
+                    input type="search" name="q" value=(q);
+                } @else {
+                    input type="search" name="q" placeholder="Search all collections…";
+                }
+                button type="submit" { "Search" }
+            }
+        }
+    }
+}
+
+/// A collection as shown on a homepage card.
+pub struct CollectionCard {
+    pub id: String,
+    pub name: String,
+    pub count: usize,
+    pub description: Option<String>,
+    pub date_range: Option<String>,
+}
+
+/// The homepage: search box, tips, and a card per collection.
+pub fn home(cards: &[CollectionCard]) -> Markup {
+    let body = html! {
+        h1 { "rustyweb" }
+        p.tagline { "Web archive search and replay" }
+        form.search-form.home action="/search" method="get" {
+            input type="search" name="q" placeholder="Search archived pages…" autofocus;
+            button type="submit" { "Search" }
+        }
+        (search_tips())
+        h2 { "Collections" }
+        @if cards.is_empty() {
+            p.muted {
+                "No collections indexed yet. Run "
+                code { "rustyweb index archive/*.wacz" } " to get started."
+            }
+        }
+        div.cards {
+            @for c in cards {
+                div.card {
+                    div.card-header {
+                        a.card-title href=(format!("/collection/{}", c.id)) { (c.name) }
+                        span.status.muted {
+                            (c.count) " WACZ" @if c.count != 1 { "s" }
+                        }
+                    }
+                    @if let Some(d) = &c.description {
+                        p.desc { (d) }
+                    }
+                    @if let Some(r) = &c.date_range {
+                        div.prov { (r) }
+                    }
+                }
+            }
+        }
+    };
+    layout("rustyweb", body)
+}
+
+// ── Search results ─────────────────────────────────────────────────────────
+
+/// One row of the search results table. The handler computes the replay `href`,
+/// display strings, and the (pre-escaped) snippet HTML; the view just lays it out.
+pub struct SearchResultRow {
+    pub href: String,
+    pub title: String,
+    pub is_collection: bool,
+    /// Display URL (empty for a collection-level hit, which shows a badge).
+    pub url: String,
+    /// Pre-formatted timestamp, empty when there is none to show.
+    pub timestamp_display: String,
+    /// Pre-escaped snippet HTML (may contain Tantivy `<b>` highlight tags).
+    pub snippet_html: Option<String>,
+    /// URL-encoded curated-collection id, for the "in <collection>" link.
+    pub coll_href: String,
+    /// Display name of the curated collection.
+    pub coll_display: String,
+}
+
+/// The search results page: top bar, tips, a count line, and the results table.
+pub fn search_results(query: &str, count: usize, rows: &[SearchResultRow]) -> Markup {
+    let body = html! {
+        (top_bar(Some(query)))
+        (search_tips())
+        div.count {
+            @if count == 0 {
+                "No results for " em { (query) }
+            } @else {
+                (count) " result" @if count != 1 { "s" } " for " em { (query) }
+            }
+        }
+        @if !rows.is_empty() {
+            table.results {
+                tbody {
+                    @for r in rows {
+                        tr {
+                            td {
+                                div.result-title { a href=(r.href) { (r.title) } }
+                                div.result-meta {
+                                    @if r.is_collection {
+                                        span.result-coll-badge { "Collection" }
+                                    } @else {
+                                        div.result-url { (r.url) }
+                                    }
+                                    @if !r.is_collection && !r.timestamp_display.is_empty() {
+                                        div.result-ts { (r.timestamp_display) }
+                                    }
+                                }
+                                @if let Some(s) = &r.snippet_html {
+                                    div.snippet { (PreEscaped(s)) }
+                                }
+                                div.result-coll {
+                                    "in " a href=(format!("/collection/{}", r.coll_href)) { em { (r.coll_display) } }
+                                }
+                            }
+                            td.replay-col {
+                                a.result-replay href=(r.href) { "Replay →" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    layout(&format!("{query} - rustyweb"), body)
+}
+
+// ── Shared metadata / provenance rows ────────────────────────────────────────
+
+/// A single `<th>/<td>` row in a metadata table. `mono` renders the value in a
+/// monospace cell (for URLs, user-agents, hashes).
+pub struct MetaRow {
+    pub label: String,
+    pub value: String,
+    pub mono: bool,
+}
+
+impl MetaRow {
+    pub fn new(label: &str, value: impl Into<String>) -> Self {
+        MetaRow { label: label.to_string(), value: value.into(), mono: false }
+    }
+    pub fn mono(label: &str, value: impl Into<String>) -> Self {
+        MetaRow { label: label.to_string(), value: value.into(), mono: true }
+    }
+}
+
+fn meta_table(rows: &[MetaRow]) -> Markup {
+    html! {
+        table.meta {
+            @for r in rows {
+                tr {
+                    th { (r.label) }
+                    @if r.mono { td.mono { (r.value) } } @else { td { (r.value) } }
+                }
+            }
+        }
+    }
+}
+
+// ── Collection detail ────────────────────────────────────────────────────────
+
+/// A member WACZ as shown in a collection's list.
+pub struct MemberItem {
+    pub id: String,
+    pub name: String,
+    pub present: bool,
+    /// One-line provenance summary (plain text), if any is known.
+    pub provenance: Option<String>,
+}
+
+/// The collection detail page: metadata table plus its list of member WACZs.
+pub fn collection(
+    name: &str,
+    description: Option<&str>,
+    meta: &[MetaRow],
+    members: &[MemberItem],
+) -> Markup {
+    let body = html! {
+        (top_bar(None))
+        h1 { (name) }
+        @if let Some(d) = description { p.desc { (d) } }
+        (meta_table(meta))
+        h2 { "WACZs" }
+        @if members.is_empty() {
+            p.muted { "No WACZs in this collection." }
+        } @else {
+            ul.pages {
+                @for m in members {
+                    li {
+                        a href=(format!("/wacz/{}", m.id)) { (m.name) }
+                        " "
+                        @if m.present { span.ok { "✓" } } @else { span.missing { "✗" } }
+                        @if let Some(p) = &m.provenance { div.prov { (p) } }
+                    }
+                }
+            }
+        }
+    };
+    layout(&format!("{name} - rustyweb"), body)
+}
+
+// ── WACZ detail ────────────────────────────────────────────────────────────
+
+/// A seed page listed on a WACZ detail page.
+pub struct PageItem {
+    pub href: String,
+    pub title: String,
+    pub url: String,
+}
+
+/// All the data the WACZ detail page renders. The handler resolves links,
+/// formats sizes/dates, and gathers provenance/file rows; the view lays them out.
+pub struct WaczPage {
+    /// `(collection_id, collection_name)` breadcrumb, if the WACZ has one.
+    pub crumb: Option<(String, String)>,
+    pub name: String,
+    pub description: Option<String>,
+    pub replay_href: String,
+    pub provenance: Vec<MetaRow>,
+    pub source: String,
+    pub size: String,
+    pub sha_short: String,
+    pub sha_full: String,
+    pub crawled: Option<String>,
+    pub indexed: String,
+    pub present: bool,
+    pub pages: Vec<PageItem>,
+}
+
+/// The WACZ detail page: provenance panel, file metadata, and seed-page list.
+pub fn wacz(p: &WaczPage) -> Markup {
+    let body = html! {
+        (top_bar(None))
+        @if let Some((id, cname)) = &p.crumb {
+            div.crumb { "in " a href=(format!("/collection/{}", id)) { (cname) } }
+        }
+        h1 { (p.name) }
+        @if let Some(d) = &p.description { p.desc { (d) } }
+        a.replay-btn href=(p.replay_href) { "Replay →" }
+
+        @if !p.provenance.is_empty() {
+            h2 { "Provenance" }
+            (meta_table(&p.provenance))
+        }
+
+        h2 { "File" }
+        table.meta {
+            tr { th { "Source" } td.mono { (p.source) } }
+            tr { th { "Size" } td { (p.size) } }
+            tr { th { "SHA-256" } td.mono title=(p.sha_full) { (p.sha_short) "…" } }
+            @if let Some(c) = &p.crawled { tr { th { "Crawled" } td { (c) } } }
+            tr { th { "Indexed" } td { (p.indexed) } }
+            tr {
+                th { "Status" }
+                td {
+                    @if p.present { span.ok { "✓ present" } } @else { span.missing { "✗ missing" } }
+                }
+            }
+        }
+
+        h2 { "Pages" }
+        @if p.pages.is_empty() {
+            p.muted { "No pages are listed in this WACZ." }
+        } @else {
+            ul.pages {
+                @for pg in &p.pages {
+                    li {
+                        a href=(pg.href) { (pg.title) }
+                        div.result-url { (pg.url) }
+                    }
+                }
+            }
+        }
+    };
+    layout(&format!("{} - rustyweb", p.name), body)
+}
