@@ -281,13 +281,18 @@ async fn search_page(
             let url_enc = url_encode(&r.url);
             let name_enc = url_encode(&r.collection_name);
             let source_enc = url_encode(&source_for(&r.collection_id));
+            // Carry the collection breadcrumb (name + id) into the replay viewer.
+            let coll_q = format!(
+                "&collection={}&collection_id={coll_href}",
+                url_encode(collection_names.get(&r.collection).map(String::as_str).unwrap_or(&r.collection)),
+            );
 
             let href = if is_collection {
                 // Link to the collection's root in the viewer.
-                format!("/replay/viewer?source={source_enc}&name={name_enc}")
+                format!("/replay/viewer?source={source_enc}&name={name_enc}{coll_q}")
             } else {
                 format!(
-                    "/replay/viewer?source={source_enc}&url={url_enc}&ts={}&name={name_enc}",
+                    "/replay/viewer?source={source_enc}&url={url_enc}&ts={}&name={name_enc}{coll_q}",
                     r.timestamp
                 )
             };
@@ -550,6 +555,11 @@ async fn wacz_page(
     let name = html_escape(&c.name);
     let source_enc = url_encode(&viewer_source(c));
     let name_enc = url_encode(&c.name);
+    // Collection breadcrumb params carried into replay links (name + id).
+    let coll_q = manifest
+        .collection_by_id(&c.collection)
+        .map(|col| format!("&collection={}&collection_id={}", url_encode(&col.name), url_encode(&col.id)))
+        .unwrap_or_default();
     let source_disp = html_escape(&c.source.location());
     let status = if c.is_present(&state.home) {
         "<span class=\"ok\">✓ present</span>"
@@ -573,11 +583,11 @@ async fn wacz_page(
     // Replay button: first seed page, else the collection root.
     let replay_href = match c.seed_pages.first() {
         Some(p) => format!(
-            "/replay/viewer?source={source_enc}&url={}&ts={}&name={name_enc}",
+            "/replay/viewer?source={source_enc}&url={}&ts={}&name={name_enc}{coll_q}",
             url_encode(&p.url),
             ts_to_14digit(&p.ts),
         ),
-        None => format!("/replay/viewer?source={source_enc}&name={name_enc}"),
+        None => format!("/replay/viewer?source={source_enc}&name={name_enc}{coll_q}"),
     };
 
     let pages: String = c
@@ -586,7 +596,7 @@ async fn wacz_page(
         .map(|p| {
             let title = p.title.as_deref().unwrap_or(&p.url);
             let href = format!(
-                "/replay/viewer?source={source_enc}&url={}&ts={}&name={name_enc}",
+                "/replay/viewer?source={source_enc}&url={}&ts={}&name={name_enc}{coll_q}",
                 url_encode(&p.url),
                 ts_to_14digit(&p.ts),
             );
