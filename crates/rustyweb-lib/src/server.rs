@@ -128,19 +128,12 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 .map(|d| format!("<p class=\"desc\">{}</p>", html_escape(d)))
                 .unwrap_or_default();
 
-            // Aggregate provenance across the collection's members.
-            let mut parts: Vec<String> = Vec::new();
-            let software = collection_software(&members);
-            if !software.is_empty() {
-                parts.push(format!("Software: {}", html_escape(&software.join(", "))));
-            }
-            if let Some(r) = members_capture_range(&members) {
-                parts.push(html_escape(&r));
-            }
-            let prov = if parts.is_empty() {
-                String::new()
-            } else {
-                format!("<div class=\"prov\">{}</div>", parts.join(" · "))
+            // Show the collection's capture date range (temporal span is
+            // meaningful at the collection level; per-tool software lives on the
+            // WACZ detail page).
+            let prov = match members_capture_range(&members) {
+                Some(r) => format!("<div class=\"prov\">{}</div>", html_escape(&r)),
+                None => String::new(),
             };
 
             format!(
