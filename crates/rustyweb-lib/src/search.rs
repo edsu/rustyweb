@@ -29,6 +29,9 @@ const FIELD_DESCRIPTION: &str = "description";
 const FIELD_HEADINGS: &str = "headings";
 /// Four-digit crawl year (from the page timestamp), for `year:` filtering.
 const FIELD_YEAR: &str = "year";
+/// Six-digit crawl month `YYYYMM` (from the page timestamp), for `month:`
+/// filtering/range and the results timeline.
+const FIELD_MONTH: &str = "month";
 /// Coarse media type of the page: `html` or `pdf`, for `type:` filtering.
 const FIELD_MEDIA_TYPE: &str = "type";
 /// Primary language subtag from `<html lang>` (e.g. `en`), for `lang:` filtering.
@@ -125,9 +128,13 @@ impl SearchIndex {
         // URL's words tokenized so they're searchable as ordinary terms.
         doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), domain_of(page.url));
         doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), url_search_text(page.url));
-        // Numeric year for range filtering; omitted when there's no usable date.
+        // Numeric year/month for range filtering and the timeline; omitted when
+        // there's no usable date.
         if let Some(year) = year_of(page.timestamp) {
             doc.add_u64(schema.get_field(FIELD_YEAR).unwrap(), year);
+        }
+        if let Some(month) = month_of(page.timestamp) {
+            doc.add_u64(schema.get_field(FIELD_MONTH).unwrap(), month);
         }
         doc.add_text(schema.get_field(FIELD_MEDIA_TYPE).unwrap(), page.media_type);
         doc.add_text(schema.get_field(FIELD_LANG).unwrap(), primary_lang(page.lang));
@@ -257,6 +264,7 @@ impl SearchIndex {
             total_hits,
             results,
             facets: facets_from_aggregations(&agg_results),
+            timeline: timeline_from_aggregations(&agg_results),
         })
     }
 }
@@ -312,6 +320,16 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     /// Facet counts per dimension, in display order.
     pub facets: Vec<FacetGroup>,
+    /// Result counts per crawl month, oldest first (the results timeline).
+    pub timeline: Vec<TimelineBucket>,
+}
+
+/// One month's slice of the results timeline.
+#[derive(Debug, Clone)]
+pub struct TimelineBucket {
+    /// Crawl month as `YYYYMM` (e.g. `202503`).
+    pub ym: u64,
+    pub count: u64,
 }
 
 /// The counts for one facet dimension (e.g. "Site"), highest count first.
@@ -346,9 +364,13 @@ const FACET_DIMENSIONS: [(&str, &str, &str); 5] = [
 /// How many buckets to request per facet dimension.
 const FACET_SIZE: u32 = 50;
 
-/// Build the terms-aggregation request that produces one bucket set per facet
-/// dimension. Deserialized from JSON because [`Aggregations`] is a serde type
-/// and the JSON form is far more legible than the nested builder structs.
+/// How many month buckets to request for the timeline (~10 years).
+const TIMELINE_SIZE: u32 = 120;
+
+/// Build the terms-aggregation request: one bucket set per facet dimension plus
+/// a month bucket set for the timeline. Deserialized from JSON because
+/// [`Aggregations`] is a serde type and the JSON form is far more legible than
+/// the nested builder structs.
 fn facet_aggregations() -> Aggregations {
     let mut req = serde_json::Map::new();
     for (field, _query_field, _label) in FACET_DIMENSIONS {
@@ -357,9 +379,35 @@ fn facet_aggregations() -> Aggregations {
             serde_json::json!({ "terms": { "field": field, "size": FACET_SIZE } }),
         );
     }
+    req.insert(
+        FIELD_MONTH.to_string(),
+        serde_json::json!({ "terms": { "field": FIELD_MONTH, "size": TIMELINE_SIZE } }),
+    );
     // The request is well-formed by construction, so this never fails.
     serde_json::from_value(serde_json::Value::Object(req))
         .expect("facet aggregation request is valid")
+}
+
+/// Extract the month buckets from the aggregation results as a timeline sorted
+/// oldest-first. Terms aggregations sort by count, so we re-sort chronologically.
+fn timeline_from_aggregations(
+    agg: &tantivy::aggregation::agg_result::AggregationResults,
+) -> Vec<TimelineBucket> {
+    let value = serde_json::to_value(agg).unwrap_or_default();
+    let Some(buckets) = value.get(FIELD_MONTH).and_then(|d| d.get("buckets")).and_then(|b| b.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<TimelineBucket> = buckets
+        .iter()
+        .filter_map(|b| {
+            let count = b.get("doc_count")?.as_u64()?;
+            let ym = b.get("key")?.as_f64()? as u64;
+            (ym > 0).then_some(TimelineBucket { ym, count })
+        })
+        .collect();
+    out.sort_by_key(|t| t.ym);
+    out
 }
 
 /// Convert Tantivy's aggregation results into ordered [`FacetGroup`]s. Empty
@@ -436,8 +484,11 @@ fn build_schema() -> Schema {
     // Tokenized URL words; indexed for search but not stored (we keep the URL).
     builder.add_text_field(FIELD_URL_TOKENS, TEXT);
     // Numeric crawl year: indexed for `year:2021` / `year:[2020 TO 2023]`, and
-    // fast so it can back the year facet (and, later, a date histogram).
+    // fast so it can back the year facet.
     builder.add_u64_field(FIELD_YEAR, INDEXED | STORED | FAST);
+    // Numeric crawl month `YYYYMM`: indexed for `month:202103` /
+    // `month:[202101 TO 202106]`, fast so it backs the results timeline.
+    builder.add_u64_field(FIELD_MONTH, INDEXED | STORED | FAST);
     // Coarse media type (`html`/`pdf`) and page language, for filtering + facets.
     builder.add_text_field(FIELD_MEDIA_TYPE, facet_string());
     builder.add_text_field(FIELD_LANG, facet_string());
@@ -460,6 +511,15 @@ fn primary_lang(lang: &str) -> String {
 fn year_of(timestamp: &str) -> Option<u64> {
     let year: u64 = timestamp.get(..4)?.parse().ok()?;
     (1000..=9999).contains(&year).then_some(year)
+}
+
+/// The six-digit crawl month `YYYYMM` parsed from a 14-digit page timestamp
+/// (`20210417...` -> `202104`). `None` when the year or month is implausible.
+fn month_of(timestamp: &str) -> Option<u64> {
+    let s = timestamp.get(..6)?;
+    let year: u64 = s.get(..4)?.parse().ok()?;
+    let month: u64 = s.get(4..6)?.parse().ok()?;
+    ((1000..=9999).contains(&year) && (1..=12).contains(&month)).then_some(year * 100 + month)
 }
 
 /// The exact host of a URL, lowercased (e.g. `https://Example.com/a` -> `example.com`).
@@ -987,6 +1047,35 @@ mod tests {
         assert_eq!(resp.total_hits, 2);
         assert_eq!(facet_map(&resp, FIELD_YEAR).get("2021"), Some(&2));
         assert!(facet_map(&resp, FIELD_YEAR).get("2023").is_none(), "2023 filtered out");
+    }
+
+    #[test]
+    fn month_of_parses_year_and_month() {
+        assert_eq!(month_of("20210417120000"), Some(202104));
+        assert_eq!(month_of("202412"), Some(202412));
+        assert_eq!(month_of("20211320"), None, "month 13 is invalid");
+        assert_eq!(month_of("2021"), None, "too short for a month");
+        assert_eq!(month_of(""), None);
+    }
+
+    #[test]
+    fn timeline_is_chronological_and_counts_months() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        // Two captures in 2021-03, one in 2021-01, one in 2023-07.
+        for ts in ["20210301000000", "20210315000000", "20210101000000", "20230701000000"] {
+            idx.index_page(&page_ts("https://ex.com/x", ts)).unwrap();
+        }
+        idx.commit().unwrap();
+
+        let resp = idx.search_faceted("shared", 10, 0).unwrap();
+        let tl: Vec<(u64, u64)> = resp.timeline.iter().map(|t| (t.ym, t.count)).collect();
+        // Oldest first, one bucket per distinct month, with correct counts.
+        assert_eq!(tl, vec![(202101, 1), (202103, 2), (202307, 1)]);
+
+        // Filtering by month narrows to that month only.
+        let resp = idx.search_faceted("shared month:202103", 10, 0).unwrap();
+        assert_eq!(resp.total_hits, 2);
     }
 
     #[test]

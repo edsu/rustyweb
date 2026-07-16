@@ -108,6 +108,15 @@ table.results td { padding: 0.8rem 0.4rem; vertical-align: top; }
 .filter-chip:hover { background: #d7e5fc; text-decoration: none; }
 .filter-chip .chip-label { color: #5f6f86; }
 
+/* Results timeline (month histogram) */
+.timeline { display: flex; align-items: flex-end; gap: 3px; height: 90px; margin: 0 0 1.75rem; padding-bottom: 1.1rem; border-bottom: 1px solid #eee; }
+.tl-bar { flex: 1 1 0; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; text-decoration: none; min-width: 0; position: relative; }
+.tl-fill { width: 70%; min-height: 2px; background: #9cc0ea; border-radius: 2px 2px 0 0; }
+.tl-bar:hover .tl-fill { background: #0066cc; }
+.tl-bar.active .tl-fill { background: #1967d2; }
+.tl-label { position: absolute; bottom: -1rem; font-size: 0.6rem; color: #999; white-space: nowrap; }
+.tl-bar:hover .tl-label, .tl-bar.active .tl-label { color: #0066cc; }
+
 /* Faceted results layout: sidebar + results */
 .results-layout { display: flex; gap: 1.75rem; align-items: flex-start; }
 .results-main { flex: 1; min-width: 0; }

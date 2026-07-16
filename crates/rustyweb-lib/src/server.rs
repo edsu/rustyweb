@@ -147,18 +147,24 @@ const PAGE_SIZE: usize = 20;
 /// The query fields that appear as facet filters (matching the facet dimensions
 /// in `search.rs`). A token `field:value` with one of these fields is treated
 /// as an active filter for the sidebar.
-const FILTER_FIELDS: [&str; 5] = ["collection", "year", "domain", "type", "lang"];
+const FILTER_FIELDS: [&str; 6] = ["collection", "year", "month", "domain", "type", "lang"];
 
 /// Human label for a facet field, for the active-filter chips.
 fn facet_label(field: &str) -> &'static str {
     match field {
         "collection" => "Collection",
         "year" => "Year",
+        "month" => "Month",
         "domain" => "Site",
         "type" => "Type",
         "lang" => "Language",
         _ => "Filter",
     }
+}
+
+/// Format a `YYYYMM` month as `YYYY-MM` for display.
+fn format_ym(ym: u64) -> String {
+    format!("{:04}-{:02}", ym / 100, ym % 100)
 }
 
 /// The active `field:value` facet filters present in a query, in order.
@@ -353,7 +359,31 @@ async fn search_page(
         .collect();
     let sidebar = views::FacetSidebar { active, groups };
 
-    views::search_results(&q, &page_nav, &sidebar, &rows).into_response()
+    // Timeline: one clickable bar per crawl month, oldest first, height scaled
+    // to the busiest month. Clicking toggles a `month:YYYYMM` filter.
+    let max_count = response.timeline.iter().map(|t| t.count).max().unwrap_or(1).max(1);
+    let timeline: Vec<views::TimelineBar> = response
+        .timeline
+        .iter()
+        .map(|t| {
+            let month = t.ym.to_string();
+            let is_active = filters.iter().any(|(f, v)| f == "month" && v == &month);
+            let new_q = if is_active {
+                query_without_filter(&q, "month", &month)
+            } else {
+                query_with_filter(&q, "month", &month)
+            };
+            views::TimelineBar {
+                label: format_ym(t.ym),
+                count: t.count,
+                pct: (t.count as f64 / max_count as f64 * 100.0).round() as u32,
+                href: search_href(&new_q),
+                active: is_active,
+            }
+        })
+        .collect();
+
+    views::search_results(&q, &page_nav, &sidebar, &timeline, &rows).into_response()
 }
 
 // ── Collection detail page ──────────────────────────────────────────────────

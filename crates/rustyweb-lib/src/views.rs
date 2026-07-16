@@ -45,6 +45,7 @@ pub fn search_tips() -> Markup {
                     li { code { "domain:example.com" } " - only pages from that exact host" }
                     li { code { "collection:demo" } " - only pages in that collection" }
                     li { code { "year:2021" } " or " code { "year:[2020 TO 2023]" } " - filter by crawl year" }
+                    li { code { "month:202103" } " or " code { "month:[202101 TO 202106]" } " - filter by crawl month" }
                     li { code { "type:pdf" } " - only PDFs (or " code { "type:html" } ")" }
                     li { code { "lang:en" } " - only pages in that language" }
                     li { code { "climate^2 change" } " - rank \"climate\" matches higher" }
@@ -185,12 +186,24 @@ pub struct FacetItem {
     pub active: bool,
 }
 
+/// One bar of the results timeline: a crawl month, its count, a height
+/// percentage (0–100), a toggle link, and whether that month is filtered.
+pub struct TimelineBar {
+    pub label: String,
+    pub count: u64,
+    pub pct: u32,
+    pub href: String,
+    pub active: bool,
+}
+
 /// The search results page: top bar, tips, a count line, an active-filter row,
-/// then a facet sidebar beside the results table with prev/next pagination.
+/// a month timeline, then a facet sidebar beside the results table with
+/// prev/next pagination.
 pub fn search_results(
     query: &str,
     nav: &PageNav,
     sidebar: &FacetSidebar,
+    timeline: &[TimelineBar],
     rows: &[SearchResultRow],
 ) -> Markup {
     // Preserve the query when linking to another page.
@@ -215,6 +228,16 @@ pub fn search_results(
                     a.filter-chip href=(f.remove_href) {
                         span.chip-label { (f.label) ": " }
                         (f.value) " ✕"
+                    }
+                }
+            }
+        }
+        @if timeline.len() >= 2 {
+            div.timeline title="Results by crawl month — click a bar to filter" {
+                @for b in timeline {
+                    a.tl-bar.active[b.active] href=(b.href) title=(format!("{}: {} result{}", b.label, b.count, if b.count == 1 { "" } else { "s" })) {
+                        span.tl-fill style=(format!("height:{}%", b.pct.max(3))) {}
+                        span.tl-label { (b.label) }
                     }
                 }
             }
