@@ -141,9 +141,14 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 // ── Search results page ───────────────────────────────────────────────────────
 
+/// Search results per page.
+const PAGE_SIZE: usize = 20;
+
 #[derive(Deserialize)]
 struct SearchPageParams {
     q: String,
+    /// 1-based page number; absent/`<1` means the first page.
+    page: Option<usize>,
 }
 
 async fn search_page(
@@ -160,10 +165,13 @@ async fn search_page(
             .into_response();
     }
 
-    let results = match state.search.search(&q, 20) {
+    let page = params.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * PAGE_SIZE;
+    let response = match state.search.search_faceted(&q, PAGE_SIZE, offset) {
         Ok(r) => r,
         Err(e) => return error_response(e).into_response(),
     };
+    let results = &response.results;
 
     // Map each WACZ id to the wabac `source` to use: /files/{id} for a local
     // WACZ, or the remote URL directly for an http source.
@@ -246,7 +254,14 @@ async fn search_page(
         })
         .collect();
 
-    views::search_results(&q, results.len(), &rows).into_response()
+    let total_pages = response.total_hits.div_ceil(PAGE_SIZE).max(1);
+    let page_nav = views::PageNav {
+        page,
+        total_pages,
+        total_hits: response.total_hits,
+        query_encoded: url_encode(&q),
+    };
+    views::search_results(&q, &page_nav, &rows).into_response()
 }
 
 // ── Collection detail page ──────────────────────────────────────────────────
@@ -500,10 +515,11 @@ async fn search_api(
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(20).min(200);
-    match state.search.search(&params.q, limit) {
-        Ok(results) => {
+    match state.search.search_faceted(&params.q, limit, 0) {
+        Ok(response) => {
             let body = serde_json::json!({
-                "results": results.iter().map(|r| serde_json::json!({
+                "total": response.total_hits,
+                "results": response.results.iter().map(|r| serde_json::json!({
                     "doc_type": r.doc_type,
                     "url": r.url,
                     "domain": r.domain,
@@ -513,7 +529,15 @@ async fn search_api(
                     "collection_name": r.collection_name,
                     "collection": r.collection,
                     "snippet": r.snippet,
-                })).collect::<Vec<_>>()
+                })).collect::<Vec<_>>(),
+                "facets": response.facets.iter().map(|g| serde_json::json!({
+                    "field": g.field,
+                    "label": g.label,
+                    "buckets": g.buckets.iter().map(|b| serde_json::json!({
+                        "value": b.value,
+                        "count": b.count,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
             });
             (StatusCode::OK, axum::Json(body)).into_response()
         }

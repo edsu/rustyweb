@@ -100,3 +100,10 @@ table.results td { padding: 0.8rem 0.4rem; vertical-align: top; }
 .replay-col { width: 100px; text-align: right; white-space: nowrap; }
 .result-replay { display: inline-block; padding: 0.3rem 0.7rem; background: #0066cc; color: #fff; border-radius: 4px; font-size: 0.85rem; text-decoration: none; }
 .result-replay:hover { background: #0052a3; }
+
+/* Pagination */
+nav.pagination { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 2rem 0 1rem; font-size: 0.9rem; }
+nav.pagination a { color: #0066cc; text-decoration: none; padding: 0.4rem 0.8rem; border: 1px solid #d6e4f2; border-radius: 4px; }
+nav.pagination a:hover { background: #eef4fb; text-decoration: none; }
+nav.pagination .disabled { color: #bbb; padding: 0.4rem 0.8rem; border: 1px solid #eee; border-radius: 4px; }
+nav.pagination .page-info { color: #666; }

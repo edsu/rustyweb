@@ -1,9 +1,14 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tantivy::collector::TopDocs;
+use tantivy::aggregation::agg_req::Aggregations;
+use tantivy::aggregation::{AggContextParams, AggregationCollector};
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
-use tantivy::schema::{Schema, Value, INDEXED, STORED, STRING, TEXT};
+use tantivy::schema::{
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED, STRING,
+    TEXT,
+};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
@@ -165,7 +170,23 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Search the top `limit` results by relevance. A thin wrapper over
+    /// [`search_faceted`](Self::search_faceted) that returns only the hits (no
+    /// facet counts, no pagination); kept for callers that don't need them.
     pub fn search(&self, query_str: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        Ok(self.search_faceted(query_str, limit, 0)?.results)
+    }
+
+    /// Search with facet counts and pagination. Returns one page of results
+    /// (`limit` hits starting at `offset`), the total number of matches, and
+    /// facet buckets (counts per value) for each facet dimension, all computed
+    /// from the same query in a single pass.
+    pub fn search_faceted(
+        &self,
+        query_str: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchResponse> {
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
         let schema = self.index.schema();
@@ -178,9 +199,9 @@ impl SearchIndex {
         let url_f = schema.get_field(FIELD_URL).unwrap();
         let ts_f = schema.get_field(FIELD_TS).unwrap();
         let domain_f = schema.get_field(FIELD_DOMAIN).unwrap();
-        let url_tokens_f = schema.get_field(FIELD_URL_TOKENS).unwrap();
         let description_f = schema.get_field(FIELD_DESCRIPTION).unwrap();
         let headings_f = schema.get_field(FIELD_HEADINGS).unwrap();
+        let url_tokens_f = schema.get_field(FIELD_URL_TOKENS).unwrap();
         let collection_f = schema.get_field(FIELD_COLLECTION).unwrap();
 
         // Bare words search the title, headings, body, description, and URL
@@ -200,8 +221,14 @@ impl SearchIndex {
         // a best-effort query instead of a hard error, so the search box never
         // 500s while someone is experimenting with syntax.
         let (query, _errors) = query_parser.parse_query_lenient(query_str);
-        let collector = TopDocs::with_limit(limit).order_by_score();
-        let top_docs = searcher.search(&query, &collector)?;
+
+        // One pass computes all three things over the same query: the page of
+        // hits (TopDocs + offset), the total match count, and the facet counts
+        // (a terms aggregation per dimension over the fast fields).
+        let top_collector = TopDocs::with_limit(limit.max(1)).and_offset(offset).order_by_score();
+        let agg_collector = AggregationCollector::from_aggs(facet_aggregations(), AggContextParams::default());
+        let (top_docs, total_hits, agg_results) =
+            searcher.search(&query, &(top_collector, Count, agg_collector))?;
 
         let mut snippet_gen = SnippetGenerator::create(&searcher, &query, body_f)?;
         // Tantivy's default snippet window is 150 chars; widen it for more
@@ -226,7 +253,11 @@ impl SearchIndex {
             });
         }
 
-        Ok(results)
+        Ok(SearchResponse {
+            total_hits,
+            results,
+            facets: facets_from_aggregations(&agg_results),
+        })
     }
 }
 
@@ -271,13 +302,127 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
+/// One page of search results plus the facet counts and total match count for
+/// the whole query (not just this page).
+#[derive(Debug, Clone)]
+pub struct SearchResponse {
+    /// Total number of matching documents across all pages.
+    pub total_hits: usize,
+    /// The requested page of results.
+    pub results: Vec<SearchResult>,
+    /// Facet counts per dimension, in display order.
+    pub facets: Vec<FacetGroup>,
+}
+
+/// The counts for one facet dimension (e.g. "Site"), highest count first.
+#[derive(Debug, Clone)]
+pub struct FacetGroup {
+    /// The index field name (e.g. `domain`), used to build `field:value` refine links.
+    pub field: String,
+    /// Human label for the dimension (e.g. `Site`).
+    pub label: String,
+    pub buckets: Vec<FacetBucket>,
+}
+
+/// One value within a facet dimension and how many results carry it.
+#[derive(Debug, Clone)]
+pub struct FacetBucket {
+    pub value: String,
+    pub count: u64,
+}
+
+/// The facet dimensions, in display order: `(index field, query field, label)`.
+/// The query field is what a refine link uses in `field:value` syntax — it
+/// matches the index field for every dimension today, but is kept distinct so a
+/// dimension whose facet field differs from its filter field can be added later.
+const FACET_DIMENSIONS: [(&str, &str, &str); 5] = [
+    (FIELD_COLLECTION, "collection", "Collection"),
+    (FIELD_YEAR, "year", "Year"),
+    (FIELD_DOMAIN, "domain", "Site"),
+    (FIELD_MEDIA_TYPE, "type", "Type"),
+    (FIELD_LANG, "lang", "Language"),
+];
+
+/// How many buckets to request per facet dimension.
+const FACET_SIZE: u32 = 50;
+
+/// Build the terms-aggregation request that produces one bucket set per facet
+/// dimension. Deserialized from JSON because [`Aggregations`] is a serde type
+/// and the JSON form is far more legible than the nested builder structs.
+fn facet_aggregations() -> Aggregations {
+    let mut req = serde_json::Map::new();
+    for (field, _query_field, _label) in FACET_DIMENSIONS {
+        req.insert(
+            field.to_string(),
+            serde_json::json!({ "terms": { "field": field, "size": FACET_SIZE } }),
+        );
+    }
+    // The request is well-formed by construction, so this never fails.
+    serde_json::from_value(serde_json::Value::Object(req))
+        .expect("facet aggregation request is valid")
+}
+
+/// Convert Tantivy's aggregation results into ordered [`FacetGroup`]s. Empty
+/// values (e.g. the blank domain/lang of collection-level docs) are dropped.
+fn facets_from_aggregations(
+    agg: &tantivy::aggregation::agg_result::AggregationResults,
+) -> Vec<FacetGroup> {
+    // Round-trip through JSON: the terms result is `{buckets:[{key,doc_count}]}`,
+    // which is simpler to read than matching the internal bucket enums.
+    let value = serde_json::to_value(agg).unwrap_or_default();
+    let mut groups = Vec::new();
+    for (field, _query_field, label) in FACET_DIMENSIONS {
+        let Some(buckets) = value.get(field).and_then(|d| d.get("buckets")).and_then(|b| b.as_array())
+        else {
+            continue;
+        };
+        let items: Vec<FacetBucket> = buckets
+            .iter()
+            .filter_map(|b| {
+                let count = b.get("doc_count")?.as_u64()?;
+                let value = match b.get("key")? {
+                    serde_json::Value::String(s) => s.clone(),
+                    // Numeric keys (year) come back as floats; show them as ints.
+                    serde_json::Value::Number(n) => (n.as_f64()? as i64).to_string(),
+                    _ => return None,
+                };
+                (!value.is_empty()).then_some(FacetBucket { value, count })
+            })
+            .collect();
+        if !items.is_empty() {
+            groups.push(FacetGroup {
+                field: field.to_string(),
+                label: label.to_string(),
+                buckets: items,
+            });
+        }
+    }
+    groups
+}
+
+/// A string field that is indexed as a single raw token (like [`STRING`]),
+/// stored, **and** kept as a fast (columnar) field so it can back a terms
+/// aggregation for facet counts. The `raw` tokenizer keeps the whole value as
+/// one term, so a facet bucket is the exact field value (e.g. one `domain:`
+/// host), not individual words.
+fn facet_string() -> TextOptions {
+    TextOptions::default()
+        .set_stored()
+        .set_fast(Some("raw"))
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
+        )
+}
+
 fn build_schema() -> Schema {
     let mut builder = Schema::builder();
     builder.add_text_field(FIELD_DOC_TYPE, STRING | STORED);
     builder.add_text_field(FIELD_COLLECTION_ID, STRING | STORED);
     builder.add_text_field(FIELD_COLLECTION_NAME, STRING | STORED);
-    // Curated collection id (slug), for `collection:` filtering.
-    builder.add_text_field(FIELD_COLLECTION, STRING | STORED);
+    // Curated collection id (slug), for `collection:` filtering and faceting.
+    builder.add_text_field(FIELD_COLLECTION, facet_string());
     builder.add_text_field(FIELD_URL, STRING | STORED);
     builder.add_text_field(FIELD_TS, STRING | STORED);
     builder.add_text_field(FIELD_TITLE, TEXT | STORED);
@@ -286,15 +431,16 @@ fn build_schema() -> Schema {
     builder.add_text_field(FIELD_DESCRIPTION, TEXT | STORED);
     // Headings are indexed (and boosted at query time) but not stored.
     builder.add_text_field(FIELD_HEADINGS, TEXT);
-    // Exact host, stored so results can show it: matched only by `domain:host`.
-    builder.add_text_field(FIELD_DOMAIN, STRING | STORED);
+    // Exact host: matched by `domain:host`, and faceted (the "Site" facet).
+    builder.add_text_field(FIELD_DOMAIN, facet_string());
     // Tokenized URL words; indexed for search but not stored (we keep the URL).
     builder.add_text_field(FIELD_URL_TOKENS, TEXT);
-    // Numeric crawl year, indexed for `year:2021` and `year:[2020 TO 2023]`.
-    builder.add_u64_field(FIELD_YEAR, INDEXED | STORED);
-    // Coarse media type (`html`/`pdf`) and page language, for exact filtering.
-    builder.add_text_field(FIELD_MEDIA_TYPE, STRING | STORED);
-    builder.add_text_field(FIELD_LANG, STRING | STORED);
+    // Numeric crawl year: indexed for `year:2021` / `year:[2020 TO 2023]`, and
+    // fast so it can back the year facet (and, later, a date histogram).
+    builder.add_u64_field(FIELD_YEAR, INDEXED | STORED | FAST);
+    // Coarse media type (`html`/`pdf`) and page language, for filtering + facets.
+    builder.add_text_field(FIELD_MEDIA_TYPE, facet_string());
+    builder.add_text_field(FIELD_LANG, facet_string());
     builder.build()
 }
 
@@ -783,6 +929,90 @@ mod tests {
         let r = idx.search("shared year:2019", 10).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].url, "https://ex.com/2019");
+    }
+
+    /// Look up one facet dimension's buckets as a value->count map.
+    fn facet_map(resp: &SearchResponse, field: &str) -> std::collections::HashMap<String, u64> {
+        resp.facets
+            .iter()
+            .find(|g| g.field == field)
+            .map(|g| g.buckets.iter().map(|b| (b.value.clone(), b.count)).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn facet_counts_reflect_the_query() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        // Three "shared" pages: two on example.com (2021 html), one on other.org
+        // (2023 pdf), spread across two collections.
+        idx.index_page(&Page {
+            url: "https://example.com/a", title: "A", body: "shared", timestamp: "20210101000000",
+            media_type: "html", lang: "en-US", collection: "demo", collection_id: "w1", collection_name: "W1",
+            ..Default::default()
+        }).unwrap();
+        idx.index_page(&Page {
+            url: "https://example.com/b", title: "B", body: "shared", timestamp: "20210601000000",
+            media_type: "html", lang: "en", collection: "demo", collection_id: "w1", collection_name: "W1",
+            ..Default::default()
+        }).unwrap();
+        idx.index_page(&Page {
+            url: "https://other.org/c", title: "C", body: "shared", timestamp: "20230101000000",
+            media_type: "pdf", lang: "fr", collection: "news", collection_id: "w2", collection_name: "W2",
+            ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        let resp = idx.search_faceted("shared", 10, 0).unwrap();
+        assert_eq!(resp.total_hits, 3);
+
+        let sites = facet_map(&resp, FIELD_DOMAIN);
+        assert_eq!(sites.get("example.com"), Some(&2));
+        assert_eq!(sites.get("other.org"), Some(&1));
+
+        let years = facet_map(&resp, FIELD_YEAR);
+        assert_eq!(years.get("2021"), Some(&2));
+        assert_eq!(years.get("2023"), Some(&1));
+
+        let types = facet_map(&resp, FIELD_MEDIA_TYPE);
+        assert_eq!(types.get("html"), Some(&2));
+        assert_eq!(types.get("pdf"), Some(&1));
+
+        let colls = facet_map(&resp, FIELD_COLLECTION);
+        assert_eq!(colls.get("demo"), Some(&2));
+        assert_eq!(colls.get("news"), Some(&1));
+
+        // Narrowing the query narrows the facet counts to the matching subset.
+        let resp = idx.search_faceted("shared domain:example.com", 10, 0).unwrap();
+        assert_eq!(resp.total_hits, 2);
+        assert_eq!(facet_map(&resp, FIELD_YEAR).get("2021"), Some(&2));
+        assert!(facet_map(&resp, FIELD_YEAR).get("2023").is_none(), "2023 filtered out");
+    }
+
+    #[test]
+    fn pagination_offsets_and_reports_total() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        for i in 0..25 {
+            let url = format!("https://ex.com/{i:02}");
+            idx.index_page(&Page {
+                url: &url, title: "T", body: "shared", collection_id: "c1", collection_name: "C1",
+                ..Default::default()
+            }).unwrap();
+        }
+        idx.commit().unwrap();
+
+        let p1 = idx.search_faceted("shared", 20, 0).unwrap();
+        assert_eq!(p1.total_hits, 25, "total counts all matches, not just the page");
+        assert_eq!(p1.results.len(), 20, "first page is full");
+
+        let p2 = idx.search_faceted("shared", 20, 20).unwrap();
+        assert_eq!(p2.total_hits, 25);
+        assert_eq!(p2.results.len(), 5, "second page holds the remainder");
+
+        // No overlap between the two pages.
+        let urls1: std::collections::HashSet<_> = p1.results.iter().map(|r| &r.url).collect();
+        assert!(p2.results.iter().all(|r| !urls1.contains(&r.url)), "pages must not overlap");
     }
 
     #[test]

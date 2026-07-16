@@ -146,16 +146,32 @@ pub struct SearchResultRow {
     pub coll_display: String,
 }
 
-/// The search results page: top bar, tips, a count line, and the results table.
-pub fn search_results(query: &str, count: usize, rows: &[SearchResultRow]) -> Markup {
+/// Pagination state for the results page: the current 1-based page, the total
+/// number of pages, and the total match count (across all pages).
+pub struct PageNav {
+    pub page: usize,
+    pub total_pages: usize,
+    pub total_hits: usize,
+    /// The URL-encoded query, so page links can preserve it.
+    pub query_encoded: String,
+}
+
+/// The search results page: top bar, tips, a count line, the results table, and
+/// prev/next pagination.
+pub fn search_results(query: &str, nav: &PageNav, rows: &[SearchResultRow]) -> Markup {
+    // Preserve the query when linking to another page.
+    let page_href = |p: usize| format!("/search?q={}&page={}", nav.query_encoded, p);
     let body = html! {
         (top_bar(Some(query)))
         (search_tips())
         div.count {
-            @if count == 0 {
+            @if nav.total_hits == 0 {
                 "No results for " em { (query) }
             } @else {
-                (count) " result" @if count != 1 { "s" } " for " em { (query) }
+                (nav.total_hits) " result" @if nav.total_hits != 1 { "s" } " for " em { (query) }
+                @if nav.total_pages > 1 {
+                    " · page " (nav.page) " of " (nav.total_pages)
+                }
             }
         }
         @if !rows.is_empty() {
@@ -187,6 +203,21 @@ pub fn search_results(query: &str, count: usize, rows: &[SearchResultRow]) -> Ma
                             }
                         }
                     }
+                }
+            }
+        }
+        @if nav.total_pages > 1 {
+            nav.pagination {
+                @if nav.page > 1 {
+                    a.page-prev href=(page_href(nav.page - 1)) { "← Previous" }
+                } @else {
+                    span.page-prev.disabled { "← Previous" }
+                }
+                span.page-info { "Page " (nav.page) " of " (nav.total_pages) }
+                @if nav.page < nav.total_pages {
+                    a.page-next href=(page_href(nav.page + 1)) { "Next →" }
+                } @else {
+                    span.page-next.disabled { "Next →" }
                 }
             }
         }
