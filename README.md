@@ -21,7 +21,12 @@ as a [reading room] for web archives. Point it at a pile of local or remote
 - **In-browser replay** of the archived pages via [ReplayWeb.page] / wabac.js
 
 It ships as a single self-contained binary - no Solr, no Elasticsearch, no
-separate database server.
+separate database server. That's a deliberate design goal: rustyweb is built for
+**small, local, and private** use - a person indexing a handful of their own
+WACZ files on a laptop, with nothing sent to a hosted service - while using the
+same model to **scale up** toward institutional collections. It aims to fit both
+ends of that range, rather than assuming the infrastructure of a large web
+archive.
 
 > **The web archive replay is entirely [Webrecorder]'s work.** rustyweb bundles
 > and serves [ReplayWeb.page] and [wabac.js] - the browser-side engine that does
@@ -44,7 +49,9 @@ expanded, with citations, in [DESIGN.md](DESIGN.md)):
   of repeat captures of the same URL - the faceted, full-text "slice and dice"
   browsing that [SHINE] (UK Web Archive) and [SolrWayback] (Royal Danish Library)
   established over the [warc-indexer]. rustyweb owes both a clear debt; it just
-  trades their Solr backend for a single embedded Tantivy index.
+  trades their Solr backend for a single embedded Tantivy index - so the same
+  faceted search runs with no cluster to operate, fitting a private laptop
+  archive as readily as an institutional one.
 - **Provenance is part of the record** - to trust and interpret an archive you
   need to know how it was made: the crawler software, operator, dates, and seeds
   (Maemura et al., *If These Crawls Could Talk*). rustyweb reads this from the

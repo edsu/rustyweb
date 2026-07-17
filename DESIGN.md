@@ -2,6 +2,8 @@
 
 rustyweb is a minimal, high-performance web archive server written in Rust. It provides full-text search over WACZ collections and serves them for in-browser replay via the ReplayWebPage/wabac.js service worker in **WACZ-direct mode** - the mode where the browser reads the archive directly, without a server-side proxy interpreting individual resource requests.
 
+A guiding design goal is **range**: rustyweb should serve small, local, and private use - an individual indexing a handful of their own WACZ files on a laptop, with nothing sent to a hosted service - and use the same model to scale up toward institutional collections. Peer tools like SHINE and SolrWayback assume the infrastructure of a large web archive (a Solr cluster); rustyweb deliberately does not, so it fits both ends of that range. This is why it ships as one binary with an embedded index, and why the two-level collection model (below) is built to serve both a solo curator and an institution reorganizing TBs of WARC.
+
 Scope:
 - Index WACZ files into a local full-text search index
 - Serve WACZ files with byte-range support so wabac.js can read them directly
@@ -237,7 +239,8 @@ behind it; the *Planned* subsection at the end lists what is deliberately not bu
   warc-indexer, offer facets for content-type, domain, crawl year, links, and public suffix.
   Facets are the established answer to a growing, unwieldy list. rustyweb follows this
   lineage directly — SolrWayback pairs the same faceted full-text search with in-browser
-  replay — but swaps their Solr backend for a single embedded Tantivy index.
+  replay — but swaps their Solr backend for a single embedded Tantivy index, so the same
+  faceted search fits a private laptop archive as readily as an institutional one.
 - **Provenance is essential and usually buried.** Maemura, Worby, Milligan & Becker, *If
   These Crawls Could Talk* (JASIST 2018): to trust and interpret an archive you must be able
   to evaluate its provenance, scope, and absences (curatorial intent, seeds/scope, crawler
