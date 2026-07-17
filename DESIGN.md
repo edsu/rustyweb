@@ -57,7 +57,7 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index          [--home <DIR>] [--name <NAME>] [--collection <NAME>] <PATH|URL>...
+rustyweb index          [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] <PATH|URL>...
 rustyweb reindex        [--home <DIR>]
 rustyweb serve          [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set [--home <DIR>] <COLLECTION> <WACZ_ID>...
@@ -72,7 +72,7 @@ index + the JSON manifest, see *Collection Management*). Keeping them together
 makes a home folder portable - move it to another disk or machine and it still
 resolves.
 
-- `index`: indexes one or more `.wacz` files or `http(s)://` URLs (downloaded to a temp file for indexing) - at least one argument is required. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
+- `index`: indexes one or more `.wacz` files or `http(s)://` URLs (downloaded to a temp file for indexing) - at least one argument is required. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. `--from-file <FILE>` (or `-f -` for stdin) reads a newline-delimited list of files/URLs, ignoring blank lines and `#` comments, and combines with any positional args. (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
 - `reindex`: rebuild the full-text index from the sources already recorded in the manifest, preserving collection membership and metadata. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. Missing local files are skipped with a warning. This is the intended way to migrate the index after a schema change (see below).
 - `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
 - `collection set` / `collection list`: reassign WACZs to a collection (by WACZ id) / list collections and their members. Metadata like description and curator is edited in `collections.json` directly.
