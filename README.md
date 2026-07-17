@@ -2,30 +2,61 @@
 
 **Note bene**: *rustyweb is alpha software and has been written extensively
 with the support of Claude Code. Like any piece of software it may contain
-bugs, and while the software was designed through several iterations and
-abandoned prototypes, the developer's understanding of how it operates at a low
-level may be limited. See the [DESIGN.md](DESIGN.md) document for the overall
-approach that was used. Technical reviews of the code and design are always
-welcome!*
+bugs. The developer's understanding of how it operates at a low level may be
+limited. See the [DESIGN.md](DESIGN.md) document for the overall design
+principles. Technical reviews of the code and design are always welcome!*
 
 ---
 
-**rustyweb** is a small, fast web archive server written in Rust. Point it at a
-pile of [WACZ] files and it gives you:
+**rustyweb** is a small, fast web archive server written in Rust. Think of it
+as a [reading room] for web archives. Point it at a pile of local or remote
+[WACZ] files and it gives you:
 
-- **Full-text search** across the archived pages, with hit-highlighted snippets
-- **A homepage** that surfaces each collection's metadata (title, description,
-  crawl date, seed pages)
+- **Full-text search with faceted, temporal browsing** - hit-highlighted
+  snippets, then narrow by collection, site, date, type, or language, with a
+  timeline for navigating through time
+- **Provenance up front** - see how each crawl was made (software, operator,
+  dates, seeds, page counts) and verify each WACZ's fixity, instead of taking
+  the archive on faith
 - **In-browser replay** of the archived pages via [ReplayWeb.page] / wabac.js
 
 It ships as a single self-contained binary - no Solr, no Elasticsearch, no
-separate database server.
+separate database server. That's a deliberate design goal: rustyweb is built for
+**small, local, and private** use - a person indexing a handful of their own
+WACZ files on a laptop, with nothing sent to a hosted service - while using the
+same model to **scale up** toward institutional collections. It aims to fit both
+ends of that range, rather than assuming the infrastructure of a large web
+archive.
 
 > **The web archive replay is entirely [Webrecorder]'s work.** rustyweb bundles
 > and serves [ReplayWeb.page] and [wabac.js] - the browser-side engine that does
 > all the actual replay - and adds a thin Rust layer for indexing, search, and
 > serving. Webrecorder did the heavy lifting; please support them. See
 > [Credits](#credits).
+
+## Discovery and provenance
+
+The "reading room" idea is that you should be able to *find* things in an
+archive and *understand* what you're looking at - not just replay a URL you
+already know. Two findings from web-archiving research shape rustyweb (both
+expanded, with citations, in [DESIGN.md](DESIGN.md)):
+
+- **Web-archive use is mostly navigational and temporal** - seeing a page or
+  site as it was, or how it changed over time (Costa & Silva's query-log study
+  of the Portuguese Web Archive). So time is a first-class axis, and facets beat
+  one long scrolling list as an archive grows. rustyweb has a faceted results
+  page (collection, site, date, type, language), a month timeline, and grouping
+  of repeat captures of the same URL - the faceted, full-text "slice and dice"
+  browsing that [SHINE] (UK Web Archive) and [SolrWayback] (Royal Danish Library)
+  established over the [warc-indexer]. rustyweb owes both a clear debt; it just
+  trades their Solr backend for a single embedded Tantivy index - so the same
+  faceted search runs with no cluster to operate, fitting a private laptop
+  archive as readily as an institutional one.
+- **Provenance is part of the record** - to trust and interpret an archive you
+  need to know how it was made: the crawler software, operator, dates, and seeds
+  (Maemura et al., *If These Crawls Could Talk*). rustyweb reads this from the
+  WACZ and WARC and surfaces it on each collection and WACZ - and lets you
+  verify each file's fixity - rather than burying it.
 
 ## Install
 
@@ -161,21 +192,31 @@ tips" panel in the app itself):
 - **Quotes** search an exact phrase: `"climate policy"`.
 - **Field search**: `title:climate` matches only the title; `domain:example.com`
   restricts to pages from that exact host; `year:2021` (or `year:[2020 TO 2023]`)
-  filters by crawl year; `type:pdf` and `lang:en` filter by media type and
-  language.
+  and `month:202103` (or `month:[202101 TO 202106]`) filter by crawl date;
+  `type:pdf`, `lang:en`, and `collection:demo` filter by media type, language,
+  and collection.
 - **Grouping and boosting**: `(climate OR weather) risk`, and `climate^2 change`
   ranks "climate" matches higher.
 
 Title matches rank above body matches, and searches are case-insensitive.
 
+The results page is faceted: a sidebar shows counts by collection, year, site,
+type, and language, and clicking one refines the search (applied filters appear
+as removable chips). A month timeline sits above the results — click a bar to
+filter to that month. Repeat captures of the same URL collapse into a single
+result marked "captured N times", and results are paginated. The homepage also
+offers "browse by year" and "top sites" entry points into search.
+
 ## Command line
 
 ```
-rustyweb index      [--home <DIR>] [--name <NAME>] <PATH|URL>...
-rustyweb reindex    [--home <DIR>]
-rustyweb serve      [--home <DIR>] [--bind <ADDR>]
-rustyweb search-url [--home <DIR>] <URL>
-rustyweb verify     [--home <DIR>]
+rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] <PATH|URL>...
+rustyweb reindex         [--home <DIR>]
+rustyweb serve           [--home <DIR>] [--bind <ADDR>]
+rustyweb collection set  [--home <DIR>] <COLLECTION> <WACZ_ID>...
+rustyweb collection list [--home <DIR>]
+rustyweb search-url      [--home <DIR>] <URL>
+rustyweb verify          [--home <DIR>]
 ```
 
 Every command takes `--home <DIR>` (default `.`); `archive/` and `index/` are
@@ -188,15 +229,19 @@ derived siblings under it.
   Index several with a shell glob: `rustyweb index archive/*.wacz`. Extracts
   searchable text from each page (HTML, Browsertrix's rendered `urn:text`
   records, and PDFs), reads `datapackage.json` for collection metadata, and
-  records everything in `<home>/index/collections.json`, including the SHA-256 of
-  each WACZ. Local WACZ paths are stored relative to home so the folder is
-  portable. The collection name comes from `--name` if given, otherwise the
-  WACZ's `datapackage.json` title, otherwise the filename.
-- **`reindex`** - rebuild the search index from the collections already in
-  `collections.json`, preserving their names. Re-fetches remote URL sources and
-  recreates the index from scratch, so it's the way to migrate after an upgrade
-  changes the searchable fields. (If you try to `index` or `serve` against an
-  index built by an older version, rustyweb tells you to run this.)
+  records everything in the manifest under `<home>/index/`, including the SHA-256
+  of each WACZ. Local WACZ paths are stored relative to home so the folder is
+  portable. The WACZ name comes from `--name` if given, otherwise the WACZ's
+  `datapackage.json` title, otherwise the filename. `--collection <NAME>` groups
+  the WACZs into a curated collection (created if new); without it each WACZ is
+  its own collection.
+- **`collection`** - `collection list` shows collections and their members;
+  `collection set <COLLECTION> <WACZ_ID>...` moves WACZs into a collection.
+- **`reindex`** - rebuild the search index from the WACZs already in the
+  manifest, preserving collection membership and metadata. Re-fetches remote URL
+  sources and recreates the index from scratch, so it's the way to migrate after
+  an upgrade changes the index schema. (If you try to `index` or `serve` against
+  an index built by an older version, rustyweb tells you to run this.)
 - **`serve`** - opens the index read-only and starts the HTTP server (so you can
   `index` while it runs). Defaults to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and
@@ -285,3 +330,7 @@ wabac.js components it bundles. See [LICENSE](LICENSE) for the full text and
 [Karl Dubost]: https://www.la-grange.net/karl/
 [1000ans]: https://www.24joursdeweb.fr/2012/un-site-web-de-1000-ans/
 [wabac.js]: https://github.com/webrecorder/wabac.js
+[reading room]: https://inkdroid.org/2026/06/03/jan6-doj-archive/
+[SHINE]: https://github.com/ukwa/shine
+[SolrWayback]: https://github.com/netarchivesuite/solrwayback
+[warc-indexer]: https://github.com/ukwa/webarchive-discovery

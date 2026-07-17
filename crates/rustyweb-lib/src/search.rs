@@ -1,9 +1,14 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tantivy::collector::TopDocs;
+use tantivy::aggregation::agg_req::Aggregations;
+use tantivy::aggregation::{AggContextParams, AggregationCollector};
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
-use tantivy::schema::{Schema, Value, INDEXED, STORED, STRING, TEXT};
+use tantivy::schema::{
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED, STRING,
+    TEXT,
+};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
@@ -24,6 +29,9 @@ const FIELD_DESCRIPTION: &str = "description";
 const FIELD_HEADINGS: &str = "headings";
 /// Four-digit crawl year (from the page timestamp), for `year:` filtering.
 const FIELD_YEAR: &str = "year";
+/// Six-digit crawl month `YYYYMM` (from the page timestamp), for `month:`
+/// filtering/range and the results timeline.
+const FIELD_MONTH: &str = "month";
 /// Coarse media type of the page: `html` or `pdf`, for `type:` filtering.
 const FIELD_MEDIA_TYPE: &str = "type";
 /// Primary language subtag from `<html lang>` (e.g. `en`), for `lang:` filtering.
@@ -33,6 +41,14 @@ const FIELD_COLLECTION: &str = "collection";
 
 /// How much more a title match counts than a body/url match when ranking.
 const TITLE_BOOST: tantivy::Score = 3.0;
+/// Upper bound on captures scanned per query for URL grouping (field collapsing
+/// has no native Tantivy support, so we group over the top-scored window). When
+/// a query matches more captures than this, grouping and `total_hits` cover only
+/// the top `CANDIDATE_CAP` and [`SearchResponse::capped`] is set. Two cost
+/// notes: every query reads this many stored docs (to read each candidate's URL
+/// for grouping), and facet/timeline counts are unaffected by this bound — they
+/// come from the aggregation, which is exact over the full match set.
+const CANDIDATE_CAP: usize = 1000;
 /// Headings rank above body text but below the title.
 const HEADINGS_BOOST: tantivy::Score = 2.0;
 
@@ -120,9 +136,13 @@ impl SearchIndex {
         // URL's words tokenized so they're searchable as ordinary terms.
         doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), domain_of(page.url));
         doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), url_search_text(page.url));
-        // Numeric year for range filtering; omitted when there's no usable date.
+        // Numeric year/month for range filtering and the timeline; omitted when
+        // there's no usable date.
         if let Some(year) = year_of(page.timestamp) {
             doc.add_u64(schema.get_field(FIELD_YEAR).unwrap(), year);
+        }
+        if let Some(month) = month_of(page.timestamp) {
+            doc.add_u64(schema.get_field(FIELD_MONTH).unwrap(), month);
         }
         doc.add_text(schema.get_field(FIELD_MEDIA_TYPE).unwrap(), page.media_type);
         doc.add_text(schema.get_field(FIELD_LANG).unwrap(), primary_lang(page.lang));
@@ -165,7 +185,36 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Facet counts across the whole archive (a match-all query), for homepage
+    /// browse entry points. Runs only the aggregation — no result fetching or
+    /// URL grouping — so it is cheap.
+    pub fn facet_overview(&self) -> Result<Vec<FacetGroup>> {
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let agg_collector =
+            AggregationCollector::from_aggs(facet_aggregations(), AggContextParams::default());
+        let agg_results = searcher.search(&tantivy::query::AllQuery, &agg_collector)?;
+        let agg_json = serde_json::to_value(&agg_results).unwrap_or_default();
+        Ok(facets_from_aggregations(&agg_json))
+    }
+
+    /// Search the top `limit` results by relevance. A thin wrapper over
+    /// [`search_faceted`](Self::search_faceted) that returns only the hits (no
+    /// facet counts, no pagination); kept for callers that don't need them.
     pub fn search(&self, query_str: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        Ok(self.search_faceted(query_str, limit, 0)?.results)
+    }
+
+    /// Search with facet counts and pagination. Returns one page of results
+    /// (`limit` hits starting at `offset`), the total number of matches, and
+    /// facet buckets (counts per value) for each facet dimension, all computed
+    /// from the same query in a single pass.
+    pub fn search_faceted(
+        &self,
+        query_str: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SearchResponse> {
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
         let schema = self.index.schema();
@@ -178,9 +227,9 @@ impl SearchIndex {
         let url_f = schema.get_field(FIELD_URL).unwrap();
         let ts_f = schema.get_field(FIELD_TS).unwrap();
         let domain_f = schema.get_field(FIELD_DOMAIN).unwrap();
-        let url_tokens_f = schema.get_field(FIELD_URL_TOKENS).unwrap();
         let description_f = schema.get_field(FIELD_DESCRIPTION).unwrap();
         let headings_f = schema.get_field(FIELD_HEADINGS).unwrap();
+        let url_tokens_f = schema.get_field(FIELD_URL_TOKENS).unwrap();
         let collection_f = schema.get_field(FIELD_COLLECTION).unwrap();
 
         // Bare words search the title, headings, body, description, and URL
@@ -200,17 +249,52 @@ impl SearchIndex {
         // a best-effort query instead of a hard error, so the search box never
         // 500s while someone is experimenting with syntax.
         let (query, _errors) = query_parser.parse_query_lenient(query_str);
-        let collector = TopDocs::with_limit(limit).order_by_score();
-        let top_docs = searcher.search(&query, &collector)?;
 
+        // One pass over the query: a bounded window of top-scored captures (for
+        // grouping), the total capture count, and the facet counts (a terms
+        // aggregation per dimension over the fast fields).
+        let top_collector = TopDocs::with_limit(CANDIDATE_CAP).order_by_score();
+        let agg_collector = AggregationCollector::from_aggs(facet_aggregations(), AggContextParams::default());
+        let (candidates, total_captures, agg_results) =
+            searcher.search(&query, &(top_collector, Count, agg_collector))?;
+
+        // Collapse repeat captures of the same URL: walking the candidates in
+        // score order, the first (best-ranked) capture of a URL becomes the
+        // result and later captures just bump its count. Collection-level docs
+        // and any capture with no URL are never merged. Grouping is over the
+        // top `CANDIDATE_CAP` captures, so `capped` flags when more matched.
+        struct Group {
+            addr: tantivy::DocAddress,
+            captures: usize,
+        }
+        let mut groups: Vec<Group> = Vec::new();
+        let mut by_url: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (_score, addr) in &candidates {
+            let doc: TantivyDocument = searcher.doc(*addr)?;
+            let url = get_text(&doc, url_f);
+            let is_page = get_text(&doc, doc_type_f) == "page";
+            if is_page && !url.is_empty() {
+                if let Some(&gi) = by_url.get(&url) {
+                    groups[gi].captures += 1;
+                    continue;
+                }
+                by_url.insert(url, groups.len());
+            }
+            groups.push(Group { addr: *addr, captures: 1 });
+        }
+        let total_hits = groups.len();
+        let capped = total_captures > CANDIDATE_CAP;
+
+        // Generate snippets only for the requested page of groups (snippet
+        // generation re-analyzes text, so we defer it past grouping).
         let mut snippet_gen = SnippetGenerator::create(&searcher, &query, body_f)?;
         // Tantivy's default snippet window is 150 chars; widen it for more
         // context around the matched terms in search results.
         snippet_gen.set_max_num_chars(350);
 
-        let mut results = Vec::with_capacity(top_docs.len());
-        for (_score, addr) in top_docs {
-            let doc: TantivyDocument = searcher.doc(addr)?;
+        let mut results = Vec::new();
+        for g in groups.iter().skip(offset).take(limit) {
+            let doc: TantivyDocument = searcher.doc(g.addr)?;
             let snippet = snippet_gen.snippet_from_doc(&doc);
             results.push(SearchResult {
                 doc_type: get_text(&doc, doc_type_f),
@@ -223,10 +307,24 @@ impl SearchIndex {
                 title: get_text(&doc, title_f),
                 description: get_text(&doc, description_f),
                 snippet: snippet.to_html(),
+                capture_count: g.captures,
             });
         }
 
-        Ok(results)
+        // Facets and the timeline are aggregation-derived: they count *captures*
+        // and are *exact* over the whole match set. total_hits counts *distinct
+        // URLs* and is bounded by CANDIDATE_CAP. So a facet's count is generally
+        // higher than the number of grouped results it would yield — the two
+        // measure different things on purpose. Serialize the aggregation once
+        // and reuse it for both extractors.
+        let agg_json = serde_json::to_value(&agg_results).unwrap_or_default();
+        Ok(SearchResponse {
+            total_hits,
+            capped,
+            results,
+            facets: facets_from_aggregations(&agg_json),
+            timeline: timeline_from_aggregations(&agg_json),
+        })
     }
 }
 
@@ -269,6 +367,185 @@ pub struct SearchResult {
     /// Page description (`<meta description>` / og:description), if any.
     pub description: String,
     pub snippet: String,
+    /// How many captures of this URL matched (1 when there are no repeats). The
+    /// result shown is the best-ranked capture; the rest are collapsed into it.
+    pub capture_count: usize,
+}
+
+/// One page of search results plus the facet counts and total match count for
+/// the whole query (not just this page).
+#[derive(Debug, Clone)]
+pub struct SearchResponse {
+    /// Total number of distinct results (URLs grouped) across all pages.
+    pub total_hits: usize,
+    /// Whether more captures matched than were scanned for grouping, so
+    /// `total_hits` is a floor and deep pages may be incomplete.
+    pub capped: bool,
+    /// The requested page of results.
+    pub results: Vec<SearchResult>,
+    /// Facet counts per dimension, in display order.
+    pub facets: Vec<FacetGroup>,
+    /// Result counts per crawl month, oldest first (the results timeline).
+    pub timeline: Vec<TimelineBucket>,
+}
+
+/// One month's slice of the results timeline.
+#[derive(Debug, Clone)]
+pub struct TimelineBucket {
+    /// Crawl month as `YYYYMM` (e.g. `202503`).
+    pub ym: u64,
+    pub count: u64,
+}
+
+/// The counts for one facet dimension (e.g. "Site"), highest count first.
+#[derive(Debug, Clone)]
+pub struct FacetGroup {
+    /// The index field name (e.g. `domain`), used to build `field:value` refine links.
+    pub field: String,
+    /// Human label for the dimension (e.g. `Site`).
+    pub label: String,
+    pub buckets: Vec<FacetBucket>,
+}
+
+/// One value within a facet dimension and how many results carry it.
+#[derive(Debug, Clone)]
+pub struct FacetBucket {
+    pub value: String,
+    pub count: u64,
+}
+
+/// The sidebar facet dimensions, in display order: `(index field, label)`. The
+/// index field name doubles as the `field:value` filter name (e.g. `domain:`),
+/// so a facet value links straight to a refine query.
+const FACET_DIMENSIONS: [(&str, &str); 5] = [
+    (FIELD_COLLECTION, "Collection"),
+    (FIELD_YEAR, "Year"),
+    (FIELD_DOMAIN, "Site"),
+    (FIELD_MEDIA_TYPE, "Type"),
+    (FIELD_LANG, "Language"),
+];
+
+/// Whether `field` can be used as a `field:value` filter: a sidebar facet
+/// dimension or the `month` timeline field. The single source of truth the
+/// server uses to recognize active filters, so the two can't drift.
+pub fn is_filter_field(field: &str) -> bool {
+    field == FIELD_MONTH || FACET_DIMENSIONS.iter().any(|(f, _)| *f == field)
+}
+
+/// The human label for a filterable field (for active-filter chips), sharing
+/// the facet labels above so they stay in sync.
+pub fn filter_label(field: &str) -> &'static str {
+    if field == FIELD_MONTH {
+        return "Month";
+    }
+    FACET_DIMENSIONS
+        .iter()
+        .find(|(f, _)| *f == field)
+        .map(|(_, label)| *label)
+        .unwrap_or("Filter")
+}
+
+/// Max buckets requested per facet dimension. A dimension with more distinct
+/// values (e.g. many hosts under `domain`) is silently truncated to its top
+/// `FACET_SIZE` by count — the sidebar shows only the busiest values, and the
+/// terms result's `sum_other_doc_count` (the rest) is discarded.
+const FACET_SIZE: u32 = 50;
+
+/// Max month buckets for the timeline (~10 years); older months beyond this are
+/// dropped from the histogram.
+const TIMELINE_SIZE: u32 = 120;
+
+/// Build the terms-aggregation request: one bucket set per facet dimension plus
+/// a month bucket set for the timeline. Deserialized from JSON because
+/// [`Aggregations`] is a serde type and the JSON form is far more legible than
+/// the nested builder structs.
+fn facet_aggregations() -> Aggregations {
+    let mut req = serde_json::Map::new();
+    for (field, _label) in FACET_DIMENSIONS {
+        req.insert(
+            field.to_string(),
+            serde_json::json!({ "terms": { "field": field, "size": FACET_SIZE } }),
+        );
+    }
+    req.insert(
+        FIELD_MONTH.to_string(),
+        serde_json::json!({ "terms": { "field": FIELD_MONTH, "size": TIMELINE_SIZE } }),
+    );
+    // The request is well-formed by construction, so this never fails.
+    serde_json::from_value(serde_json::Value::Object(req))
+        .expect("facet aggregation request is valid")
+}
+
+/// Extract the month buckets from the aggregation results as a timeline sorted
+/// oldest-first. Terms aggregations sort by count, so we re-sort chronologically.
+fn timeline_from_aggregations(value: &serde_json::Value) -> Vec<TimelineBucket> {
+    let Some(buckets) = value.get(FIELD_MONTH).and_then(|d| d.get("buckets")).and_then(|b| b.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<TimelineBucket> = buckets
+        .iter()
+        .filter_map(|b| {
+            let count = b.get("doc_count")?.as_u64()?;
+            let ym = b.get("key")?.as_f64()? as u64;
+            (ym > 0).then_some(TimelineBucket { ym, count })
+        })
+        .collect();
+    out.sort_by_key(|t| t.ym);
+    out
+}
+
+/// Convert Tantivy's aggregation results into ordered [`FacetGroup`]s. Empty
+/// values (e.g. the blank domain/lang of collection-level docs) are dropped.
+/// `value` is the aggregation results already serialized to JSON (the terms
+/// result is `{buckets:[{key,doc_count}]}`, simpler to read than the internal
+/// bucket enums). Serializing once and passing it in avoids re-serializing for
+/// the timeline.
+fn facets_from_aggregations(value: &serde_json::Value) -> Vec<FacetGroup> {
+    let mut groups = Vec::new();
+    for (field, label) in FACET_DIMENSIONS {
+        let Some(buckets) = value.get(field).and_then(|d| d.get("buckets")).and_then(|b| b.as_array())
+        else {
+            continue;
+        };
+        let items: Vec<FacetBucket> = buckets
+            .iter()
+            .filter_map(|b| {
+                let count = b.get("doc_count")?.as_u64()?;
+                let value = match b.get("key")? {
+                    serde_json::Value::String(s) => s.clone(),
+                    // Numeric keys (year) come back as floats; show them as ints.
+                    serde_json::Value::Number(n) => (n.as_f64()? as i64).to_string(),
+                    _ => return None,
+                };
+                (!value.is_empty()).then_some(FacetBucket { value, count })
+            })
+            .collect();
+        if !items.is_empty() {
+            groups.push(FacetGroup {
+                field: field.to_string(),
+                label: label.to_string(),
+                buckets: items,
+            });
+        }
+    }
+    groups
+}
+
+/// A string field that is indexed as a single raw token (like [`STRING`]),
+/// stored, **and** kept as a fast (columnar) field so it can back a terms
+/// aggregation for facet counts. The `raw` tokenizer keeps the whole value as
+/// one term, so a facet bucket is the exact field value (e.g. one `domain:`
+/// host), not individual words.
+fn facet_string() -> TextOptions {
+    TextOptions::default()
+        .set_stored()
+        .set_fast(Some("raw"))
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
+        )
 }
 
 fn build_schema() -> Schema {
@@ -276,8 +553,8 @@ fn build_schema() -> Schema {
     builder.add_text_field(FIELD_DOC_TYPE, STRING | STORED);
     builder.add_text_field(FIELD_COLLECTION_ID, STRING | STORED);
     builder.add_text_field(FIELD_COLLECTION_NAME, STRING | STORED);
-    // Curated collection id (slug), for `collection:` filtering.
-    builder.add_text_field(FIELD_COLLECTION, STRING | STORED);
+    // Curated collection id (slug), for `collection:` filtering and faceting.
+    builder.add_text_field(FIELD_COLLECTION, facet_string());
     builder.add_text_field(FIELD_URL, STRING | STORED);
     builder.add_text_field(FIELD_TS, STRING | STORED);
     builder.add_text_field(FIELD_TITLE, TEXT | STORED);
@@ -286,15 +563,19 @@ fn build_schema() -> Schema {
     builder.add_text_field(FIELD_DESCRIPTION, TEXT | STORED);
     // Headings are indexed (and boosted at query time) but not stored.
     builder.add_text_field(FIELD_HEADINGS, TEXT);
-    // Exact host, stored so results can show it: matched only by `domain:host`.
-    builder.add_text_field(FIELD_DOMAIN, STRING | STORED);
+    // Exact host: matched by `domain:host`, and faceted (the "Site" facet).
+    builder.add_text_field(FIELD_DOMAIN, facet_string());
     // Tokenized URL words; indexed for search but not stored (we keep the URL).
     builder.add_text_field(FIELD_URL_TOKENS, TEXT);
-    // Numeric crawl year, indexed for `year:2021` and `year:[2020 TO 2023]`.
-    builder.add_u64_field(FIELD_YEAR, INDEXED | STORED);
-    // Coarse media type (`html`/`pdf`) and page language, for exact filtering.
-    builder.add_text_field(FIELD_MEDIA_TYPE, STRING | STORED);
-    builder.add_text_field(FIELD_LANG, STRING | STORED);
+    // Numeric crawl year: indexed for `year:2021` / `year:[2020 TO 2023]`, and
+    // fast so it can back the year facet.
+    builder.add_u64_field(FIELD_YEAR, INDEXED | STORED | FAST);
+    // Numeric crawl month `YYYYMM`: indexed for `month:202103` /
+    // `month:[202101 TO 202106]`, fast so it backs the results timeline.
+    builder.add_u64_field(FIELD_MONTH, INDEXED | STORED | FAST);
+    // Coarse media type (`html`/`pdf`) and page language, for filtering + facets.
+    builder.add_text_field(FIELD_MEDIA_TYPE, facet_string());
+    builder.add_text_field(FIELD_LANG, facet_string());
     builder.build()
 }
 
@@ -314,6 +595,15 @@ fn primary_lang(lang: &str) -> String {
 fn year_of(timestamp: &str) -> Option<u64> {
     let year: u64 = timestamp.get(..4)?.parse().ok()?;
     (1000..=9999).contains(&year).then_some(year)
+}
+
+/// The six-digit crawl month `YYYYMM` parsed from a 14-digit page timestamp
+/// (`20210417...` -> `202104`). `None` when the year or month is implausible.
+fn month_of(timestamp: &str) -> Option<u64> {
+    let s = timestamp.get(..6)?;
+    let year: u64 = s.get(..4)?.parse().ok()?;
+    let month: u64 = s.get(4..6)?.parse().ok()?;
+    ((1000..=9999).contains(&year) && (1..=12).contains(&month)).then_some(year * 100 + month)
 }
 
 /// The exact host of a URL, lowercased (e.g. `https://Example.com/a` -> `example.com`).
@@ -783,6 +1073,152 @@ mod tests {
         let r = idx.search("shared year:2019", 10).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].url, "https://ex.com/2019");
+    }
+
+    /// Look up one facet dimension's buckets as a value->count map.
+    fn facet_map(resp: &SearchResponse, field: &str) -> std::collections::HashMap<String, u64> {
+        resp.facets
+            .iter()
+            .find(|g| g.field == field)
+            .map(|g| g.buckets.iter().map(|b| (b.value.clone(), b.count)).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn facet_counts_reflect_the_query() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        // Three "shared" pages: two on example.com (2021 html), one on other.org
+        // (2023 pdf), spread across two collections.
+        idx.index_page(&Page {
+            url: "https://example.com/a", title: "A", body: "shared", timestamp: "20210101000000",
+            media_type: "html", lang: "en-US", collection: "demo", collection_id: "w1", collection_name: "W1",
+            ..Default::default()
+        }).unwrap();
+        idx.index_page(&Page {
+            url: "https://example.com/b", title: "B", body: "shared", timestamp: "20210601000000",
+            media_type: "html", lang: "en", collection: "demo", collection_id: "w1", collection_name: "W1",
+            ..Default::default()
+        }).unwrap();
+        idx.index_page(&Page {
+            url: "https://other.org/c", title: "C", body: "shared", timestamp: "20230101000000",
+            media_type: "pdf", lang: "fr", collection: "news", collection_id: "w2", collection_name: "W2",
+            ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        let resp = idx.search_faceted("shared", 10, 0).unwrap();
+        assert_eq!(resp.total_hits, 3);
+
+        let sites = facet_map(&resp, FIELD_DOMAIN);
+        assert_eq!(sites.get("example.com"), Some(&2));
+        assert_eq!(sites.get("other.org"), Some(&1));
+
+        let years = facet_map(&resp, FIELD_YEAR);
+        assert_eq!(years.get("2021"), Some(&2));
+        assert_eq!(years.get("2023"), Some(&1));
+
+        let types = facet_map(&resp, FIELD_MEDIA_TYPE);
+        assert_eq!(types.get("html"), Some(&2));
+        assert_eq!(types.get("pdf"), Some(&1));
+
+        let colls = facet_map(&resp, FIELD_COLLECTION);
+        assert_eq!(colls.get("demo"), Some(&2));
+        assert_eq!(colls.get("news"), Some(&1));
+
+        // Narrowing the query narrows the facet counts to the matching subset.
+        let resp = idx.search_faceted("shared domain:example.com", 10, 0).unwrap();
+        assert_eq!(resp.total_hits, 2);
+        assert_eq!(facet_map(&resp, FIELD_YEAR).get("2021"), Some(&2));
+        assert!(facet_map(&resp, FIELD_YEAR).get("2023").is_none(), "2023 filtered out");
+    }
+
+    #[test]
+    fn repeat_captures_of_a_url_are_grouped() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        // The same URL captured three times (different crawls), plus a distinct URL.
+        for ts in ["20210101000000", "20220101000000", "20230101000000"] {
+            idx.index_page(&Page {
+                url: "https://ex.com/a", title: "A", body: "shared",
+                timestamp: ts, collection_id: "c1", collection_name: "C1", ..Default::default()
+            }).unwrap();
+        }
+        idx.index_page(&Page {
+            url: "https://ex.com/b", title: "B", body: "shared",
+            collection_id: "c1", collection_name: "C1", ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        let resp = idx.search_faceted("shared", 10, 0).unwrap();
+        // Two distinct results, not four captures.
+        assert_eq!(resp.total_hits, 2);
+        assert!(!resp.capped);
+        let a = resp.results.iter().find(|r| r.url == "https://ex.com/a").unwrap();
+        assert_eq!(a.capture_count, 3, "three captures of /a collapse into one result");
+        let b = resp.results.iter().find(|r| r.url == "https://ex.com/b").unwrap();
+        assert_eq!(b.capture_count, 1);
+    }
+
+    #[test]
+    fn month_of_parses_year_and_month() {
+        assert_eq!(month_of("20210417120000"), Some(202104));
+        assert_eq!(month_of("202412"), Some(202412));
+        assert_eq!(month_of("20211320"), None, "month 13 is invalid");
+        assert_eq!(month_of("2021"), None, "too short for a month");
+        assert_eq!(month_of(""), None);
+    }
+
+    #[test]
+    fn timeline_is_chronological_and_counts_months() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        // Two captures in 2021-03, one in 2021-01, one in 2023-07 (distinct URLs
+        // so month counts aren't affected by URL grouping).
+        for (url, ts) in [
+            ("https://ex.com/1", "20210301000000"),
+            ("https://ex.com/2", "20210315000000"),
+            ("https://ex.com/3", "20210101000000"),
+            ("https://ex.com/4", "20230701000000"),
+        ] {
+            idx.index_page(&page_ts(url, ts)).unwrap();
+        }
+        idx.commit().unwrap();
+
+        let resp = idx.search_faceted("shared", 10, 0).unwrap();
+        let tl: Vec<(u64, u64)> = resp.timeline.iter().map(|t| (t.ym, t.count)).collect();
+        // Oldest first, one bucket per distinct month, with correct counts.
+        assert_eq!(tl, vec![(202101, 1), (202103, 2), (202307, 1)]);
+
+        // Filtering by month narrows to that month only.
+        let resp = idx.search_faceted("shared month:202103", 10, 0).unwrap();
+        assert_eq!(resp.total_hits, 2);
+    }
+
+    #[test]
+    fn pagination_offsets_and_reports_total() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        for i in 0..25 {
+            let url = format!("https://ex.com/{i:02}");
+            idx.index_page(&Page {
+                url: &url, title: "T", body: "shared", collection_id: "c1", collection_name: "C1",
+                ..Default::default()
+            }).unwrap();
+        }
+        idx.commit().unwrap();
+
+        let p1 = idx.search_faceted("shared", 20, 0).unwrap();
+        assert_eq!(p1.total_hits, 25, "total counts all matches, not just the page");
+        assert_eq!(p1.results.len(), 20, "first page is full");
+
+        let p2 = idx.search_faceted("shared", 20, 20).unwrap();
+        assert_eq!(p2.total_hits, 25);
+        assert_eq!(p2.results.len(), 5, "second page holds the remainder");
+
+        // No overlap between the two pages.
+        let urls1: std::collections::HashSet<_> = p1.results.iter().map(|r| &r.url).collect();
+        assert!(p2.results.iter().all(|r| !urls1.contains(&r.url)), "pages must not overlap");
     }
 
     #[test]

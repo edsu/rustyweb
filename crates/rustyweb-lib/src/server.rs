@@ -136,14 +136,100 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         })
         .collect();
 
-    views::home(&cards).into_response()
+    // Browse entry points: years (most recent first) and the busiest sites,
+    // each a search link. Derived from an archive-wide facet overview.
+    let overview = state.search.facet_overview().unwrap_or_default();
+    let browse = views::HomeBrowse {
+        years: browse_links(&overview, "year", "year", 12, true),
+        sites: browse_links(&overview, "domain", "domain", 8, false),
+    };
+
+    views::home(&cards, &browse).into_response()
+}
+
+/// Build homepage browse links from one facet dimension: `field` is the facet
+/// group to read, `query_field` the `field:value` used in the search link.
+/// `by_value_desc` sorts by the value (e.g. year, newest first) instead of by
+/// count; `max` caps how many are shown.
+fn browse_links(
+    overview: &[crate::search::FacetGroup],
+    field: &str,
+    query_field: &str,
+    max: usize,
+    by_value_desc: bool,
+) -> Vec<views::BrowseLink> {
+    let Some(group) = overview.iter().find(|g| g.field == field) else {
+        return Vec::new();
+    };
+    let mut buckets: Vec<&crate::search::FacetBucket> = group.buckets.iter().collect();
+    if by_value_desc {
+        buckets.sort_by(|a, b| b.value.cmp(&a.value));
+    }
+    buckets
+        .into_iter()
+        .take(max)
+        .map(|b| views::BrowseLink {
+            label: b.value.clone(),
+            count: b.count,
+            href: format!("/search?q={}", url_encode(&format!("{query_field}:{}", b.value))),
+        })
+        .collect()
 }
 
 // ── Search results page ───────────────────────────────────────────────────────
 
+/// Search results per page.
+const PAGE_SIZE: usize = 20;
+
+/// Format a `YYYYMM` month as `YYYY-MM` for display.
+fn format_ym(ym: u64) -> String {
+    format!("{:04}-{:02}", ym / 100, ym % 100)
+}
+
+/// The active `field:value` facet filters present in a query, in order. Only
+/// single-token filters are recognized: a range like `month:[202101 TO 202106]`
+/// is a valid query but splits into several whitespace tokens, so it does not
+/// appear as a removable chip. Filter fields come from `search::is_filter_field`
+/// so this stays in sync with the facet dimensions.
+fn active_filters(q: &str) -> Vec<(String, String)> {
+    q.split_whitespace()
+        .filter_map(|tok| {
+            let (f, v) = tok.split_once(':')?;
+            (crate::search::is_filter_field(f) && !v.is_empty())
+                .then(|| (f.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Add a `field:value` filter to a query, leaving the rest (including quoted
+/// phrases) untouched. A no-op if that exact filter is already present.
+fn query_with_filter(q: &str, field: &str, value: &str) -> String {
+    let token = format!("{field}:{value}");
+    let base = q.trim();
+    if base.split_whitespace().any(|t| t == token) {
+        return base.to_string();
+    }
+    if base.is_empty() {
+        token
+    } else {
+        format!("{base} {token}")
+    }
+}
+
+/// Remove a `field:value` filter from a query (all occurrences of that token).
+fn query_without_filter(q: &str, field: &str, value: &str) -> String {
+    let token = format!("{field}:{value}");
+    q.split_whitespace()
+        .filter(|t| *t != token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Deserialize)]
 struct SearchPageParams {
     q: String,
+    /// 1-based page number; absent/`<1` means the first page.
+    page: Option<usize>,
 }
 
 async fn search_page(
@@ -160,10 +246,13 @@ async fn search_page(
             .into_response();
     }
 
-    let results = match state.search.search(&q, 20) {
+    let page = params.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * PAGE_SIZE;
+    let response = match state.search.search_faceted(&q, PAGE_SIZE, offset) {
         Ok(r) => r,
         Err(e) => return error_response(e).into_response(),
     };
+    let results = &response.results;
 
     // Map each WACZ id to the wabac `source` to use: /files/{id} for a local
     // WACZ, or the remote URL directly for an http source.
@@ -242,11 +331,85 @@ async fn search_page(
                 snippet_html,
                 coll_href,
                 coll_display,
+                capture_count: r.capture_count,
             }
         })
         .collect();
 
-    views::search_results(&q, results.len(), &rows).into_response()
+    let total_pages = response.total_hits.div_ceil(PAGE_SIZE).max(1);
+    let page_nav = views::PageNav {
+        page,
+        total_pages,
+        total_hits: response.total_hits,
+        capped: response.capped,
+        query_encoded: url_encode(&q),
+    };
+
+    // Facet sidebar: clickable buckets that add/remove a `field:value` filter,
+    // plus chips for the filters already active in the query. Refining resets
+    // to page 1.
+    let filters = active_filters(&q);
+    let search_href = |new_q: &str| format!("/search?q={}", url_encode(new_q));
+    let active: Vec<views::ActiveFilter> = filters
+        .iter()
+        .map(|(f, v)| views::ActiveFilter {
+            label: crate::search::filter_label(f).to_string(),
+            value: v.clone(),
+            remove_href: search_href(&query_without_filter(&q, f, v)),
+        })
+        .collect();
+    let groups: Vec<views::FacetGroupView> = response
+        .facets
+        .iter()
+        .map(|g| views::FacetGroupView {
+            label: g.label.clone(),
+            items: g
+                .buckets
+                .iter()
+                .map(|b| {
+                    let is_active = filters.iter().any(|(f, v)| f == &g.field && v == &b.value);
+                    let new_q = if is_active {
+                        query_without_filter(&q, &g.field, &b.value)
+                    } else {
+                        query_with_filter(&q, &g.field, &b.value)
+                    };
+                    views::FacetItem {
+                        value: b.value.clone(),
+                        count: b.count,
+                        href: search_href(&new_q),
+                        active: is_active,
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    let sidebar = views::FacetSidebar { active, groups };
+
+    // Timeline: one clickable bar per crawl month, oldest first, height scaled
+    // to the busiest month. Clicking toggles a `month:YYYYMM` filter.
+    let max_count = response.timeline.iter().map(|t| t.count).max().unwrap_or(1).max(1);
+    let timeline: Vec<views::TimelineBar> = response
+        .timeline
+        .iter()
+        .map(|t| {
+            let month = t.ym.to_string();
+            let is_active = filters.iter().any(|(f, v)| f == "month" && v == &month);
+            let new_q = if is_active {
+                query_without_filter(&q, "month", &month)
+            } else {
+                query_with_filter(&q, "month", &month)
+            };
+            views::TimelineBar {
+                label: format_ym(t.ym),
+                count: t.count,
+                pct: (t.count as f64 / max_count as f64 * 100.0).round() as u32,
+                href: search_href(&new_q),
+                active: is_active,
+            }
+        })
+        .collect();
+
+    views::search_results(&q, &page_nav, &sidebar, &timeline, &rows).into_response()
 }
 
 // ── Collection detail page ──────────────────────────────────────────────────
@@ -500,10 +663,12 @@ async fn search_api(
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(20).min(200);
-    match state.search.search(&params.q, limit) {
-        Ok(results) => {
+    match state.search.search_faceted(&params.q, limit, 0) {
+        Ok(response) => {
             let body = serde_json::json!({
-                "results": results.iter().map(|r| serde_json::json!({
+                "total": response.total_hits,
+                "capped": response.capped,
+                "results": response.results.iter().map(|r| serde_json::json!({
                     "doc_type": r.doc_type,
                     "url": r.url,
                     "domain": r.domain,
@@ -513,7 +678,16 @@ async fn search_api(
                     "collection_name": r.collection_name,
                     "collection": r.collection,
                     "snippet": r.snippet,
-                })).collect::<Vec<_>>()
+                    "capture_count": r.capture_count,
+                })).collect::<Vec<_>>(),
+                "facets": response.facets.iter().map(|g| serde_json::json!({
+                    "field": g.field,
+                    "label": g.label,
+                    "buckets": g.buckets.iter().map(|b| serde_json::json!({
+                        "value": b.value,
+                        "count": b.count,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
             });
             (StatusCode::OK, axum::Json(body)).into_response()
         }
@@ -745,5 +919,53 @@ fn format_timestamp(ts: &str) -> String {
         )
     } else {
         ts.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_filters_extracts_facet_tokens_only() {
+        // Free text and non-facet `field:` tokens are ignored.
+        let f = active_filters("climate type:pdf domain:example.com title:foo");
+        assert_eq!(
+            f,
+            vec![
+                ("type".to_string(), "pdf".to_string()),
+                ("domain".to_string(), "example.com".to_string()),
+            ]
+        );
+        assert!(active_filters("just some words").is_empty());
+    }
+
+    #[test]
+    fn query_with_filter_appends_once() {
+        assert_eq!(query_with_filter("climate", "type", "pdf"), "climate type:pdf");
+        // Idempotent: already-present filter is not duplicated.
+        assert_eq!(query_with_filter("climate type:pdf", "type", "pdf"), "climate type:pdf");
+        // Empty base query yields just the filter.
+        assert_eq!(query_with_filter("  ", "year", "2021"), "year:2021");
+    }
+
+    #[test]
+    fn query_without_filter_removes_that_token() {
+        assert_eq!(query_without_filter("climate type:pdf", "type", "pdf"), "climate");
+        // Leaves other filters and free text intact.
+        assert_eq!(
+            query_without_filter("climate type:pdf domain:ex.com", "type", "pdf"),
+            "climate domain:ex.com"
+        );
+        // Removing an absent filter is a no-op (modulo whitespace normalization).
+        assert_eq!(query_without_filter("climate", "type", "pdf"), "climate");
+    }
+
+    #[test]
+    fn toggling_a_filter_round_trips() {
+        let q = "coral reef";
+        let added = query_with_filter(q, "collection", "coralreef-gov");
+        assert_eq!(added, "coral reef collection:coralreef-gov");
+        assert_eq!(query_without_filter(&added, "collection", "coralreef-gov"), "coral reef");
     }
 }
