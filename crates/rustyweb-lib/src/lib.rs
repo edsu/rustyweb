@@ -1,4 +1,5 @@
 pub mod collections;
+pub mod http_range;
 pub mod index;
 pub mod pdf;
 pub mod search;

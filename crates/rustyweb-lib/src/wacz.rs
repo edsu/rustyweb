@@ -39,8 +39,15 @@ pub struct CdxjRecord {
 pub fn read_datapackage(wacz_path: &Path) -> Result<WaczMetadata> {
     let file = std::fs::File::open(wacz_path)
         .with_context(|| format!("opening WACZ {}", wacz_path.display()))?;
-    let mut zip = zip::ZipArchive::new(file)
-        .with_context(|| format!("reading ZIP {}", wacz_path.display()))?;
+    read_datapackage_from(file)
+}
+
+/// Read `datapackage.json` + `pages/pages.jsonl` metadata from any `Read + Seek`
+/// WACZ — a local file, or an HTTP range reader for streaming indexing.
+pub(crate) fn read_datapackage_from<R: std::io::Read + std::io::Seek>(
+    reader: R,
+) -> Result<WaczMetadata> {
+    let mut zip = zip::ZipArchive::new(reader).context("reading WACZ ZIP")?;
 
     // --- datapackage.json -------------------------------------------------
     // Descriptive fields live at the top level in some WACZs and under a

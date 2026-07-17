@@ -253,15 +253,21 @@ fn index_one(
     // Extract via the CDX (streaming) instead of scanning every WARC record.
     stream: bool,
 ) -> Result<()> {
-    // A URL is downloaded to a temp file for indexing; the temp file is kept
-    // alive (`_tmp`) for the duration of this function. File sources are
-    // resolved against home (relative sources live under it).
-    let (local, _tmp): (PathBuf, Option<tempfile::NamedTempFile>) = match source {
-        Source::File(_) => (source.resolve(home).unwrap(), None),
+    // A remote URL with --stream is indexed directly over HTTP range requests
+    // (no download); its `remote_url` is set and `local` stays None. Otherwise
+    // resolve to a local file (a File source in place, or a URL downloaded to a
+    // temp file kept alive as `_tmp`).
+    let remote_url: Option<&str> = match source {
+        Source::Url(u) if stream => Some(u),
+        _ => None,
+    };
+    let (local, _tmp): (Option<PathBuf>, Option<tempfile::NamedTempFile>) = match source {
+        _ if remote_url.is_some() => (None, None),
+        Source::File(_) => (Some(source.resolve(home).unwrap()), None),
         Source::Url(u) => {
             info!(url = %u, "downloading remote WACZ for indexing");
             let tmp = download_to_temp(u).with_context(|| format!("downloading {u}"))?;
-            (tmp.path().to_path_buf(), Some(tmp))
+            (Some(tmp.path().to_path_buf()), Some(tmp))
         }
     };
 
@@ -270,7 +276,11 @@ fn index_one(
     // Read metadata from the WACZ datapackage.json up front so its title can
     // name the collection. Precedence: explicit --name, then the WACZ title,
     // then the filename/URL stem.
-    let meta = read_datapackage(&local).unwrap_or_default();
+    let meta = match remote_url {
+        Some(u) => crate::wacz::read_datapackage_from(crate::http_range::open_remote(u)?)
+            .unwrap_or_default(),
+        None => read_datapackage(local.as_ref().unwrap()).unwrap_or_default(),
+    };
     let display_name = name
         .map(|n| n.to_string())
         .or_else(|| meta.title.clone().filter(|t| !t.trim().is_empty()))
@@ -290,12 +300,19 @@ fn index_one(
     // pass also collects provenance and capture stats (no re-read of the WARCs).
     // `--stream` uses CDX-guided extraction over the file; the default scans
     // every WARC record.
-    let stats = if stream {
-        let file = std::fs::File::open(&local)
-            .with_context(|| format!("opening {} for streaming index", local.display()))?;
-        index_wacz_streaming(file, &id, &display_name, &collection_id, search, &local.display().to_string())?
-    } else {
-        index_wacz(&local, &id, &display_name, &collection_id, search)?
+    let stats = match remote_url {
+        Some(u) => {
+            info!(url = %u, "streaming remote WACZ index (no download)");
+            let reader = crate::http_range::open_remote(u)?;
+            index_wacz_streaming(reader, &id, &display_name, &collection_id, search, u)?
+        }
+        None if stream => {
+            let p = local.as_ref().unwrap();
+            let file = std::fs::File::open(p)
+                .with_context(|| format!("opening {} for streaming index", p.display()))?;
+            index_wacz_streaming(file, &id, &display_name, &collection_id, search, &p.display().to_string())?
+        }
+        None => index_wacz(local.as_ref().unwrap(), &id, &display_name, &collection_id, search)?,
     };
 
     // Index the WACZ's metadata as a searchable document, tagged with its collection.
@@ -305,9 +322,18 @@ fn index_one(
         .unwrap()
         .index_collection(&id, &display_name, &collection_id, &coll_body)?;
 
-    let sha = file_sha256(&local)
-        .with_context(|| format!("computing sha256 of {}", local.display()))?;
-    let file_size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+    // Fixity: a streamed remote is never fully read, so there's no whole-file
+    // SHA-256 (empty; `verify` already skips remote sources). Its size comes
+    // from the HTTP Content-Length. A local/downloaded file is hashed as before.
+    let (sha, file_size) = match remote_url {
+        Some(u) => (String::new(), crate::http_range::open_remote(u)?.total_len()),
+        None => {
+            let p = local.as_ref().unwrap();
+            let sha = file_sha256(p).with_context(|| format!("computing sha256 of {}", p.display()))?;
+            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            (sha, size)
+        }
+    };
     let date_indexed = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     // Provenance: collect the software reported by the datapackage and by the
