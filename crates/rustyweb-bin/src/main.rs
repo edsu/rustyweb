@@ -85,6 +85,11 @@ enum Commands {
         /// WACZ is its own collection.
         #[arg(long)]
         collection: Option<String>,
+
+        /// Index via the WACZ's CDX index (reading only page records) instead of
+        /// scanning every WARC record. Faster on media-heavy archives.
+        #[arg(long)]
+        stream: bool,
     },
     /// Start the replay web server.
     Serve {
@@ -195,7 +200,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index { paths, from_file, home, name, collection } => {
+        Commands::Index { paths, from_file, home, name, collection, stream } => {
             // Sources come from the positional args plus, optionally, a
             // newline-delimited list from a file or stdin.
             let mut locations = paths;
@@ -239,6 +244,7 @@ async fn main() -> Result<()> {
                     &home,
                     name.as_deref(),
                     collection.as_deref(),
+                    stream,
                 );
                 drop(quiet);
                 result?;

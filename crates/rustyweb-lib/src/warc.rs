@@ -108,8 +108,6 @@ pub fn parse_warc_fields(bytes: &[u8]) -> Vec<(String, String)> {
 /// indexing, which gunzips a single record slice located via the CDX offset and
 /// parses it without touching the rest of the WARC. `offset`/`record_length`
 /// are informational (carried onto each record for provenance).
-// Wired into the CDX-guided extractor next (streaming-index .1); allow until then.
-#[allow(dead_code)]
 pub(crate) fn parse_warc_records(data: &[u8], offset: u64, record_length: u64) -> Vec<Result<WarcRecord>> {
     let mut out = Vec::new();
     parse_all_warc_records_from(data, offset, record_length, &mut out);

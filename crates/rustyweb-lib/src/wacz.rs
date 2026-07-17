@@ -181,7 +181,9 @@ pub fn search_cdx(wacz_path: &Path, url: &str) -> Result<Vec<CdxjRecord>> {
     Ok(results)
 }
 
-fn find_cdx_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<Option<String>> {
+fn find_cdx_entry<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Option<String>> {
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
         let name = entry.name().to_string();
@@ -189,6 +191,110 @@ fn find_cdx_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<Option<Str
             && (name.ends_with(".cdx.gz") || name.ends_with(".cdx"))
         {
             return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// The basename of a slash-separated path (`archive/x.warc.gz` -> `x.warc.gz`).
+fn basename(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// Read and parse **all** CDX records from a WACZ ZIP (any `Read + Seek`), for
+/// CDX-guided/streaming indexing. Unlike [`search_cdx`], no URL filter.
+pub(crate) fn cdx_records<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Vec<CdxjRecord>> {
+    let Some(cdx_name) = find_cdx_entry(zip)? else {
+        return Ok(Vec::new());
+    };
+    let mut raw = Vec::new();
+    zip.by_name(&cdx_name)?.read_to_end(&mut raw)?;
+    let text = if cdx_name.ends_with(".gz") {
+        let mut out = String::new();
+        flate2::read::GzDecoder::new(raw.as_slice()).read_to_string(&mut out)?;
+        out
+    } else {
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+    Ok(text
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            (!l.is_empty()).then(|| parse_cdx_line(l)).flatten()
+        })
+        .collect())
+}
+
+/// Error unless every embedded WARC is `Stored` (uncompressed). CDX-guided
+/// streaming needs this: a CDX byte offset maps to an absolute WACZ position
+/// only when the WARC isn't ZIP-compressed. Browsertrix / py-wacz store WARCs
+/// uncompressed (they're already gzipped); some tools deflate them, and those
+/// can't be streamed (fall back to scan / `--download`).
+pub(crate) fn ensure_warcs_stored<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<()> {
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i)?;
+        let name = entry.name();
+        let is_warc =
+            name.starts_with("archive/") && (name.ends_with(".warc.gz") || name.ends_with(".warc"));
+        if is_warc && entry.compression() != zip::CompressionMethod::Stored {
+            anyhow::bail!(
+                "WACZ stores its WARC entries compressed (deflate); CDX-guided \
+                 streaming needs uncompressed (stored) WARCs. Index without --stream \
+                 (scan mode), or use --download."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Map each embedded WARC's basename to the absolute byte offset of its data
+/// within the WACZ (`ZipFile::data_start`). Since WARCs are stored uncompressed,
+/// a CDX record at `offset` lives at `data_start + offset` in the WACZ.
+pub(crate) fn warc_data_starts<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<std::collections::HashMap<String, u64>> {
+    let mut map = std::collections::HashMap::new();
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i)?;
+        let name = entry.name().to_string();
+        if name.starts_with("archive/") && (name.ends_with(".warc.gz") || name.ends_with(".warc")) {
+            map.insert(basename(&name).to_string(), entry.data_start());
+        }
+    }
+    Ok(map)
+}
+
+/// Find the crawl's `warcinfo` by decoding the first gzip member of each
+/// embedded WARC (warcinfo is the first record) and parsing it — so streaming
+/// indexing gets provenance without reading whole WARCs. Returns the first
+/// non-empty warcinfo found.
+pub(crate) fn find_warcinfo_streaming<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Option<crate::warc::Warcinfo>> {
+    let names: Vec<String> = (0..zip.len())
+        .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
+        .filter(|n| n.starts_with("archive/") && (n.ends_with(".warc.gz") || n.ends_with(".warc")))
+        .collect();
+    for name in names {
+        let mut decoded = Vec::new();
+        // read::GzDecoder decodes only the first member, which is enough.
+        if flate2::read::GzDecoder::new(zip.by_name(&name)?)
+            .read_to_end(&mut decoded)
+            .is_err()
+            || decoded.is_empty()
+        {
+            continue;
+        }
+        for rec in crate::warc::parse_warc_records(&decoded, 0, 0).into_iter().flatten() {
+            if let Some(info) = crate::warc::Warcinfo::from_record(&rec) {
+                if !info.is_empty() {
+                    return Ok(Some(info));
+                }
+            }
         }
     }
     Ok(None)
@@ -323,14 +429,12 @@ pub fn extract_warc_from_wacz(
 /// `data_start`). Gunzips just that slice and parses it, so CDX-guided/streaming
 /// indexing can pull one record without reading the rest of the WARC. Returns
 /// the record(s) in the member (usually one).
-// Wired into the CDX-guided extractor next (streaming-index .1); allow until then.
-#[allow(dead_code)]
 pub(crate) fn record_at<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     offset: u64,
     length: u64,
 ) -> Result<Vec<crate::warc::WarcRecord>> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Read, SeekFrom};
     reader
         .seek(SeekFrom::Start(offset))
         .with_context(|| format!("seeking to offset {offset}"))?;

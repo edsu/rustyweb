@@ -22,7 +22,7 @@ pub fn archive_dir(home: &Path) -> PathBuf {
 /// Index a local WACZ file (which must live under `<home>/archive`) under the
 /// given home dir. Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
-    index_location(&path.to_string_lossy(), home, name, None)
+    index_location(&path.to_string_lossy(), home, name, None, false)
 }
 
 /// Index a WACZ from a location into the home directory's `index/`. The location
@@ -43,6 +43,8 @@ pub fn index_location(
     home: &Path,
     name: Option<&str>,
     collection: Option<&str>,
+    // Extract via the CDX (streaming) instead of scanning every WARC record.
+    stream: bool,
 ) -> Result<()> {
     // Validate the argument first (a bad path errors before we touch the index).
     let sources = resolve_sources(location, home)?;
@@ -63,7 +65,7 @@ pub fn index_location(
 
     for source in &sources {
         let c = group.as_ref().map(|(id, n)| (id.as_str(), n.as_str()));
-        index_one(source, home, &mut manifest, &search, name, c)?;
+        index_one(source, home, &mut manifest, &search, name, c, stream)?;
     }
 
     search.into_inner().unwrap().commit()?;
@@ -144,6 +146,7 @@ pub fn reindex(home: &Path) -> Result<()> {
             &search,
             Some(name),
             Some((collection_id, collection_name)),
+            false,
         )
         .with_context(|| {
             format!(
@@ -247,6 +250,8 @@ fn index_one(
     // The collection (id, display name) this WACZ joins. `None` makes the WACZ
     // its own singleton collection (id == WACZ id, name == WACZ name).
     collection: Option<(&str, &str)>,
+    // Extract via the CDX (streaming) instead of scanning every WARC record.
+    stream: bool,
 ) -> Result<()> {
     // A URL is downloaded to a temp file for indexing; the temp file is kept
     // alive (`_tmp`) for the duration of this function. File sources are
@@ -283,7 +288,15 @@ fn index_one(
 
     // Index pages, tagging each with this WACZ (id/name) and its collection. The
     // pass also collects provenance and capture stats (no re-read of the WARCs).
-    let stats = index_wacz(&local, &id, &display_name, &collection_id, search)?;
+    // `--stream` uses CDX-guided extraction over the file; the default scans
+    // every WARC record.
+    let stats = if stream {
+        let file = std::fs::File::open(&local)
+            .with_context(|| format!("opening {} for streaming index", local.display()))?;
+        index_wacz_streaming(file, &id, &display_name, &collection_id, search, &local.display().to_string())?
+    } else {
+        index_wacz(&local, &id, &display_name, &collection_id, search)?
+    };
 
     // Index the WACZ's metadata as a searchable document, tagged with its collection.
     let coll_body = build_collection_body(&meta);
@@ -423,7 +436,7 @@ struct MergedPage {
 
 /// Provenance and capture stats gathered during one WACZ indexing pass, so the
 /// manifest can record them without re-reading the WARCs.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct CrawlStats {
     pages: u64,
     earliest_capture: Option<String>,
@@ -459,14 +472,49 @@ fn index_wacz(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Merge all records into one entry per URL, keeping the first warcinfo found
-    // (warcinfo leads its WARC, so the first WARC's is the crawl-level record).
+    // Flatten to all records + the first warcinfo (warcinfo leads its WARC, so
+    // the first WARC's is the crawl-level record), then merge and index.
     let mut warcinfo: Option<Warcinfo> = None;
-    let mut pages: HashMap<String, MergedPage> = HashMap::new();
-    for (raws, wi) in per_warc {
+    let mut raws: Vec<RawRecord> = Vec::new();
+    for (r, wi) in per_warc {
         if warcinfo.is_none() {
             warcinfo = wi;
         }
+        raws.extend(r);
+    }
+    index_merged(raws, warcinfo, collection_id, collection_name, collection, search, &wacz_path.display().to_string())
+}
+
+/// Index a WACZ by CDX-guided/streaming extraction over a `Read + Seek` source
+/// (a local file or an HTTP range reader): read only the page-relevant records
+/// the CDX points at, rather than scanning every WARC record. Produces the same
+/// index as [`index_wacz`] (both share [`record_to_raw`] and [`index_merged`]).
+fn index_wacz_streaming<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    collection_id: &str,
+    collection_name: &str,
+    collection: &str,
+    search: &Mutex<SearchIndex>,
+    label: &str,
+) -> Result<CrawlStats> {
+    let (raws, warcinfo) = collect_page_records_via_cdx(reader)?;
+    index_merged(raws, warcinfo, collection_id, collection_name, collection, search, label)
+}
+
+/// Merge per-record contributions into one document per URL and index them.
+/// Shared by the scan-everything ([`index_wacz`]) and CDX-guided
+/// ([`index_wacz_streaming`]) paths.
+fn index_merged(
+    raws: Vec<RawRecord>,
+    warcinfo: Option<Warcinfo>,
+    collection_id: &str,
+    collection_name: &str,
+    collection: &str,
+    search: &Mutex<SearchIndex>,
+    label: &str,
+) -> Result<CrawlStats> {
+    let mut pages: HashMap<String, MergedPage> = HashMap::new();
+    {
         for raw in raws {
             match raw {
             RawRecord::Html { url, timestamp, title, body, description, headings, keywords, author, media_type, lang, status, modified_year } => {
@@ -567,7 +615,7 @@ fn index_wacz(
         }
     }
 
-    info!(pages = count, wacz = %wacz_path.display(), "indexed pages from WACZ");
+    info!(pages = count, wacz = %label, "indexed pages from WACZ");
     Ok(CrawlStats {
         pages: count,
         earliest_capture: earliest,
@@ -587,8 +635,8 @@ fn collect_page_records(warc_path: &Path) -> Result<(Vec<RawRecord>, Option<Warc
     let mut out = Vec::new();
     let mut warcinfo: Option<Warcinfo> = None;
     for record in &records {
-        // Capture the crawl's warcinfo (checked before the URI gate below, since
-        // warcinfo records carry no WARC-Target-URI).
+        // Capture the crawl's warcinfo (checked before the URI gate in
+        // record_to_raw, since warcinfo records carry no WARC-Target-URI).
         if warcinfo.is_none() {
             if let Some(info) = Warcinfo::from_record(record) {
                 if !info.is_empty() {
@@ -596,92 +644,127 @@ fn collect_page_records(warc_path: &Path) -> Result<(Vec<RawRecord>, Option<Warc
                 }
             }
         }
+        if let Some(raw) = record_to_raw(record) {
+            out.push(raw);
+        }
+    }
 
-        let uri = record.target_uri.as_str();
-        if uri.is_empty() || uri.starts_with("dns:") {
-            continue;
-        }
+    Ok((out, warcinfo))
+}
 
-        // Browsertrix stores fully rendered page text as a `urn:text:<url>`
-        // resource record (WARC-Type: resource, not response). Map it back to
-        // the real URL and use its plain-text payload as the body.
-        if let Some(real_url) = uri.strip_prefix("urn:text:") {
-            if record.payload.is_empty() {
-                continue;
-            }
-            let text = String::from_utf8_lossy(&record.payload).trim().to_string();
-            if text.is_empty() {
-                continue;
-            }
-            out.push(RawRecord::Text {
-                url: real_url.to_string(),
-                timestamp: record.timestamp.clone(),
-                text,
-            });
-            continue;
-        }
+/// CDX-guided extraction over a `Read + Seek` WACZ: read the CDX, fetch only the
+/// page-relevant records (HTML/PDF responses and `urn:text:` rendered text) by
+/// seeking to `data_start + offset`, and transform each with [`record_to_raw`].
+/// Images/JS/JSON/pageinfo/thumbnail captures are never fetched. Streaming
+/// indexes exactly what the CDX lists (authoritative for Browsertrix WACZs).
+fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
+    reader: R,
+) -> Result<(Vec<RawRecord>, Option<Warcinfo>)> {
+    use crate::wacz;
+    let mut zip = zip::ZipArchive::new(reader).context("opening WACZ ZIP")?;
+    wacz::ensure_warcs_stored(&mut zip)?;
+    let cdx = wacz::cdx_records(&mut zip)?;
+    let starts = wacz::warc_data_starts(&mut zip)?;
+    let warcinfo = wacz::find_warcinfo_streaming(&mut zip)?;
+    let mut reader = zip.into_inner();
 
-        // Skip other urn: pseudo-records (pageinfo, thumbnail, view, ...).
-        if uri.starts_with("urn:") {
+    let mut out = Vec::new();
+    for c in &cdx {
+        // Only fetch records that can become a page; skip media/pseudo-records.
+        let wanted =
+            c.url.starts_with("urn:text:") || c.mime.contains("html") || c.mime.contains("pdf");
+        if !wanted || c.length == 0 {
             continue;
         }
+        let base = c.filename.rsplit('/').next().unwrap_or(&c.filename);
+        let Some(&start) = starts.get(base) else {
+            continue;
+        };
+        match wacz::record_at(&mut reader, start + c.offset, c.length) {
+            Ok(records) => out.extend(records.iter().filter_map(record_to_raw)),
+            Err(e) => tracing::warn!(url = %c.url, "skipping unreadable CDX record: {e:#}"),
+        }
+    }
+    Ok((out, warcinfo))
+}
 
-        // HTML responses give us the title and a scraped-text fallback body.
-        if !record.warc_type.eq_ignore_ascii_case("response") {
-            continue;
-        }
-        let mime = record.content_type.to_ascii_lowercase();
+/// Transform one WARC record into an indexable [`RawRecord`], or `None` if it is
+/// not a page: warcinfo, `dns:`, other `urn:` pseudo-records (pageinfo,
+/// thumbnail, …), non-HTML/PDF responses, or empty payloads. Shared by the
+/// scan-everything path ([`collect_page_records`]) and the CDX-guided path
+/// ([`collect_page_records_via_cdx`]) so both index identically.
+fn record_to_raw(record: &WarcRecord) -> Option<RawRecord> {
+    let uri = record.target_uri.as_str();
+    if uri.is_empty() || uri.starts_with("dns:") {
+        return None;
+    }
 
-        // PDF responses: extract the text and index it as the page body, with a
-        // title derived from the URL's filename.
-        if mime.contains("pdf") {
-            if !record.payload.is_empty() {
-                if let Some(text) = crate::pdf::extract_pdf_text(&record.payload) {
-                    out.push(RawRecord::Html {
-                        url: uri.to_string(),
-                        timestamp: record.timestamp.clone(),
-                        title: pdf_title_from_url(uri),
-                        body: text,
-                        description: String::new(),
-                        headings: String::new(),
-                        keywords: String::new(),
-                        author: String::new(),
-                        media_type: "pdf".to_string(),
-                        lang: String::new(),
-                        status: record.http_status,
-                        modified_year: last_modified_year(&record.http_headers),
-                    });
-                } else {
-                    debug!(url = uri, "PDF text extraction yielded nothing; skipping");
-                }
-            }
-            continue;
+    // Browsertrix stores fully rendered page text as a `urn:text:<url>` resource
+    // record (WARC-Type: resource). Map it back to the real URL as the body.
+    if let Some(real_url) = uri.strip_prefix("urn:text:") {
+        let text = String::from_utf8_lossy(&record.payload).trim().to_string();
+        if text.is_empty() {
+            return None;
         }
+        return Some(RawRecord::Text {
+            url: real_url.to_string(),
+            timestamp: record.timestamp.clone(),
+            text,
+        });
+    }
 
-        if !mime.contains("html") || record.payload.is_empty() {
-            continue;
+    // Skip other urn: pseudo-records (pageinfo, thumbnail, view, …).
+    if uri.starts_with("urn:") || !record.warc_type.eq_ignore_ascii_case("response") {
+        return None;
+    }
+    let mime = record.content_type.to_ascii_lowercase();
+
+    // PDF responses: extract text as the body, title from the URL's filename.
+    if mime.contains("pdf") {
+        if record.payload.is_empty() {
+            return None;
         }
-        let html = extract_html_text(&record.payload);
-        if html.title.is_empty() && html.body.is_empty() && html.description.is_empty() {
-            continue;
-        }
-        out.push(RawRecord::Html {
+        let Some(text) = crate::pdf::extract_pdf_text(&record.payload) else {
+            debug!(url = uri, "PDF text extraction yielded nothing; skipping");
+            return None;
+        };
+        return Some(RawRecord::Html {
             url: uri.to_string(),
             timestamp: record.timestamp.clone(),
-            title: html.title,
-            body: html.body,
-            description: html.description,
-            headings: html.headings,
-            keywords: html.keywords,
-            author: html.author,
-            media_type: "html".to_string(),
-            lang: html.lang,
+            title: pdf_title_from_url(uri),
+            body: text,
+            description: String::new(),
+            headings: String::new(),
+            keywords: String::new(),
+            author: String::new(),
+            media_type: "pdf".to_string(),
+            lang: String::new(),
             status: record.http_status,
             modified_year: last_modified_year(&record.http_headers),
         });
     }
 
-    Ok((out, warcinfo))
+    if !mime.contains("html") || record.payload.is_empty() {
+        return None;
+    }
+    let html = extract_html_text(&record.payload);
+    if html.title.is_empty() && html.body.is_empty() && html.description.is_empty() {
+        return None;
+    }
+    Some(RawRecord::Html {
+        url: uri.to_string(),
+        timestamp: record.timestamp.clone(),
+        title: html.title,
+        body: html.body,
+        description: html.description,
+        headings: html.headings,
+        keywords: html.keywords,
+        author: html.author,
+        media_type: "html".to_string(),
+        lang: html.lang,
+        status: record.http_status,
+        modified_year: last_modified_year(&record.http_headers),
+    })
 }
 
 /// The year from an HTTP `Last-Modified` header, or `None` if the header is
@@ -727,6 +810,47 @@ fn file_display_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Index a fixture WACZ either by scanning (default) or CDX-guided streaming,
+    /// returning the page count for a parity comparison. (Per-record extraction
+    /// correctness is covered by `wacz::record_at` tests + the offset proof.)
+    fn indexed_page_count(fixture_name: &str, stream: bool) -> u64 {
+        use crate::search::SearchIndex;
+        let f = fixture(fixture_name);
+        let tmp = TempDir::new().unwrap();
+        let search = Mutex::new(SearchIndex::open(tmp.path()).unwrap());
+        let stats = if stream {
+            let file = std::fs::File::open(&f).unwrap();
+            index_wacz_streaming(file, "cid", "cname", "coll", &search, fixture_name).unwrap()
+        } else {
+            index_wacz(&f, "cid", "cname", "coll", &search).unwrap()
+        };
+        stats.pages
+    }
+
+    #[test]
+    fn streaming_matches_scan_on_a_stored_wacz() {
+        // a.wacz stores its WARCs uncompressed, so streaming can seek into them.
+        let scan = indexed_page_count("a.wacz", false);
+        let stream = indexed_page_count("a.wacz", true);
+        assert!(scan > 0, "fixture should index some pages");
+        assert_eq!(scan, stream, "CDX-guided streaming must index the same page count as scanning");
+    }
+
+    #[test]
+    fn streaming_refuses_a_deflated_wacz() {
+        use crate::search::SearchIndex;
+        // simple.wacz deflates its WARC entries, which streaming can't seek into.
+        let f = fixture("simple.wacz");
+        let tmp = TempDir::new().unwrap();
+        let search = Mutex::new(SearchIndex::open(tmp.path()).unwrap());
+        let file = std::fs::File::open(&f).unwrap();
+        let err = index_wacz_streaming(file, "cid", "cname", "coll", &search, "simple.wacz")
+            .unwrap_err()
+            .to_string()
+            .to_lowercase();
+        assert!(err.contains("stored") || err.contains("compress"), "unexpected error: {err}");
+    }
 
     #[test]
     fn last_modified_year_parses_http_date() {
@@ -825,7 +949,7 @@ mod tests {
         let dest = archive.join("simple.wacz");
         std::fs::copy(fixture("simple.wacz"), &dest).unwrap();
 
-        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project")).unwrap();
+        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project"), false).unwrap();
 
         let m = crate::collections::Manifest::open(&tmp.path().join("index")).unwrap();
         assert!(
