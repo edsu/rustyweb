@@ -210,7 +210,7 @@ offers "browse by year" and "top sites" entry points into search.
 ## Command line
 
 ```
-rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] <PATH|URL>...
+rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] <PATH|URL>...
 rustyweb reindex         [--home <DIR>]
 rustyweb serve           [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set  [--home <DIR>] <COLLECTION> <WACZ_ID>...
@@ -234,7 +234,9 @@ derived siblings under it.
   portable. The WACZ name comes from `--name` if given, otherwise the WACZ's
   `datapackage.json` title, otherwise the filename. `--collection <NAME>` groups
   the WACZs into a curated collection (created if new); without it each WACZ is
-  its own collection.
+  its own collection. To index many at once, pass a newline-delimited list of
+  files/URLs with `--from-file <FILE>` (or `-f -` to read from stdin); blank
+  lines and `#` comments are ignored, and it combines with any positional args.
 - **`collection`** - `collection list` shows collections and their members;
   `collection set <COLLECTION> <WACZ_ID>...` moves WACZs into a collection.
 - **`reindex`** - rebuild the search index from the WACZs already in the

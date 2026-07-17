@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::fmt::{
     format::{FormatEvent, Format, Writer},
@@ -63,9 +63,15 @@ struct Cli {
 enum Commands {
     /// Index one or more WACZ files (kept in <home>/archive) or http(s) URLs.
     Index {
-        /// WACZ files or http(s) URLs to index (at least one). A local WACZ must
-        /// live under <home>/archive; for several, glob it: `index archive/*.wacz`.
+        /// WACZ files or http(s) URLs to index. A local WACZ must live under
+        /// <home>/archive; for several, glob it: `index archive/*.wacz`. Provide
+        /// at least one here or via --from-file.
         paths: Vec<String>,
+
+        /// Read more WACZ files/URLs from a text file, one per line (blank lines
+        /// and lines starting with `#` are ignored). Use `-` to read from stdin.
+        #[arg(short = 'f', long = "from-file", value_name = "FILE")]
+        from_file: Option<String>,
 
         /// rustyweb home directory (holds archive/ and index/).
         #[arg(long, default_value = ".")]
@@ -145,6 +151,34 @@ enum CollectionCmd {
     },
 }
 
+/// Read a newline-delimited list of WACZ files/URLs from a file, or from stdin
+/// when `src` is `-`. Blank lines and `#` comment lines are skipped; each
+/// remaining line is trimmed.
+fn read_source_list(src: &str) -> Result<Vec<String>> {
+    let text = if src == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading WACZ list from stdin")?;
+        buf
+    } else {
+        std::fs::read_to_string(src)
+            .with_context(|| format!("reading WACZ list from {src}"))?
+    };
+    Ok(parse_source_lines(&text))
+}
+
+/// Parse a newline-delimited source list: trim each line, drop blank lines and
+/// `#` comments.
+fn parse_source_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -161,25 +195,33 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index { paths, home, name, collection } => {
+        Commands::Index { paths, from_file, home, name, collection } => {
+            // Sources come from the positional args plus, optionally, a
+            // newline-delimited list from a file or stdin.
+            let mut locations = paths;
+            if let Some(src) = &from_file {
+                locations.extend(read_source_list(src)?);
+            }
+
             // `index` no longer auto-scans <home>/archive; a bare invocation is
-            // almost always a mistake, so guide the user to the two things they
+            // almost always a mistake, so guide the user to the things they
             // probably meant instead.
-            if paths.is_empty() {
+            if locations.is_empty() {
                 eprintln!(
                     "index needs at least one WACZ file (kept in <home>/archive) or an\n\
                      http(s) URL. For example:\n\
                      \n\
-                     \x20 rustyweb index archive/site.wacz      index a local WACZ (must be in archive/)\n\
-                     \x20 rustyweb index archive/*.wacz         index several at once\n\
-                     \x20 rustyweb index https://ex.org/b.wacz  index a remote WACZ\n\
+                     \x20 rustyweb index archive/site.wacz          index a local WACZ (must be in archive/)\n\
+                     \x20 rustyweb index archive/*.wacz             index several at once\n\
+                     \x20 rustyweb index https://ex.org/b.wacz      index a remote WACZ\n\
+                     \x20 rustyweb index --from-file urls.txt       index a list from a file\n\
+                     \x20 cat urls.txt | rustyweb index -f -        index a list from stdin\n\
                      \n\
-                     To rebuild the existing index from collections.json (including\n\
+                     To rebuild the existing index from the manifest (including\n\
                      remote sources), use: rustyweb reindex"
                 );
                 std::process::exit(2);
             }
-            let locations = paths;
             let total = locations.len();
             for (i, location) in locations.iter().enumerate() {
                 tracing::info!(
@@ -395,4 +437,35 @@ fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_source_lines;
+
+    #[test]
+    fn parse_source_lines_skips_blanks_and_comments_and_trims() {
+        let text = "\
+# a list of WACZs
+archive/one.wacz
+
+  archive/two.wacz  
+https://ex.org/three.wacz
+   # indented comment
+";
+        assert_eq!(
+            parse_source_lines(text),
+            vec![
+                "archive/one.wacz".to_string(),
+                "archive/two.wacz".to_string(),
+                "https://ex.org/three.wacz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_source_lines_empty_input_yields_nothing() {
+        assert!(parse_source_lines("").is_empty());
+        assert!(parse_source_lines("# only a comment\n\n").is_empty());
+    }
 }
