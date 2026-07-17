@@ -181,35 +181,22 @@ fn browse_links(
 /// Search results per page.
 const PAGE_SIZE: usize = 20;
 
-/// The query fields that appear as facet filters (matching the facet dimensions
-/// in `search.rs`). A token `field:value` with one of these fields is treated
-/// as an active filter for the sidebar.
-const FILTER_FIELDS: [&str; 6] = ["collection", "year", "month", "domain", "type", "lang"];
-
-/// Human label for a facet field, for the active-filter chips.
-fn facet_label(field: &str) -> &'static str {
-    match field {
-        "collection" => "Collection",
-        "year" => "Year",
-        "month" => "Month",
-        "domain" => "Site",
-        "type" => "Type",
-        "lang" => "Language",
-        _ => "Filter",
-    }
-}
-
 /// Format a `YYYYMM` month as `YYYY-MM` for display.
 fn format_ym(ym: u64) -> String {
     format!("{:04}-{:02}", ym / 100, ym % 100)
 }
 
-/// The active `field:value` facet filters present in a query, in order.
+/// The active `field:value` facet filters present in a query, in order. Only
+/// single-token filters are recognized: a range like `month:[202101 TO 202106]`
+/// is a valid query but splits into several whitespace tokens, so it does not
+/// appear as a removable chip. Filter fields come from `search::is_filter_field`
+/// so this stays in sync with the facet dimensions.
 fn active_filters(q: &str) -> Vec<(String, String)> {
     q.split_whitespace()
         .filter_map(|tok| {
             let (f, v) = tok.split_once(':')?;
-            (FILTER_FIELDS.contains(&f) && !v.is_empty()).then(|| (f.to_string(), v.to_string()))
+            (crate::search::is_filter_field(f) && !v.is_empty())
+                .then(|| (f.to_string(), v.to_string()))
         })
         .collect()
 }
@@ -366,7 +353,7 @@ async fn search_page(
     let active: Vec<views::ActiveFilter> = filters
         .iter()
         .map(|(f, v)| views::ActiveFilter {
-            label: facet_label(f).to_string(),
+            label: crate::search::filter_label(f).to_string(),
             value: v.clone(),
             remove_href: search_href(&query_without_filter(&q, f, v)),
         })

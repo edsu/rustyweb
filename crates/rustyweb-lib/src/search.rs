@@ -43,8 +43,11 @@ const FIELD_COLLECTION: &str = "collection";
 const TITLE_BOOST: tantivy::Score = 3.0;
 /// Upper bound on captures scanned per query for URL grouping (field collapsing
 /// has no native Tantivy support, so we group over the top-scored window). When
-/// a query matches more captures than this, results are grouped over the top
-/// `CANDIDATE_CAP` only and [`SearchResponse::capped`] is set.
+/// a query matches more captures than this, grouping and `total_hits` cover only
+/// the top `CANDIDATE_CAP` and [`SearchResponse::capped`] is set. Two cost
+/// notes: every query reads this many stored docs (to read each candidate's URL
+/// for grouping), and facet/timeline counts are unaffected by this bound — they
+/// come from the aggregation, which is exact over the full match set.
 const CANDIDATE_CAP: usize = 1000;
 /// Headings rank above body text but below the title.
 const HEADINGS_BOOST: tantivy::Score = 2.0;
@@ -191,7 +194,8 @@ impl SearchIndex {
         let agg_collector =
             AggregationCollector::from_aggs(facet_aggregations(), AggContextParams::default());
         let agg_results = searcher.search(&tantivy::query::AllQuery, &agg_collector)?;
-        Ok(facets_from_aggregations(&agg_results))
+        let agg_json = serde_json::to_value(&agg_results).unwrap_or_default();
+        Ok(facets_from_aggregations(&agg_json))
     }
 
     /// Search the top `limit` results by relevance. A thin wrapper over
@@ -307,12 +311,19 @@ impl SearchIndex {
             });
         }
 
+        // Facets and the timeline are aggregation-derived: they count *captures*
+        // and are *exact* over the whole match set. total_hits counts *distinct
+        // URLs* and is bounded by CANDIDATE_CAP. So a facet's count is generally
+        // higher than the number of grouped results it would yield — the two
+        // measure different things on purpose. Serialize the aggregation once
+        // and reuse it for both extractors.
+        let agg_json = serde_json::to_value(&agg_results).unwrap_or_default();
         Ok(SearchResponse {
             total_hits,
             capped,
             results,
-            facets: facets_from_aggregations(&agg_results),
-            timeline: timeline_from_aggregations(&agg_results),
+            facets: facets_from_aggregations(&agg_json),
+            timeline: timeline_from_aggregations(&agg_json),
         })
     }
 }
@@ -403,22 +414,45 @@ pub struct FacetBucket {
     pub count: u64,
 }
 
-/// The facet dimensions, in display order: `(index field, query field, label)`.
-/// The query field is what a refine link uses in `field:value` syntax — it
-/// matches the index field for every dimension today, but is kept distinct so a
-/// dimension whose facet field differs from its filter field can be added later.
-const FACET_DIMENSIONS: [(&str, &str, &str); 5] = [
-    (FIELD_COLLECTION, "collection", "Collection"),
-    (FIELD_YEAR, "year", "Year"),
-    (FIELD_DOMAIN, "domain", "Site"),
-    (FIELD_MEDIA_TYPE, "type", "Type"),
-    (FIELD_LANG, "lang", "Language"),
+/// The sidebar facet dimensions, in display order: `(index field, label)`. The
+/// index field name doubles as the `field:value` filter name (e.g. `domain:`),
+/// so a facet value links straight to a refine query.
+const FACET_DIMENSIONS: [(&str, &str); 5] = [
+    (FIELD_COLLECTION, "Collection"),
+    (FIELD_YEAR, "Year"),
+    (FIELD_DOMAIN, "Site"),
+    (FIELD_MEDIA_TYPE, "Type"),
+    (FIELD_LANG, "Language"),
 ];
 
-/// How many buckets to request per facet dimension.
+/// Whether `field` can be used as a `field:value` filter: a sidebar facet
+/// dimension or the `month` timeline field. The single source of truth the
+/// server uses to recognize active filters, so the two can't drift.
+pub fn is_filter_field(field: &str) -> bool {
+    field == FIELD_MONTH || FACET_DIMENSIONS.iter().any(|(f, _)| *f == field)
+}
+
+/// The human label for a filterable field (for active-filter chips), sharing
+/// the facet labels above so they stay in sync.
+pub fn filter_label(field: &str) -> &'static str {
+    if field == FIELD_MONTH {
+        return "Month";
+    }
+    FACET_DIMENSIONS
+        .iter()
+        .find(|(f, _)| *f == field)
+        .map(|(_, label)| *label)
+        .unwrap_or("Filter")
+}
+
+/// Max buckets requested per facet dimension. A dimension with more distinct
+/// values (e.g. many hosts under `domain`) is silently truncated to its top
+/// `FACET_SIZE` by count — the sidebar shows only the busiest values, and the
+/// terms result's `sum_other_doc_count` (the rest) is discarded.
 const FACET_SIZE: u32 = 50;
 
-/// How many month buckets to request for the timeline (~10 years).
+/// Max month buckets for the timeline (~10 years); older months beyond this are
+/// dropped from the histogram.
 const TIMELINE_SIZE: u32 = 120;
 
 /// Build the terms-aggregation request: one bucket set per facet dimension plus
@@ -427,7 +461,7 @@ const TIMELINE_SIZE: u32 = 120;
 /// the nested builder structs.
 fn facet_aggregations() -> Aggregations {
     let mut req = serde_json::Map::new();
-    for (field, _query_field, _label) in FACET_DIMENSIONS {
+    for (field, _label) in FACET_DIMENSIONS {
         req.insert(
             field.to_string(),
             serde_json::json!({ "terms": { "field": field, "size": FACET_SIZE } }),
@@ -444,10 +478,7 @@ fn facet_aggregations() -> Aggregations {
 
 /// Extract the month buckets from the aggregation results as a timeline sorted
 /// oldest-first. Terms aggregations sort by count, so we re-sort chronologically.
-fn timeline_from_aggregations(
-    agg: &tantivy::aggregation::agg_result::AggregationResults,
-) -> Vec<TimelineBucket> {
-    let value = serde_json::to_value(agg).unwrap_or_default();
+fn timeline_from_aggregations(value: &serde_json::Value) -> Vec<TimelineBucket> {
     let Some(buckets) = value.get(FIELD_MONTH).and_then(|d| d.get("buckets")).and_then(|b| b.as_array())
     else {
         return Vec::new();
@@ -466,14 +497,13 @@ fn timeline_from_aggregations(
 
 /// Convert Tantivy's aggregation results into ordered [`FacetGroup`]s. Empty
 /// values (e.g. the blank domain/lang of collection-level docs) are dropped.
-fn facets_from_aggregations(
-    agg: &tantivy::aggregation::agg_result::AggregationResults,
-) -> Vec<FacetGroup> {
-    // Round-trip through JSON: the terms result is `{buckets:[{key,doc_count}]}`,
-    // which is simpler to read than matching the internal bucket enums.
-    let value = serde_json::to_value(agg).unwrap_or_default();
+/// `value` is the aggregation results already serialized to JSON (the terms
+/// result is `{buckets:[{key,doc_count}]}`, simpler to read than the internal
+/// bucket enums). Serializing once and passing it in avoids re-serializing for
+/// the timeline.
+fn facets_from_aggregations(value: &serde_json::Value) -> Vec<FacetGroup> {
     let mut groups = Vec::new();
-    for (field, _query_field, label) in FACET_DIMENSIONS {
+    for (field, label) in FACET_DIMENSIONS {
         let Some(buckets) = value.get(field).and_then(|d| d.get("buckets")).and_then(|b| b.as_array())
         else {
             continue;
