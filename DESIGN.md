@@ -233,9 +233,11 @@ behind it; the *Planned* subsection at the end lists what is deliberately not bu
   topic from the past), 5-16% *transactional*. So **time is a first-class axis**, and both
   known-item lookup (URL + date + versions) and topical full-text search matter.
 - **Faceted "slice and dice" scales navigation better than clever ranking.** SHINE (UK Web
-  Archive), built on the same warc-indexer, offers facets for content-type, domain, crawl
-  year, links, and public suffix. Facets are the established answer to a growing, unwieldy
-  list.
+  Archive) and SolrWayback (Royal Danish Library), both built on the UK Web Archive's
+  warc-indexer, offer facets for content-type, domain, crawl year, links, and public suffix.
+  Facets are the established answer to a growing, unwieldy list. rustyweb follows this
+  lineage directly — SolrWayback pairs the same faceted full-text search with in-browser
+  replay — but swaps their Solr backend for a single embedded Tantivy index.
 - **Provenance is essential and usually buried.** Maemura, Worby, Milligan & Becker, *If
   These Crawls Could Talk* (JASIST 2018): to trust and interpret an archive you must be able
   to evaluate its provenance, scope, and absences (curatorial intent, seeds/scope, crawler
@@ -313,8 +315,10 @@ results it yields.
 - Costa & Silva, *Understanding the Information Needs of Web Archive Users*, IWAW 2010.
 - Maemura, Worby, Milligan & Becker, *If These Crawls Could Talk: Studying and Documenting
   Web Archives Provenance*, JASIST 2018.
-- SHINE / webarchive-discovery (UK Web Archive); WACZ 1.1.1 and the WACZ auth spec; the WARC
-  1.0 format specification.
+- SHINE (`github.com/ukwa/shine`) and SolrWayback (`github.com/netarchivesuite/solrwayback`),
+  both on the UK Web Archive's warc-indexer / webarchive-discovery
+  (`github.com/ukwa/webarchive-discovery`).
+- WACZ 1.1.1 and the WACZ auth spec; the WARC 1.0 format specification.
 
 ---
 

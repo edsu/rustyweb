@@ -41,8 +41,10 @@ expanded, with citations, in [DESIGN.md](DESIGN.md)):
   of the Portuguese Web Archive). So time is a first-class axis, and facets beat
   one long scrolling list as an archive grows. rustyweb has a faceted results
   page (collection, site, date, type, language), a month timeline, and grouping
-  of repeat captures of the same URL - the "slice and dice" browsing the UK Web
-  Archive's SHINE pioneered.
+  of repeat captures of the same URL - the faceted, full-text "slice and dice"
+  browsing that [SHINE] (UK Web Archive) and [SolrWayback] (Royal Danish Library)
+  established over the [warc-indexer]. rustyweb owes both a clear debt; it just
+  trades their Solr backend for a single embedded Tantivy index.
 - **Provenance is part of the record** - to trust and interpret an archive you
   need to know how it was made: the crawler software, operator, dates, and seeds
   (Maemura et al., *If These Crawls Could Talk*). rustyweb reads this from the
@@ -322,3 +324,6 @@ wabac.js components it bundles. See [LICENSE](LICENSE) for the full text and
 [1000ans]: https://www.24joursdeweb.fr/2012/un-site-web-de-1000-ans/
 [wabac.js]: https://github.com/webrecorder/wabac.js
 [reading room]: https://inkdroid.org/2026/06/03/jan6-doj-archive/
+[SHINE]: https://github.com/ukwa/shine
+[SolrWayback]: https://github.com/netarchivesuite/solrwayback
+[warc-indexer]: https://github.com/ukwa/webarchive-discovery
