@@ -155,9 +155,10 @@ pub fn search_cdx(wacz_path: &Path, url: &str) -> Result<Vec<CdxjRecord>> {
     let mut raw = Vec::new();
     entry.read_to_end(&mut raw)?;
 
-    // Decompress if gzipped.
+    // Decompress if gzipped. The CDX is often a multi-member gzip (ZipNum
+    // blocks), so use MultiGzDecoder to read every block, not just the first.
     let text = if cdx_name.ends_with(".gz") {
-        let mut decoder = flate2::read::GzDecoder::new(raw.as_slice());
+        let mut decoder = flate2::read::MultiGzDecoder::new(raw.as_slice());
         let mut out = String::new();
         decoder.read_to_string(&mut out)?;
         out
@@ -212,8 +213,10 @@ pub(crate) fn cdx_records<R: std::io::Read + std::io::Seek>(
     let mut raw = Vec::new();
     zip.by_name(&cdx_name)?.read_to_end(&mut raw)?;
     let text = if cdx_name.ends_with(".gz") {
+        // The CDX is often a multi-member gzip (ZipNum-clustered blocks); use
+        // MultiGzDecoder so every block is read, not just the first.
         let mut out = String::new();
-        flate2::read::GzDecoder::new(raw.as_slice()).read_to_string(&mut out)?;
+        flate2::read::MultiGzDecoder::new(raw.as_slice()).read_to_string(&mut out)?;
         out
     } else {
         String::from_utf8_lossy(&raw).into_owned()
@@ -455,6 +458,36 @@ pub(crate) fn record_at<R: std::io::Read + std::io::Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdx_records_reads_all_members_of_a_multimember_gzip() {
+        use std::io::Write;
+        // Two CDX lines, each in its OWN gzip member (ZipNum-style clustering).
+        let line = |u: &str| {
+            format!("com,example)/ 20200101000000 {{\"url\":\"{u}\",\"mime\":\"text/html\",\"filename\":\"x.warc.gz\",\"offset\":0,\"length\":10,\"status\":200}}\n")
+        };
+        let gz = |s: String| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(s.as_bytes()).unwrap();
+            e.finish().unwrap()
+        };
+        let mut cdx_gz = gz(line("https://example.com/a"));
+        cdx_gz.extend_from_slice(&gz(line("https://example.com/b"))); // 2nd member appended
+
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("indexes/index.cdx.gz", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&cdx_gz).unwrap();
+            zw.finish().unwrap();
+        }
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+        let recs = cdx_records(&mut zip).unwrap();
+        let urls: Vec<&str> = recs.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(recs.len(), 2, "must read every gzip member of the CDX, not just the first");
+        assert!(urls.contains(&"https://example.com/a") && urls.contains(&"https://example.com/b"));
+    }
 
     #[test]
     fn record_at_reads_one_gzipped_warc_record_slice() {
