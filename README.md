@@ -183,9 +183,9 @@ object like the one above, or a presigned URL) and index that.
 
 ## Searching
 
-The search box matches page titles, headings, page text, descriptions, and
-words from the page URL. A few things worth knowing (there's also a "Search
-tips" panel in the app itself):
+The search box matches page titles, headings, body text, descriptions,
+keywords, author, and words from the page URL. A few things worth knowing
+(there's also a "Search tips" panel in the app itself):
 
 - **All words must match.** `climate policy` finds pages containing both words.
   Use `OR` for either (`climate OR weather`) and `-` to exclude (`climate -policy`).

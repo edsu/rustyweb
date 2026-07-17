@@ -32,7 +32,8 @@ pub fn search_tips() -> Markup {
             summary { "Search tips" }
             div.tips-body {
                 p {
-                    "Type words to search page titles, headings, page text, descriptions, and URLs. "
+                    "Type words to search page titles, headings, body text, descriptions, "
+                    "keywords, author, and URLs. "
                     strong { "All words must match" } " - " code { "climate policy" }
                     " finds pages containing both."
                 }
