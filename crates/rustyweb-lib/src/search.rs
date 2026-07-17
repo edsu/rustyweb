@@ -19,14 +19,21 @@ const FIELD_URL: &str = "url";
 const FIELD_TS: &str = "timestamp";
 const FIELD_TITLE: &str = "title";
 const FIELD_BODY: &str = "body";
-/// Exact host of a page URL (e.g. `example.com`), for `domain:` filtering.
+/// Exact host of a page URL (e.g. `www.example.com`), for `domain:` filtering.
 const FIELD_DOMAIN: &str = "domain";
+/// Registrable domain of a page URL (eTLD+1, e.g. `example.com` for any
+/// `*.example.com` host), for the cross-subdomain `site:` filter and Site facet.
+const FIELD_SITE: &str = "site";
 /// Tokenized words from a page URL (host + path), so URL words are searchable.
 const FIELD_URL_TOKENS: &str = "url_tokens";
 /// Page description from `<meta name=description>` / `og:description`.
 const FIELD_DESCRIPTION: &str = "description";
 /// Concatenated `<h1>`/`<h2>` heading text.
 const FIELD_HEADINGS: &str = "headings";
+/// `<meta name=keywords>` content.
+const FIELD_KEYWORDS: &str = "keywords";
+/// Page author (`<meta name=author>` / `article:author`), for `author:` search.
+const FIELD_AUTHOR: &str = "author";
 /// Four-digit crawl year (from the page timestamp), for `year:` filtering.
 const FIELD_YEAR: &str = "year";
 /// Six-digit crawl month `YYYYMM` (from the page timestamp), for `month:`
@@ -38,6 +45,11 @@ const FIELD_MEDIA_TYPE: &str = "type";
 const FIELD_LANG: &str = "lang";
 /// Curated collection id (slug) this document belongs to, for `collection:` filtering.
 const FIELD_COLLECTION: &str = "collection";
+/// HTTP response status code of the capture, for `status:200` filtering.
+const FIELD_STATUS: &str = "status";
+/// Year from the HTTP `Last-Modified` header, for `modified:2015` filtering
+/// (when the content was authored, vs `year:` = when it was crawled).
+const FIELD_MODIFIED: &str = "modified";
 
 /// How much more a title match counts than a body/url match when ranking.
 const TITLE_BOOST: tantivy::Score = 3.0;
@@ -132,9 +144,12 @@ impl SearchIndex {
         doc.add_text(schema.get_field(FIELD_BODY).unwrap(), page.body);
         doc.add_text(schema.get_field(FIELD_DESCRIPTION).unwrap(), page.description);
         doc.add_text(schema.get_field(FIELD_HEADINGS).unwrap(), page.headings);
+        doc.add_text(schema.get_field(FIELD_KEYWORDS).unwrap(), page.keywords);
+        doc.add_text(schema.get_field(FIELD_AUTHOR).unwrap(), page.author);
         // Derived URL fields: an exact host for `domain:` filtering, and the
         // URL's words tokenized so they're searchable as ordinary terms.
         doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), domain_of(page.url));
+        doc.add_text(schema.get_field(FIELD_SITE).unwrap(), site_of(page.url));
         doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), url_search_text(page.url));
         // Numeric year/month for range filtering and the timeline; omitted when
         // there's no usable date.
@@ -145,7 +160,20 @@ impl SearchIndex {
             doc.add_u64(schema.get_field(FIELD_MONTH).unwrap(), month);
         }
         doc.add_text(schema.get_field(FIELD_MEDIA_TYPE).unwrap(), page.media_type);
-        doc.add_text(schema.get_field(FIELD_LANG).unwrap(), primary_lang(page.lang));
+        // Language: the declared `<html lang>` wins; if absent, fall back to
+        // detecting it from the body text (empty when nothing is confident).
+        let lang = if page.lang.trim().is_empty() {
+            detect_lang(page.body).unwrap_or_default()
+        } else {
+            primary_lang(page.lang)
+        };
+        doc.add_text(schema.get_field(FIELD_LANG).unwrap(), &lang);
+        if let Some(status) = page.status {
+            doc.add_u64(schema.get_field(FIELD_STATUS).unwrap(), status as u64);
+        }
+        if let Some(year) = page.modified_year {
+            doc.add_u64(schema.get_field(FIELD_MODIFIED).unwrap(), year);
+        }
         self.writer_mut().add_document(doc)?;
         Ok(())
     }
@@ -172,7 +200,10 @@ impl SearchIndex {
         // Collection docs have no page URL or HTML metadata; keep those empty.
         doc.add_text(schema.get_field(FIELD_DESCRIPTION).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_HEADINGS).unwrap(), "");
+        doc.add_text(schema.get_field(FIELD_KEYWORDS).unwrap(), "");
+        doc.add_text(schema.get_field(FIELD_AUTHOR).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), "");
+        doc.add_text(schema.get_field(FIELD_SITE).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_MEDIA_TYPE).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_LANG).unwrap(), "");
@@ -229,15 +260,17 @@ impl SearchIndex {
         let domain_f = schema.get_field(FIELD_DOMAIN).unwrap();
         let description_f = schema.get_field(FIELD_DESCRIPTION).unwrap();
         let headings_f = schema.get_field(FIELD_HEADINGS).unwrap();
+        let keywords_f = schema.get_field(FIELD_KEYWORDS).unwrap();
+        let author_f = schema.get_field(FIELD_AUTHOR).unwrap();
         let url_tokens_f = schema.get_field(FIELD_URL_TOKENS).unwrap();
         let collection_f = schema.get_field(FIELD_COLLECTION).unwrap();
 
-        // Bare words search the title, headings, body, description, and URL
-        // words. Other fields (domain:, url:, title:) are reachable by explicit
-        // `field:` syntax.
+        // Bare words search the title, headings, body, description, keywords,
+        // author, and URL words. Other fields (domain:, url:, title:, author:)
+        // are also reachable by explicit `field:` syntax.
         let mut query_parser = QueryParser::for_index(
             &self.index,
-            vec![title_f, headings_f, body_f, description_f, url_tokens_f],
+            vec![title_f, headings_f, body_f, description_f, keywords_f, author_f, url_tokens_f],
         );
         // Require all terms by default (`climate change` means both), which
         // matches what people expect from a search box more than OR does.
@@ -339,10 +372,18 @@ pub struct Page<'a> {
     pub body: &'a str,
     pub description: &'a str,
     pub headings: &'a str,
+    /// `<meta name=keywords>` content.
+    pub keywords: &'a str,
+    /// Page author (`<meta name=author>` / `article:author`).
+    pub author: &'a str,
     /// Coarse media type: `"html"` or `"pdf"` (empty if unknown).
     pub media_type: &'a str,
     /// Page language tag, e.g. `"en-US"` (stored as its primary subtag).
     pub lang: &'a str,
+    /// HTTP response status code, if known.
+    pub status: Option<u16>,
+    /// Year from the HTTP `Last-Modified` header, if present.
+    pub modified_year: Option<u64>,
     /// The WACZ this page came from (id and display name).
     pub collection_id: &'a str,
     pub collection_name: &'a str,
@@ -420,26 +461,34 @@ pub struct FacetBucket {
 const FACET_DIMENSIONS: [(&str, &str); 5] = [
     (FIELD_COLLECTION, "Collection"),
     (FIELD_YEAR, "Year"),
-    (FIELD_DOMAIN, "Site"),
+    (FIELD_SITE, "Site"),
     (FIELD_MEDIA_TYPE, "Type"),
     (FIELD_LANG, "Language"),
 ];
 
+/// Filterable `field:value` fields that aren't sidebar facets: `month` (the
+/// timeline) and `domain` (exact host — the Site facet uses the registrable
+/// domain instead), with labels for their active-filter chips.
+const EXTRA_FILTERS: [(&str, &str); 4] = [
+    (FIELD_MONTH, "Month"),
+    (FIELD_DOMAIN, "Host"),
+    (FIELD_STATUS, "Status"),
+    (FIELD_MODIFIED, "Modified"),
+];
+
 /// Whether `field` can be used as a `field:value` filter: a sidebar facet
-/// dimension or the `month` timeline field. The single source of truth the
+/// dimension or one of the extra filter fields. The single source of truth the
 /// server uses to recognize active filters, so the two can't drift.
 pub fn is_filter_field(field: &str) -> bool {
-    field == FIELD_MONTH || FACET_DIMENSIONS.iter().any(|(f, _)| *f == field)
+    FACET_DIMENSIONS.iter().chain(EXTRA_FILTERS.iter()).any(|(f, _)| *f == field)
 }
 
 /// The human label for a filterable field (for active-filter chips), sharing
 /// the facet labels above so they stay in sync.
 pub fn filter_label(field: &str) -> &'static str {
-    if field == FIELD_MONTH {
-        return "Month";
-    }
     FACET_DIMENSIONS
         .iter()
+        .chain(EXTRA_FILTERS.iter())
         .find(|(f, _)| *f == field)
         .map(|(_, label)| *label)
         .unwrap_or("Filter")
@@ -563,8 +612,13 @@ fn build_schema() -> Schema {
     builder.add_text_field(FIELD_DESCRIPTION, TEXT | STORED);
     // Headings are indexed (and boosted at query time) but not stored.
     builder.add_text_field(FIELD_HEADINGS, TEXT);
-    // Exact host: matched by `domain:host`, and faceted (the "Site" facet).
+    // Keywords and author are indexed (searchable, incl. `author:`) but not stored.
+    builder.add_text_field(FIELD_KEYWORDS, TEXT);
+    builder.add_text_field(FIELD_AUTHOR, TEXT);
+    // Exact host, for `domain:host` filtering and results display.
     builder.add_text_field(FIELD_DOMAIN, facet_string());
+    // Registrable domain, for the cross-subdomain `site:` filter and Site facet.
+    builder.add_text_field(FIELD_SITE, facet_string());
     // Tokenized URL words; indexed for search but not stored (we keep the URL).
     builder.add_text_field(FIELD_URL_TOKENS, TEXT);
     // Numeric crawl year: indexed for `year:2021` / `year:[2020 TO 2023]`, and
@@ -576,6 +630,10 @@ fn build_schema() -> Schema {
     // Coarse media type (`html`/`pdf`) and page language, for filtering + facets.
     builder.add_text_field(FIELD_MEDIA_TYPE, facet_string());
     builder.add_text_field(FIELD_LANG, facet_string());
+    // HTTP status code, for `status:200` / `status:[200 TO 299]`.
+    builder.add_u64_field(FIELD_STATUS, INDEXED | STORED);
+    // Last-Modified year, for `modified:2015` / range filtering.
+    builder.add_u64_field(FIELD_MODIFIED, INDEXED | STORED);
     builder.build()
 }
 
@@ -587,6 +645,67 @@ fn primary_lang(lang: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
+}
+
+/// Below this many bytes of body text, language detection is too unreliable to
+/// trust.
+const MIN_DETECT_BYTES: usize = 40;
+
+/// whatlang only needs a modest sample to identify the dominant language, so we
+/// cap the input to keep detection cheap on long pages (it runs per page that
+/// lacks `<html lang>`, so cost matters at scale). A couple of KB is plenty.
+const DETECT_SAMPLE_BYTES: usize = 2048;
+
+/// Detect a page's language from its body text as a fallback when `<html lang>`
+/// is absent. Returns the ISO 639-1 subtag (e.g. `en`) to match the codes used
+/// by declared `lang`, or `None` when the text is too short, detection is not
+/// reliable, or whatlang's language has no 639-1 code. whatlang reports a single
+/// dominant language, which fits our single-valued `lang` field.
+fn detect_lang(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.len() < MIN_DETECT_BYTES {
+        return None;
+    }
+    // Detect on a bounded prefix rather than the whole body; truncate on a char
+    // boundary so we never slice mid-UTF-8.
+    let sample = if body.len() > DETECT_SAMPLE_BYTES {
+        let mut end = DETECT_SAMPLE_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        &body[..end]
+    } else {
+        body
+    };
+    let info = whatlang::detect(sample)?;
+    if !info.is_reliable() {
+        return None;
+    }
+    lang3_to_lang1(info.lang().code()).map(String::from)
+}
+
+/// Map an ISO 639-3 code (as whatlang reports) to its ISO 639-1 two-letter
+/// subtag. The arms mirror whatlang's supported language set; a language with no
+/// 639-1 code (or a new whatlang language not listed here) returns `None`, so we
+/// never store a code inconsistent with the declared `lang` values (better a gap
+/// than a bucket that won't unify).
+fn lang3_to_lang1(code3: &str) -> Option<&'static str> {
+    Some(match code3 {
+        "eng" => "en", "spa" => "es", "por" => "pt", "fra" => "fr", "deu" => "de",
+        "ita" => "it", "nld" => "nl", "rus" => "ru", "ukr" => "uk", "bel" => "be",
+        "bul" => "bg", "ces" => "cs", "pol" => "pl", "hrv" => "hr", "srp" => "sr",
+        "mkd" => "mk", "slv" => "sl", "ron" => "ro", "ell" => "el", "dan" => "da",
+        "swe" => "sv", "nob" => "nb", "fin" => "fi", "hun" => "hu", "est" => "et",
+        "lit" => "lt", "lav" => "lv", "tur" => "tr", "aze" => "az", "uzb" => "uz",
+        "tuk" => "tk", "cat" => "ca", "epo" => "eo", "cmn" => "zh", "jpn" => "ja",
+        "kor" => "ko", "vie" => "vi", "tha" => "th", "ind" => "id", "tgl" => "tl",
+        "jav" => "jv", "mya" => "my", "khm" => "km", "ara" => "ar", "heb" => "he",
+        "yid" => "yi", "pes" => "fa", "urd" => "ur", "hin" => "hi", "ben" => "bn",
+        "guj" => "gu", "pan" => "pa", "mar" => "mr", "kan" => "kn", "tam" => "ta",
+        "tel" => "te", "mal" => "ml", "ori" => "or", "nep" => "ne", "sin" => "si",
+        "kat" => "ka", "hye" => "hy", "amh" => "am", "zul" => "zu", "aka" => "ak",
+        _ => return None,
+    })
 }
 
 /// The four-digit crawl year parsed from a 14-digit page timestamp
@@ -612,6 +731,19 @@ fn domain_of(url: &str) -> String {
     url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+/// The registrable domain (eTLD+1) of a URL, via the Public Suffix List, so a
+/// whole site unifies across subdomains and multi-level suffixes are handled
+/// correctly (`www.example.co.uk` -> `example.co.uk`, `a.github.io` ->
+/// `a.github.io` since `github.io` is a private suffix). Empty when there's no
+/// host or no registrable domain (e.g. a bare public suffix, `urn:`).
+fn site_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .and_then(|host| psl::domain_str(&host).map(|d| d.to_string()))
         .unwrap_or_default()
 }
 
@@ -649,6 +781,10 @@ pub struct HtmlText {
     pub description: String,
     /// Concatenated `<h1>`/`<h2>` heading text.
     pub headings: String,
+    /// `<meta name=keywords>` content, if present.
+    pub keywords: String,
+    /// Page author: `<meta name=author>`, falling back to `article:author`.
+    pub author: String,
     /// The `<html lang>` attribute value, if present (e.g. `en`, `en-US`).
     pub lang: String,
 }
@@ -673,6 +809,12 @@ pub fn extract_html_text(html: &[u8]) -> HtmlText {
     // Description: prefer <meta name="description">, fall back to og:description.
     let description = meta_content(&doc, "meta[name=description]")
         .or_else(|| meta_content(&doc, "meta[property=\"og:description\"]"))
+        .unwrap_or_default();
+
+    // Keywords and author from <meta> tags (author falls back to article:author).
+    let keywords = meta_content(&doc, "meta[name=keywords]").unwrap_or_default();
+    let author = meta_content(&doc, "meta[name=author]")
+        .or_else(|| meta_content(&doc, "meta[property=\"article:author\"]"))
         .unwrap_or_default();
 
     // Headings: h1 and h2 text, in document order.
@@ -724,6 +866,8 @@ pub fn extract_html_text(html: &[u8]) -> HtmlText {
         body: body_parts.join(" "),
         description,
         headings,
+        keywords,
+        author,
         lang,
     }
 }
@@ -776,6 +920,42 @@ mod tests {
     }
 
     #[test]
+    fn extract_keywords_and_author_from_meta() {
+        let html = br#"<html><head><title>T</title>
+            <meta name="keywords" content="climate, policy, marmots">
+            <meta name="author" content="Ada Lovelace"></head>
+            <body>x</body></html>"#;
+        let t = extract_html_text(html);
+        assert!(t.keywords.contains("marmots"), "keywords: {}", t.keywords);
+        assert_eq!(t.author, "Ada Lovelace");
+    }
+
+    #[test]
+    fn author_falls_back_to_article_author() {
+        let html = br#"<html><head>
+            <meta property="article:author" content="Grace Hopper"></head>
+            <body>x</body></html>"#;
+        let t = extract_html_text(html);
+        assert_eq!(t.author, "Grace Hopper");
+    }
+
+    #[test]
+    fn keywords_and_author_are_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page(&Page {
+            url: "https://ex.com/a", title: "Plain", body: "ordinary body",
+            keywords: "marmots rodentia", author: "Ada Lovelace",
+            collection_id: "c1", collection_name: "C1", ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        assert_eq!(idx.search("rodentia", 10).unwrap().len(), 1, "keywords searchable");
+        assert_eq!(idx.search("Lovelace", 10).unwrap().len(), 1, "author searchable by bare word");
+        assert_eq!(idx.search("author:Lovelace", 10).unwrap().len(), 1, "author: field query");
+    }
+
+    #[test]
     fn description_falls_back_to_og_description() {
         let html = br#"<html><head><meta property="og:description" content="OG only"></head>
             <body>x</body></html>"#;
@@ -788,6 +968,57 @@ mod tests {
         let html = br#"<html lang="en-US"><head><title>T</title></head><body>x</body></html>"#;
         let t = extract_html_text(html);
         assert_eq!(t.lang, "en-US");
+    }
+
+    #[test]
+    fn detect_lang_fills_in_when_html_lang_absent() {
+        // Enough English text to detect reliably.
+        let en = "The quick brown fox jumps over the lazy dog near the riverbank \
+                  while the sun sets slowly behind the distant hills this evening.";
+        assert_eq!(detect_lang(en).as_deref(), Some("en"));
+        // French.
+        let fr = "Le vif renard brun saute par-dessus le chien paresseux tandis que \
+                  le soleil se couche lentement derrière les collines lointaines ce soir.";
+        assert_eq!(detect_lang(fr).as_deref(), Some("fr"));
+        // Too short to trust.
+        assert_eq!(detect_lang("hi there"), None);
+    }
+
+    #[test]
+    fn detect_lang_caps_long_multibyte_body_without_panicking() {
+        // A body well over DETECT_SAMPLE_BYTES with multibyte chars (é, à) right
+        // around the cut point must not panic on a mid-UTF-8 slice, and still
+        // detect the dominant language.
+        let sentence = "Le renard brun rapide sauté par-dessus le chien paresseux à côté de la rivière. ";
+        let long = sentence.repeat(80); // > 2 KB, many multi-byte chars
+        assert!(long.len() > DETECT_SAMPLE_BYTES);
+        assert_eq!(detect_lang(&long).as_deref(), Some("fr"));
+    }
+
+    #[test]
+    fn indexing_detects_lang_only_as_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        let french = "Le renard brun rapide saute par-dessus le chien paresseux et \
+                      le soleil se couche derrière les collines lointaines ce soir la.";
+        // Declared lang wins even when the body is another language.
+        idx.index_page(&Page {
+            url: "https://ex.com/declared", title: "T", body: french, lang: "en-GB",
+            collection_id: "c1", collection_name: "C1", ..Default::default()
+        }).unwrap();
+        // No declared lang -> detected from body.
+        idx.index_page(&Page {
+            url: "https://ex.com/detected", title: "T", body: french, lang: "",
+            collection_id: "c1", collection_name: "C1", ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        let en = idx.search("lang:en", 10).unwrap();
+        assert_eq!(en.len(), 1);
+        assert_eq!(en[0].url, "https://ex.com/declared", "declared en-GB wins over the body");
+        let fr = idx.search("lang:fr", 10).unwrap();
+        assert_eq!(fr.len(), 1);
+        assert_eq!(fr[0].url, "https://ex.com/detected", "empty lang detected as fr from body");
     }
 
     #[test]
@@ -931,6 +1162,66 @@ mod tests {
 
         let results = idx.search("nonexistent", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn status_and_modified_year_filters() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page(&Page {
+            url: "https://ex.com/ok", title: "OK", body: "shared", status: Some(200),
+            modified_year: Some(2015), collection_id: "c1", collection_name: "C1", ..Default::default()
+        }).unwrap();
+        idx.index_page(&Page {
+            url: "https://ex.com/gone", title: "Gone", body: "shared", status: Some(404),
+            modified_year: Some(2020), collection_id: "c1", collection_name: "C1", ..Default::default()
+        }).unwrap();
+        idx.commit().unwrap();
+
+        let r = idx.search("status:200", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://ex.com/ok");
+
+        let r = idx.search("shared modified:2020", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://ex.com/gone");
+
+        // Status ranges work (u64 field): 4xx only.
+        let r = idx.search("status:[400 TO 499]", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://ex.com/gone");
+    }
+
+    #[test]
+    fn site_of_extracts_registrable_domain() {
+        // Subdomains unify to the registrable domain.
+        assert_eq!(site_of("https://www.example.com/a"), "example.com");
+        assert_eq!(site_of("https://blog.example.com/"), "example.com");
+        // Multi-level public suffix handled via the PSL.
+        assert_eq!(site_of("https://www.bbc.co.uk/news"), "bbc.co.uk");
+        // Private suffixes (github.io) are effective TLDs, so subdomains stay distinct.
+        assert_eq!(site_of("https://alice.github.io/"), "alice.github.io");
+        // No host / unparseable input yields an empty site.
+        assert_eq!(site_of("urn:text:foo"), "");
+    }
+
+    #[test]
+    fn site_filter_spans_subdomains_while_domain_is_exact() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.index_page(&page("https://www.example.com/a", "A", "shared", "c1", "C1")).unwrap();
+        idx.index_page(&page("https://blog.example.com/b", "B", "shared", "c1", "C1")).unwrap();
+        idx.index_page(&page("https://other.org/c", "C", "shared", "c1", "C1")).unwrap();
+        idx.commit().unwrap();
+
+        // site: matches the whole registrable domain across subdomains.
+        let r = idx.search("site:example.com", 10).unwrap();
+        assert_eq!(r.len(), 2, "site: spans www. and blog.");
+
+        // domain: stays exact-host.
+        let r = idx.search("domain:www.example.com", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].url, "https://www.example.com/a");
     }
 
     #[test]
@@ -1110,7 +1401,8 @@ mod tests {
         let resp = idx.search_faceted("shared", 10, 0).unwrap();
         assert_eq!(resp.total_hits, 3);
 
-        let sites = facet_map(&resp, FIELD_DOMAIN);
+        // The Site facet is the registrable domain (FIELD_SITE), not the host.
+        let sites = facet_map(&resp, FIELD_SITE);
         assert_eq!(sites.get("example.com"), Some(&2));
         assert_eq!(sites.get("other.org"), Some(&1));
 

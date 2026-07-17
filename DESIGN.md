@@ -113,16 +113,21 @@ Two document types share the same index, distinguished by `doc_type`.
 | `body` | TEXT | ✓ | BM25 | - | Page body text or collection description + seed URLs |
 | `description` | TEXT | ✓ | BM25 | - | Page `<meta description>` / og:description; shown as a snippet fallback |
 | `headings` | TEXT | - | BM25 | - | Page `<h1>`/`<h2>` text; boosted at query time |
-| `domain` | STRING | ✓ | exact | ✓ | Lowercased host of the page URL, for `domain:` filtering + the Site facet |
+| `keywords` | TEXT | - | BM25 | - | `<meta name=keywords>`; searchable via default fields |
+| `author` | TEXT | - | BM25 | - | `<meta name=author>` / `article:author`; also `author:name` |
+| `domain` | STRING | ✓ | exact | ✓ | Exact host of the page URL, for `domain:` filtering + results display |
+| `site` | STRING | ✓ | exact | ✓ | Registrable domain (eTLD+1, via the PSL), for the cross-subdomain `site:` filter + the Site facet |
 | `url_tokens` | TEXT | - | BM25 | - | URL host + path split into words, so URL words are searchable as ordinary terms |
 | `year` | u64 | ✓ | numeric | ✓ | Four-digit crawl year, for `year:2021` / `year:[2020 TO 2023]` + the Year facet |
 | `month` | u64 | ✓ | numeric | ✓ | Six-digit crawl month `YYYYMM`, for `month:202103` / ranges + the results timeline |
 | `type` | STRING | ✓ | exact | ✓ | Coarse media type (`html` or `pdf`), for `type:pdf` filtering + facet |
-| `lang` | STRING | ✓ | exact | ✓ | Primary `<html lang>` subtag (e.g. `en`), for `lang:en` filtering + facet |
+| `lang` | STRING | ✓ | exact | ✓ | Primary language subtag (`en`); from `<html lang>`, else detected from body text; `lang:en` filtering + facet |
+| `status` | u64 | ✓ | numeric | - | HTTP status code, for `status:200` / `status:[200 TO 299]` |
+| `modified` | u64 | ✓ | numeric | - | Year from the HTTP `Last-Modified` header, for `modified:2015` |
 
-`body` and `description` are stored (not just indexed) so that Tantivy's `SnippetGenerator` can produce hit-highlighted excerpts without re-reading the source files, and so a result can show the description when the query didn't match the body. `headings` and `url_tokens` are indexed but not stored: they exist only to make that text findable; the canonical URL is kept in `url`.
+`body` and `description` are stored (not just indexed) so that Tantivy's `SnippetGenerator` can produce hit-highlighted excerpts without re-reading the source files, and so a result can show the description when the query didn't match the body. `headings`, `keywords`, `author`, and `url_tokens` are indexed but not stored: they exist only to make that text findable; the canonical URL is kept in `url`.
 
-The facet dimensions (`collection`, `domain`, `type`, `lang`) and the numeric `year`/`month` are **fast** (columnar) fields. Fast storage is what lets them back Tantivy *terms aggregations*, which compute the per-value counts for the facet sidebar and the timeline. The string facet fields use the `raw` tokenizer so each field value is a single term (one bucket), rather than being split into words.
+The facet dimensions (`collection`, `site`, `type`, `lang`) and the numeric `year`/`month` are **fast** (columnar) fields. Fast storage is what lets them back Tantivy *terms aggregations*, which compute the per-value counts for the facet sidebar and the timeline. The string facet fields use the `raw` tokenizer so each field value is a single term (one bucket), rather than being split into words. Note the **Site facet is the registrable domain (`site`)**, not the raw host — so a whole site groups across subdomains; `domain:` remains available for exact-host filtering. `lang` is taken from the declared `<html lang>` when present, else detected from the body text with `whatlang` (single dominant language, only when confident); the code is normalized to a 639-1 subtag so declared and detected values unify.
 
 ### Query behavior
 
@@ -283,11 +288,13 @@ SHA-256). Signature-based authenticity (`datapackage-digest.json`, the WACZ auth
 The results page is search-first and faceted, implemented in `search_faceted` +
 `views.rs`:
 
-- **Facet sidebar** with live counts for collection, year, site (domain), content type, and
-  language. Each value is a link that toggles a `field:value` filter on the query; applied
-  filters show as removable chips. Counts come from Tantivy *terms aggregations* over the
-  fast fields, computed in the **same query pass** as the results, so they always reflect
-  the current query.
+- **Facet sidebar** with live counts for collection, year, site (registrable domain),
+  content type, and language. Each value is a link that toggles a `field:value` filter on
+  the query; applied filters show as removable chips. Counts come from Tantivy *terms
+  aggregations* over the fast fields, computed in the **same query pass** as the results, so
+  they always reflect the current query. Beyond the faceted fields, results can also be
+  filtered by `author:`, `domain:` (exact host), `status:` (HTTP status), and `modified:`
+  (Last-Modified year).
 - **Month timeline** - a chronological histogram (a terms aggregation on `month`) above the
   results; each bar toggles a `month:` filter.
 - **Repeat-capture grouping** - multiple captures of the same URL collapse into one result
@@ -307,9 +314,10 @@ results it yields.
 
 - **Authenticity**: verify `datapackage-digest.json` signatures (WACZ auth spec), surfaced
   alongside fixity. Tracked by `rustyweb-authenticity-671`.
-- **Search enrichment**: more page fields - keywords/author, a language fallback, a `site:`
-  registrable-domain facet, outbound links, HTTP status. Tracked by
-  `rustyweb-search-enrichment-6by`; a `crawler` facet lands with it.
+- **Search enrichment**: keywords/author, language-detection fallback, the `site:`
+  registrable-domain facet, HTTP `status:`, and `modified:` (Last-Modified year) have
+  shipped. Still open under `rustyweb-search-enrichment-6by`: outbound-link fields (deferred
+  over index size), plus a `crawler` facet.
 - **Browsertrix import**: pull WACZs from a Browsertrix org's public API into `<home>/archive`.
   Tracked by `rustyweb-15z` (includes nested/multi-WACZ indexing).
 

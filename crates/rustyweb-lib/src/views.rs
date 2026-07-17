@@ -32,7 +32,8 @@ pub fn search_tips() -> Markup {
             summary { "Search tips" }
             div.tips-body {
                 p {
-                    "Type words to search page titles, headings, page text, descriptions, and URLs. "
+                    "Type words to search page titles, headings, body text, descriptions, "
+                    "keywords, author, and URLs. "
                     strong { "All words must match" } " - " code { "climate policy" }
                     " finds pages containing both."
                 }
@@ -42,12 +43,16 @@ pub fn search_tips() -> Markup {
                     li { code { "climate -policy" } " - has \"climate\", excludes \"policy\"" }
                     li { code { "(climate OR weather) risk" } " - group with parentheses" }
                     li { code { "title:climate" } " - match only in the page title" }
-                    li { code { "domain:example.com" } " - only pages from that exact host" }
+                    li { code { "author:hopper" } " - match the page author" }
+                    li { code { "site:example.com" } " - a whole site, across subdomains" }
+                    li { code { "domain:www.example.com" } " - only that exact host" }
                     li { code { "collection:demo" } " - only pages in that collection" }
                     li { code { "year:2021" } " or " code { "year:[2020 TO 2023]" } " - filter by crawl year" }
                     li { code { "month:202103" } " or " code { "month:[202101 TO 202106]" } " - filter by crawl month" }
+                    li { code { "modified:2015" } " - filter by Last-Modified year" }
                     li { code { "type:pdf" } " - only PDFs (or " code { "type:html" } ")" }
                     li { code { "lang:en" } " - only pages in that language" }
+                    li { code { "status:200" } " - filter by HTTP status (or " code { "status:[200 TO 299]" } ")" }
                     li { code { "climate^2 change" } " - rank \"climate\" matches higher" }
                 }
                 p.tips-note {

@@ -384,10 +384,16 @@ enum RawRecord {
         body: String,
         description: String,
         headings: String,
+        keywords: String,
+        author: String,
         /// `"html"` or `"pdf"`.
         media_type: String,
         /// `<html lang>` value (empty for PDFs).
         lang: String,
+        /// HTTP response status code, if known.
+        status: Option<u16>,
+        /// Year from the HTTP `Last-Modified` header, if present.
+        modified_year: Option<u64>,
     },
     /// A `urn:text:` resource record: Browsertrix's fully rendered (post-JS)
     /// page text. Richer than scraped HTML, especially for SPAs.
@@ -407,8 +413,12 @@ struct MergedPage {
     rendered_text: Option<String>,
     description: Option<String>,
     headings: Option<String>,
+    keywords: Option<String>,
+    author: Option<String>,
     media_type: Option<String>,
     lang: Option<String>,
+    status: Option<u16>,
+    modified_year: Option<u64>,
 }
 
 /// Provenance and capture stats gathered during one WACZ indexing pass, so the
@@ -459,7 +469,7 @@ fn index_wacz(
         }
         for raw in raws {
             match raw {
-            RawRecord::Html { url, timestamp, title, body, description, headings, media_type, lang } => {
+            RawRecord::Html { url, timestamp, title, body, description, headings, keywords, author, media_type, lang, status, modified_year } => {
                 let e = pages.entry(url).or_default();
                 // The HTML capture is the authoritative timestamp for replay.
                 e.timestamp = timestamp;
@@ -475,11 +485,23 @@ fn index_wacz(
                 if !headings.is_empty() {
                     e.headings = Some(headings);
                 }
+                if !keywords.is_empty() {
+                    e.keywords = Some(keywords);
+                }
+                if !author.is_empty() {
+                    e.author = Some(author);
+                }
                 if !media_type.is_empty() {
                     e.media_type = Some(media_type);
                 }
                 if !lang.is_empty() {
                     e.lang = Some(lang);
+                }
+                if status.is_some() {
+                    e.status = status;
+                }
+                if modified_year.is_some() {
+                    e.modified_year = modified_year;
                 }
             }
             RawRecord::Text { url, timestamp, text } => {
@@ -507,6 +529,8 @@ fn index_wacz(
             let title = m.title.unwrap_or_default();
             let description = m.description.unwrap_or_default();
             let headings = m.headings.unwrap_or_default();
+            let keywords = m.keywords.unwrap_or_default();
+            let author = m.author.unwrap_or_default();
             let media_type = m.media_type.unwrap_or_default();
             let lang = m.lang.unwrap_or_default();
             if title.is_empty() && body.is_empty() && description.is_empty() {
@@ -519,8 +543,12 @@ fn index_wacz(
                 body: &body,
                 description: &description,
                 headings: &headings,
+                keywords: &keywords,
+                author: &author,
                 media_type: &media_type,
                 lang: &lang,
+                status: m.status,
+                modified_year: m.modified_year,
                 collection_id,
                 collection_name,
                 collection,
@@ -616,8 +644,12 @@ fn collect_page_records(warc_path: &Path) -> Result<(Vec<RawRecord>, Option<Warc
                         body: text,
                         description: String::new(),
                         headings: String::new(),
+                        keywords: String::new(),
+                        author: String::new(),
                         media_type: "pdf".to_string(),
                         lang: String::new(),
+                        status: record.http_status,
+                        modified_year: last_modified_year(&record.http_headers),
                     });
                 } else {
                     debug!(url = uri, "PDF text extraction yielded nothing; skipping");
@@ -640,12 +672,31 @@ fn collect_page_records(warc_path: &Path) -> Result<(Vec<RawRecord>, Option<Warc
             body: html.body,
             description: html.description,
             headings: html.headings,
+            keywords: html.keywords,
+            author: html.author,
             media_type: "html".to_string(),
             lang: html.lang,
+            status: record.http_status,
+            modified_year: last_modified_year(&record.http_headers),
         });
     }
 
     Ok((out, warcinfo))
+}
+
+/// The year from an HTTP `Last-Modified` header, or `None` if the header is
+/// absent or unparseable. Only the modern IMF-fixdate form (RFC 7231, e.g.
+/// `Wed, 21 Oct 2015 07:28:00 GMT`) is parsed — the two obsolete HTTP-date
+/// formats (RFC 850 and asctime) are rare and yield `None`.
+fn last_modified_year(headers: &[(String, String)]) -> Option<u64> {
+    let value = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("last-modified"))
+        .map(|(_, v)| v.as_str())?;
+    // IMF-fixdate is RFC 2822-compatible (chrono accepts the "GMT" zone).
+    let dt = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?;
+    let year = chrono::Datelike::year(&dt);
+    (year > 0).then_some(year as u64)
 }
 
 /// Derive a page title for a PDF from the last path segment of its URL
@@ -676,6 +727,24 @@ fn file_display_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_modified_year_parses_http_date() {
+        let headers = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("Last-Modified".to_string(), "Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        ];
+        assert_eq!(last_modified_year(&headers), Some(2015));
+        // Header name match is case-insensitive.
+        let headers = vec![("last-modified".to_string(), "Mon, 01 Jan 2001 00:00:00 GMT".to_string())];
+        assert_eq!(last_modified_year(&headers), Some(2001));
+        // Absent or unparseable -> None.
+        assert_eq!(last_modified_year(&[]), None);
+        assert_eq!(
+            last_modified_year(&[("Last-Modified".to_string(), "not a date".to_string())]),
+            None
+        );
+    }
     use tempfile::TempDir;
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");

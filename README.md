@@ -183,18 +183,19 @@ object like the one above, or a presigned URL) and index that.
 
 ## Searching
 
-The search box matches page titles, headings, page text, descriptions, and
-words from the page URL. A few things worth knowing (there's also a "Search
-tips" panel in the app itself):
+The search box matches page titles, headings, body text, descriptions,
+keywords, author, and words from the page URL. A few things worth knowing
+(there's also a "Search tips" panel in the app itself):
 
 - **All words must match.** `climate policy` finds pages containing both words.
   Use `OR` for either (`climate OR weather`) and `-` to exclude (`climate -policy`).
 - **Quotes** search an exact phrase: `"climate policy"`.
-- **Field search**: `title:climate` matches only the title; `domain:example.com`
-  restricts to pages from that exact host; `year:2021` (or `year:[2020 TO 2023]`)
-  and `month:202103` (or `month:[202101 TO 202106]`) filter by crawl date;
-  `type:pdf`, `lang:en`, and `collection:demo` filter by media type, language,
-  and collection.
+- **Field search**: `title:climate` and `author:hopper` match those fields;
+  `site:example.com` matches a whole site across subdomains while
+  `domain:www.example.com` is an exact host; `year:2021` (or `year:[2020 TO 2023]`),
+  `month:202103`, and `modified:2015` (Last-Modified year) filter by date;
+  `type:pdf`, `lang:en`, `status:200`, and `collection:demo` filter by media
+  type, language, HTTP status, and collection.
 - **Grouping and boosting**: `(climate OR weather) risk`, and `climate^2 change`
   ranks "climate" matches higher.
 

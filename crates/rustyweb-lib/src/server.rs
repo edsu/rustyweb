@@ -141,7 +141,7 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let overview = state.search.facet_overview().unwrap_or_default();
     let browse = views::HomeBrowse {
         years: browse_links(&overview, "year", "year", 12, true),
-        sites: browse_links(&overview, "domain", "domain", 8, false),
+        sites: browse_links(&overview, "site", "site", 8, false),
     };
 
     views::home(&cards, &browse).into_response()
