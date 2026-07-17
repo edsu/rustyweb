@@ -2,20 +2,22 @@
 
 **Note bene**: *rustyweb is alpha software and has been written extensively
 with the support of Claude Code. Like any piece of software it may contain
-bugs, and while the software was designed through several iterations and
-abandoned prototypes, the developer's understanding of how it operates at a low
-level may be limited. See the [DESIGN.md](DESIGN.md) document for the overall
-approach that was used. Technical reviews of the code and design are always
-welcome!*
+bugs. The developer's understanding of how it operates at a low level may be
+limited. See the [DESIGN.md](DESIGN.md) document for the overall design
+principles. Technical reviews of the code and design are always welcome!*
 
 ---
 
-**rustyweb** is a small, fast web archive server written in Rust. Point it at a
-pile of [WACZ] files and it gives you:
+**rustyweb** is a small, fast web archive server written in Rust. Think of it
+as a [reading room] for web archives. Point it at a pile of local or remote
+[WACZ] files and it gives you:
 
-- **Full-text search** across the archived pages, with hit-highlighted snippets
-- **A homepage** that surfaces each collection's metadata (title, description,
-  crawl date, seed pages)
+- **Full-text search with faceted, temporal browsing** - hit-highlighted
+  snippets, then narrow by collection, site, date, type, or language, with a
+  timeline for navigating through time
+- **Provenance up front** - see how each crawl was made (software, operator,
+  dates, seeds, page counts) and verify each WACZ's fixity, instead of taking
+  the archive on faith
 - **In-browser replay** of the archived pages via [ReplayWeb.page] / wabac.js
 
 It ships as a single self-contained binary - no Solr, no Elasticsearch, no
@@ -26,6 +28,26 @@ separate database server.
 > all the actual replay - and adds a thin Rust layer for indexing, search, and
 > serving. Webrecorder did the heavy lifting; please support them. See
 > [Credits](#credits).
+
+## Discovery and provenance
+
+The "reading room" idea is that you should be able to *find* things in an
+archive and *understand* what you're looking at - not just replay a URL you
+already know. Two findings from web-archiving research shape rustyweb (both
+expanded, with citations, in [DESIGN.md](DESIGN.md)):
+
+- **Web-archive use is mostly navigational and temporal** - seeing a page or
+  site as it was, or how it changed over time (Costa & Silva's query-log study
+  of the Portuguese Web Archive). So time is a first-class axis, and facets beat
+  one long scrolling list as an archive grows. rustyweb has a faceted results
+  page (collection, site, date, type, language), a month timeline, and grouping
+  of repeat captures of the same URL - the "slice and dice" browsing the UK Web
+  Archive's SHINE pioneered.
+- **Provenance is part of the record** - to trust and interpret an archive you
+  need to know how it was made: the crawler software, operator, dates, and seeds
+  (Maemura et al., *If These Crawls Could Talk*). rustyweb reads this from the
+  WACZ and WARC and surfaces it on each collection and WACZ - and lets you
+  verify each file's fixity - rather than burying it.
 
 ## Install
 
@@ -299,3 +321,4 @@ wabac.js components it bundles. See [LICENSE](LICENSE) for the full text and
 [Karl Dubost]: https://www.la-grange.net/karl/
 [1000ans]: https://www.24joursdeweb.fr/2012/un-site-web-de-1000-ans/
 [wabac.js]: https://github.com/webrecorder/wabac.js
+[reading room]: https://inkdroid.org/2026/06/03/jan6-doj-archive/
