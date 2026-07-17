@@ -684,14 +684,16 @@ fn collect_page_records(warc_path: &Path) -> Result<(Vec<RawRecord>, Option<Warc
     Ok((out, warcinfo))
 }
 
-/// The year from an HTTP `Last-Modified` header (RFC 7231 date), or `None` if
-/// the header is absent or unparseable.
+/// The year from an HTTP `Last-Modified` header, or `None` if the header is
+/// absent or unparseable. Only the modern IMF-fixdate form (RFC 7231, e.g.
+/// `Wed, 21 Oct 2015 07:28:00 GMT`) is parsed — the two obsolete HTTP-date
+/// formats (RFC 850 and asctime) are rare and yield `None`.
 fn last_modified_year(headers: &[(String, String)]) -> Option<u64> {
     let value = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("last-modified"))
         .map(|(_, v)| v.as_str())?;
-    // HTTP dates are RFC 2822-ish ("Wed, 21 Oct 2015 07:28:00 GMT").
+    // IMF-fixdate is RFC 2822-compatible (chrono accepts the "GMT" zone).
     let dt = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?;
     let year = chrono::Datelike::year(&dt);
     (year > 0).then_some(year as u64)

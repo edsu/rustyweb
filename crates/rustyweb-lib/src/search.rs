@@ -647,8 +647,14 @@ fn primary_lang(lang: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Below this many characters, language detection is too unreliable to trust.
-const MIN_DETECT_CHARS: usize = 40;
+/// Below this many bytes of body text, language detection is too unreliable to
+/// trust.
+const MIN_DETECT_BYTES: usize = 40;
+
+/// whatlang only needs a modest sample to identify the dominant language, so we
+/// cap the input to keep detection cheap on long pages (it runs per page that
+/// lacks `<html lang>`, so cost matters at scale). A couple of KB is plenty.
+const DETECT_SAMPLE_BYTES: usize = 2048;
 
 /// Detect a page's language from its body text as a fallback when `<html lang>`
 /// is absent. Returns the ISO 639-1 subtag (e.g. `en`) to match the codes used
@@ -656,10 +662,22 @@ const MIN_DETECT_CHARS: usize = 40;
 /// reliable, or whatlang's language has no 639-1 code. whatlang reports a single
 /// dominant language, which fits our single-valued `lang` field.
 fn detect_lang(body: &str) -> Option<String> {
-    if body.trim().chars().count() < MIN_DETECT_CHARS {
+    let body = body.trim();
+    if body.len() < MIN_DETECT_BYTES {
         return None;
     }
-    let info = whatlang::detect(body)?;
+    // Detect on a bounded prefix rather than the whole body; truncate on a char
+    // boundary so we never slice mid-UTF-8.
+    let sample = if body.len() > DETECT_SAMPLE_BYTES {
+        let mut end = DETECT_SAMPLE_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        &body[..end]
+    } else {
+        body
+    };
+    let info = whatlang::detect(sample)?;
     if !info.is_reliable() {
         return None;
     }
@@ -667,9 +685,10 @@ fn detect_lang(body: &str) -> Option<String> {
 }
 
 /// Map an ISO 639-3 code (as whatlang reports) to its ISO 639-1 two-letter
-/// subtag. Returns `None` for languages without a 639-1 code, so we never store
-/// a code inconsistent with the declared `lang` values (better a gap than a
-/// bucket that won't unify).
+/// subtag. The arms mirror whatlang's supported language set; a language with no
+/// 639-1 code (or a new whatlang language not listed here) returns `None`, so we
+/// never store a code inconsistent with the declared `lang` values (better a gap
+/// than a bucket that won't unify).
 fn lang3_to_lang1(code3: &str) -> Option<&'static str> {
     Some(match code3 {
         "eng" => "en", "spa" => "es", "por" => "pt", "fra" => "fr", "deu" => "de",
@@ -963,6 +982,17 @@ mod tests {
         assert_eq!(detect_lang(fr).as_deref(), Some("fr"));
         // Too short to trust.
         assert_eq!(detect_lang("hi there"), None);
+    }
+
+    #[test]
+    fn detect_lang_caps_long_multibyte_body_without_panicking() {
+        // A body well over DETECT_SAMPLE_BYTES with multibyte chars (é, à) right
+        // around the cut point must not panic on a mid-UTF-8 slice, and still
+        // detect the dominant language.
+        let sentence = "Le renard brun rapide sauté par-dessus le chien paresseux à côté de la rivière. ";
+        let long = sentence.repeat(80); // > 2 KB, many multi-byte chars
+        assert!(long.len() > DETECT_SAMPLE_BYTES);
+        assert_eq!(detect_lang(&long).as_deref(), Some("fr"));
     }
 
     #[test]
