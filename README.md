@@ -161,21 +161,31 @@ tips" panel in the app itself):
 - **Quotes** search an exact phrase: `"climate policy"`.
 - **Field search**: `title:climate` matches only the title; `domain:example.com`
   restricts to pages from that exact host; `year:2021` (or `year:[2020 TO 2023]`)
-  filters by crawl year; `type:pdf` and `lang:en` filter by media type and
-  language.
+  and `month:202103` (or `month:[202101 TO 202106]`) filter by crawl date;
+  `type:pdf`, `lang:en`, and `collection:demo` filter by media type, language,
+  and collection.
 - **Grouping and boosting**: `(climate OR weather) risk`, and `climate^2 change`
   ranks "climate" matches higher.
 
 Title matches rank above body matches, and searches are case-insensitive.
 
+The results page is faceted: a sidebar shows counts by collection, year, site,
+type, and language, and clicking one refines the search (applied filters appear
+as removable chips). A month timeline sits above the results — click a bar to
+filter to that month. Repeat captures of the same URL collapse into a single
+result marked "captured N times", and results are paginated. The homepage also
+offers "browse by year" and "top sites" entry points into search.
+
 ## Command line
 
 ```
-rustyweb index      [--home <DIR>] [--name <NAME>] <PATH|URL>...
-rustyweb reindex    [--home <DIR>]
-rustyweb serve      [--home <DIR>] [--bind <ADDR>]
-rustyweb search-url [--home <DIR>] <URL>
-rustyweb verify     [--home <DIR>]
+rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] <PATH|URL>...
+rustyweb reindex         [--home <DIR>]
+rustyweb serve           [--home <DIR>] [--bind <ADDR>]
+rustyweb collection set  [--home <DIR>] <COLLECTION> <WACZ_ID>...
+rustyweb collection list [--home <DIR>]
+rustyweb search-url      [--home <DIR>] <URL>
+rustyweb verify          [--home <DIR>]
 ```
 
 Every command takes `--home <DIR>` (default `.`); `archive/` and `index/` are
@@ -188,15 +198,19 @@ derived siblings under it.
   Index several with a shell glob: `rustyweb index archive/*.wacz`. Extracts
   searchable text from each page (HTML, Browsertrix's rendered `urn:text`
   records, and PDFs), reads `datapackage.json` for collection metadata, and
-  records everything in `<home>/index/collections.json`, including the SHA-256 of
-  each WACZ. Local WACZ paths are stored relative to home so the folder is
-  portable. The collection name comes from `--name` if given, otherwise the
-  WACZ's `datapackage.json` title, otherwise the filename.
-- **`reindex`** - rebuild the search index from the collections already in
-  `collections.json`, preserving their names. Re-fetches remote URL sources and
-  recreates the index from scratch, so it's the way to migrate after an upgrade
-  changes the searchable fields. (If you try to `index` or `serve` against an
-  index built by an older version, rustyweb tells you to run this.)
+  records everything in the manifest under `<home>/index/`, including the SHA-256
+  of each WACZ. Local WACZ paths are stored relative to home so the folder is
+  portable. The WACZ name comes from `--name` if given, otherwise the WACZ's
+  `datapackage.json` title, otherwise the filename. `--collection <NAME>` groups
+  the WACZs into a curated collection (created if new); without it each WACZ is
+  its own collection.
+- **`collection`** - `collection list` shows collections and their members;
+  `collection set <COLLECTION> <WACZ_ID>...` moves WACZs into a collection.
+- **`reindex`** - rebuild the search index from the WACZs already in the
+  manifest, preserving collection membership and metadata. Re-fetches remote URL
+  sources and recreates the index from scratch, so it's the way to migrate after
+  an upgrade changes the index schema. (If you try to `index` or `serve` against
+  an index built by an older version, rustyweb tells you to run this.)
 - **`serve`** - opens the index read-only and starts the HTTP server (so you can
   `index` while it runs). Defaults to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and

@@ -55,23 +55,27 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index      [--home <DIR>] [--name <NAME>] <PATH|URL>...
-rustyweb reindex    [--home <DIR>]
-rustyweb serve      [--home <DIR>] [--bind <ADDR>]
-rustyweb search-url [--home <DIR>] <URL>
-rustyweb verify     [--home <DIR>]
+rustyweb index          [--home <DIR>] [--name <NAME>] [--collection <NAME>] <PATH|URL>...
+rustyweb reindex        [--home <DIR>]
+rustyweb serve          [--home <DIR>] [--bind <ADDR>]
+rustyweb collection set [--home <DIR>] <COLLECTION> <WACZ_ID>...
+rustyweb collection list[--home <DIR>]
+rustyweb search-url     [--home <DIR>] <URL>
+rustyweb verify         [--home <DIR>]
 ```
 
 Every command takes `--home <DIR>` (default `.`). The home directory holds two
 derived siblings: `<home>/archive/` (WACZ files) and `<home>/index/` (Tantivy
-index + `collections.json`). Keeping them together makes a home folder portable
-- move it to another disk or machine and it still resolves.
+index + the JSON manifest, see *Collection Management*). Keeping them together
+makes a home folder portable - move it to another disk or machine and it still
+resolves.
 
-- `index`: indexes one or more `.wacz` files or `http(s)://` URLs (downloaded to a temp file for indexing) - at least one argument is required. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` for collection metadata, records the SHA-256 of each WACZ, and updates `collections.json`. A `Source` is a local file (stored relative to home) or a remote URL. (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
-- `reindex`: rebuild the full-text index from the sources already recorded in `collections.json`, preserving the manifest and each collection's name. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. Missing local files are skipped with a warning. This is the intended way to migrate the index after the searchable-field schema changes (see below).
+- `index`: indexes one or more `.wacz` files or `http(s)://` URLs (downloaded to a temp file for indexing) - at least one argument is required. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
+- `reindex`: rebuild the full-text index from the sources already recorded in the manifest, preserving collection membership and metadata. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. Missing local files are skipped with a warning. This is the intended way to migrate the index after a schema change (see below).
 - `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
+- `collection set` / `collection list`: reassign WACZs to a collection (by WACZ id) / list collections and their members. Metadata like description and curator is edited in `collections.json` directly.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
-- `verify`: re-hashes every WACZ in `collections.json` and compares against the stored SHA-256, reporting each collection as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
+- `verify`: re-hashes every WACZ in the manifest and compares against the stored SHA-256, reporting each as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
 
 ---
 
@@ -79,11 +83,14 @@ index + `collections.json`). Keeping them together makes a home folder portable
 
 | Route | Handler |
 |---|---|
-| `GET /` | Homepage: search box + collections with metadata and seed pages |
-| `GET /search?q=...` | Server-rendered full-text search results with snippets and replay links |
-| `GET /api/search?q=...` | Full-text search → JSON (used by clients) |
+| `GET /` | Homepage: search box, browse-by-facet entry points, and the collection overview |
+| `GET /search?q=...&page=N` | Server-rendered results with a facet sidebar, month timeline, snippets, and pagination |
+| `GET /collection/{id}` | Collection detail: metadata + member WACZs |
+| `GET /wacz/{id}` | WACZ detail: provenance panel, file metadata, seed pages |
+| `GET /api/search?q=...` | Full-text search → JSON (results, `total`, `capped`, `facets`) |
 | `GET /files/{id}` | Stream a registered WACZ file with byte-range support |
-| `GET /replay/viewer` | Viewer shell (reads `?source=&url=&ts=&name=` params) |
+| `GET /assets/*` | Embedded site assets (the shared `app.css` stylesheet) |
+| `GET /replay/viewer` | Viewer shell (reads `?source=&url=&ts=&name=&collection=` params) |
 | `GET /replay/*` | Embedded ReplayWebPage static assets (JS, CSS, WASM, sw.js) |
 
 ---
@@ -92,28 +99,36 @@ index + `collections.json`). Keeping them together makes a home folder portable
 
 Two document types share the same index, distinguished by `doc_type`.
 
-| Field | Type | Stored | Indexed | Notes |
-|---|---|---|---|---|
-| `doc_type` | STRING | ✓ | exact | `"page"` or `"collection"` |
-| `collection_id` | STRING | ✓ | exact | Short collection hash (e.g. `e02536ec`) |
-| `collection_name` | STRING | ✓ | - | Human-readable collection name |
-| `url` | STRING | ✓ | exact | Page URL (empty for collection docs) |
-| `timestamp` | STRING | ✓ | - | 14-digit crawl timestamp |
-| `title` | TEXT | ✓ | BM25 | Page title or collection name |
-| `body` | TEXT | ✓ | BM25 | Page body text or collection description + seed URLs |
-| `description` | TEXT | ✓ | BM25 | Page `<meta description>` / og:description; shown as a snippet fallback |
-| `headings` | TEXT | - | BM25 | Page `<h1>`/`<h2>` text; boosted at query time |
-| `domain` | STRING | ✓ | exact | Lowercased host of the page URL, for `domain:` filtering (empty for collection docs) |
-| `url_tokens` | TEXT | - | BM25 | URL host + path split into words, so URL words are searchable as ordinary terms |
-| `year` | u64 | ✓ | numeric | Four-digit crawl year from the page timestamp, for `year:2021` / `year:[2020 TO 2023]` |
-| `type` | STRING | ✓ | exact | Coarse media type (`html` or `pdf`), for `type:pdf` filtering |
-| `lang` | STRING | ✓ | exact | Primary language subtag from `<html lang>` (e.g. `en`), for `lang:en` filtering |
+| Field | Type | Stored | Indexed | Fast | Notes |
+|---|---|---|---|---|---|
+| `doc_type` | STRING | ✓ | exact | - | `"page"` or `"collection"` |
+| `collection_id` | STRING | ✓ | exact | - | Per-WACZ hash (e.g. `e02536ec`) |
+| `collection_name` | STRING | ✓ | - | - | Human-readable WACZ name |
+| `collection` | STRING | ✓ | exact | ✓ | Curated collection slug the WACZ belongs to, for `collection:` filtering + faceting |
+| `url` | STRING | ✓ | exact | - | Page URL (empty for collection docs) |
+| `timestamp` | STRING | ✓ | - | - | 14-digit crawl timestamp |
+| `title` | TEXT | ✓ | BM25 | - | Page title or collection name |
+| `body` | TEXT | ✓ | BM25 | - | Page body text or collection description + seed URLs |
+| `description` | TEXT | ✓ | BM25 | - | Page `<meta description>` / og:description; shown as a snippet fallback |
+| `headings` | TEXT | - | BM25 | - | Page `<h1>`/`<h2>` text; boosted at query time |
+| `domain` | STRING | ✓ | exact | ✓ | Lowercased host of the page URL, for `domain:` filtering + the Site facet |
+| `url_tokens` | TEXT | - | BM25 | - | URL host + path split into words, so URL words are searchable as ordinary terms |
+| `year` | u64 | ✓ | numeric | ✓ | Four-digit crawl year, for `year:2021` / `year:[2020 TO 2023]` + the Year facet |
+| `month` | u64 | ✓ | numeric | ✓ | Six-digit crawl month `YYYYMM`, for `month:202103` / ranges + the results timeline |
+| `type` | STRING | ✓ | exact | ✓ | Coarse media type (`html` or `pdf`), for `type:pdf` filtering + facet |
+| `lang` | STRING | ✓ | exact | ✓ | Primary `<html lang>` subtag (e.g. `en`), for `lang:en` filtering + facet |
 
 `body` and `description` are stored (not just indexed) so that Tantivy's `SnippetGenerator` can produce hit-highlighted excerpts without re-reading the source files, and so a result can show the description when the query didn't match the body. `headings` and `url_tokens` are indexed but not stored: they exist only to make that text findable; the canonical URL is kept in `url`.
 
+The facet dimensions (`collection`, `domain`, `type`, `lang`) and the numeric `year`/`month` are **fast** (columnar) fields. Fast storage is what lets them back Tantivy *terms aggregations*, which compute the per-value counts for the facet sidebar and the timeline. The string facet fields use the `raw` tokenizer so each field value is a single term (one bucket), rather than being split into words.
+
 ### Query behavior
 
-Queries go through Tantivy's `QueryParser`, configured in `SearchIndex::search`:
+`SearchIndex::search_faceted(query, limit, offset)` runs one query and returns a page of
+results, the total, facet counts, and the month timeline together (see *Faceted, temporal
+discovery* below). `SearchIndex::search` is a thin wrapper returning just the hits.
+
+Queries go through Tantivy's `QueryParser`, configured in `search_faceted`:
 
 - **Default fields** are `title`, `headings`, `body`, `description`, and `url_tokens`, so a bare word matches any of them. Other fields are reachable with explicit `field:` syntax (`title:climate`, `domain:example.com`).
 - **AND by default** (`set_conjunction_by_default`): `climate policy` requires both terms. Users can still write `OR`, `-`, `+`, `"phrases"`, `(groups)`, and `^boost`.
@@ -124,7 +139,7 @@ The `<details>` "Search tips" panel on the homepage and results page documents t
 
 ### Schema changes and migration
 
-Tantivy persists the schema inside the index directory (`index/full_text/meta.json`) and reuses it when the index is opened. Adding a searchable field (as `domain`, `year`, `type`, etc. did) therefore makes an index built by an older binary *stale*: it lacks the new fields. To avoid writing/querying against a mismatched schema, `SearchIndex::open` compares the stored schema to the current one and, if they differ, returns an error telling the user to run `rustyweb reindex` rather than proceeding (which would otherwise panic on a missing field).
+Tantivy persists the schema inside the index directory (`index/full_text/meta.json`) and reuses it when the index is opened. Changing the schema — adding a searchable field (as `domain`, `year`, `type`, `month` did) or making fields *fast* for faceting — therefore makes an index built by an older binary *stale*. To avoid writing/querying against a mismatched schema, `SearchIndex::open` compares the stored schema to the current one and, if they differ, returns an error telling the user to run `rustyweb reindex` rather than proceeding (which would otherwise panic on a missing field).
 
 `rustyweb reindex` performs the migration: it reads `collections.json`, deletes the old `index/full_text`, recreates it with the current schema, and re-indexes every registered source (files and remote URLs). The manifest and collection names are preserved.
 
@@ -152,54 +167,63 @@ The server renders these `<b>` tags in the search results HTML; CSS applies a hi
 
 ## Collection Metadata
 
-`datapackage.json` inside each WACZ (WACZ spec §4) is read at index time and stored in `collections.json` alongside the existing file metadata.
+`datapackage.json` inside each WACZ (WACZ spec §4) is read at index time and stored on the
+WACZ's manifest entry.
 
 Fields extracted:
-- `title` - collection display name (falls back to filename stem)
+- `title` - WACZ display name (falls back to filename stem)
 - `description` - free-text description
 - `created` - ISO 8601 crawl date
-- Seed pages - first 3–5 entries from the `pages` array (url, title, timestamp)
+- `software` - crawler/packager software (also enriched from the WARC `warcinfo`)
+- Seed pages - first entries from the `pages` array (url, title, timestamp)
 
-The homepage displays this metadata per collection, giving users a preview of what each archive contains before searching or replaying.
+The WACZ detail page shows this per WACZ; the collection page aggregates it across members.
 
 ---
 
 ## Collection Management
 
-`<home>/index/collections.json` - written/updated by `rustyweb index`, read by `rustyweb serve`.
+The manifest is **two files** under `<home>/index/`, written by `rustyweb index` and read by
+`rustyweb serve` - collections (curated groups) and the WACZs that belong to them:
 
-```json
+```jsonc
+// collections.json - one entry per curated collection
+[
+  { "id": "demo", "name": "Demo", "description": "A test set", "curator": null,
+    "created": "2026-07-01T00:00:00Z" }
+]
+
+// waczs.json - one entry per WACZ member
 [
   {
     "id": "e02536ec",
+    "collection": "demo",                       // -> collections.json id
     "source": "archive/attar.wacz",
     "name": "Attar Silas",
     "date_indexed": "2026-07-01T00:00:00Z",
     "file_size": 104857600,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb924...",
-    "description": "Personal website of Attar Silas",
     "crawl_date": "2026-02-24T00:00:00Z",
-    "seed_pages": [
-      { "url": "https://www.attarsilas.fr/", "title": "Attar Silas", "ts": "20260224005439" }
-    ]
+    "software": ["browsertrix-crawler 1.0.0"],
+    "seed_pages": [ { "url": "https://www.attarsilas.fr/", "title": "Attar Silas", "ts": "20260224005439" } ]
   }
 ]
 ```
 
-- `source`: a local file path (stored relative to `<home>` when under it, e.g. `archive/attar.wacz`; absolute otherwise) or an `http(s)://` URL. Relative paths resolve against `<home>` at serve time, so the whole home folder is portable. (Older manifests used the key `path`; it is still read.)
-- `id`: first 8 hex chars of SHA-256 of the source string - relative sources give IDs that are stable across moves
-- Re-indexing the same source upserts the entry
-- For a **file** source, `GET /files/{id}` streams the registered file with byte-range support; only files registered in `collections.json` are served, so arbitrary filesystem access is not possible.
+- `source`: a local file path (stored relative to `<home>` when under it, e.g. `archive/attar.wacz`; absolute otherwise) or an `http(s)://` URL. Relative paths resolve against `<home>` at serve time, so the whole home folder is portable.
+- `id`: first 8 hex chars of SHA-256 of the source string - relative sources give IDs that are stable across moves. Collection ids are slugs of the collection name.
+- Re-indexing the same source upserts its WACZ entry; a WACZ with no `--collection` gets a singleton collection of its own.
+- An older single-file `collections.json` (flat, per-WACZ with a `source` key) is detected and **migrated** on open into the two-file form.
+- For a **file** source, `GET /files/{id}` streams the registered file with byte-range support; only registered files are served, so arbitrary filesystem access is not possible.
 - For a **URL** source, replay points wabac.js directly at the remote URL (the host must provide range + CORS); `GET /files/{id}` just redirects there. rustyweb never proxies remote bytes.
 
 ---
 
-## Discovery, Provenance & Collections (design direction)
+## Discovery, Provenance & Collections
 
-This section records the intended direction for discovery, provenance, and the collection
-model. It is a roadmap - much of it is not implemented yet - and is tracked by three beads
-epics: `rustyweb-provenance-imd`, `rustyweb-collections-model-5co`, and
-`rustyweb-faceted-discovery-4js`.
+Discovery in rustyweb is search-first and faceted, over a two-level collection model, with
+provenance surfaced rather than buried. This section explains that design and the reasoning
+behind it; the *Planned* subsection at the end lists what is deliberately not built yet.
 
 ### Why (grounded in the literature)
 
@@ -219,45 +243,70 @@ epics: `rustyweb-provenance-imd`, `rustyweb-collections-model-5co`, and
 
 ### Two-level collection model
 
-rustyweb currently treats **one WACZ as one "collection"**, listed in a flat grid. The
-direction is a **two-level model**:
+rustyweb uses a **two-level model** (see *Collection Management* above for the on-disk form):
 
 - **Collection** - a curated grouping with *curatorial* provenance (name, description,
-  intent/scope). This becomes the primary unit users browse and facet by.
-- **WACZ / crawl members** - each carries *technical* provenance (crawler software,
-  operator, user-agent, crawl date range, seeds, page/capture counts, fixity + optional
-  signature).
+  curator, created date). The primary unit users browse and facet by; stored in
+  `collections.json`.
+- **WACZ members** - each carries *technical* provenance (crawler software, operator,
+  user-agent, crawl date range, seeds, page counts, fixity). Stored in `waczs.json`, each
+  pointing at its collection.
 
-This single change serves both audiences: an **individual** self-hosting WACZs made with
-wget or browsertrix-crawler gets context and verifiable authenticity with no hosted-service
-dependency; an **institution** (e.g. TBs of WARC behind pywb) can reorganize crawls into
-navigable, provenance-bearing collections. It is also the structural fix for the "long
-list" problem. (Tracked by `rustyweb-collections-model-5co`.)
+A WACZ indexed without `--collection` becomes a singleton collection, so the flat case still
+works. This model serves both audiences: an **individual** self-hosting WACZs made with wget
+or browsertrix-crawler gets context with no hosted-service dependency; an **institution**
+(e.g. TBs of WARC behind pywb) can reorganize crawls into navigable, provenance-bearing
+collections. It is also the structural fix for the "long list" problem.
 
-### Provenance sources rustyweb should use
+### Provenance
 
-Available in WACZ/WARC today but largely unused by the current indexer:
+rustyweb extracts provenance from the WACZ/WARC and presents it **prominently** - a
+provenance panel on the WACZ detail page and a compact provenance line on collection member
+listings - rather than tucking it away. Sources used:
 
-- **`datapackage.json`** (WACZ 1.1.1): `title`, `description`, `created`, `modified`,
-  `software`, `mainPageUrl`.
-- **`datapackage-digest.json` + signature** (WACZ auth spec): verifiable authenticity
-  without trusting a service.
-- **WARC `warcinfo` record** (`application/warc-fields`, one per WARC): `software`,
-  `operator`, `http-header-user-agent`, `isPartOf`, `conformsTo`, `robots`, hostname.
-- **Per-record**: `WARC-Date`, HTTP status, payload digest, `WARC-IP-Address`.
+- **`datapackage.json`** (WACZ 1.1.1): `title`, `description`, `created`, `software`.
+- **WARC `warcinfo` record** (`application/warc-fields`, one per WARC, read by `warc.rs`):
+  `software`, `operator`, `http-header-user-agent`, `robots`.
+- **Timestamps**: capture date range (earliest/latest) and page counts.
 
-The goal is to extract these and present them **prominently** - a provenance panel on the
-collection page and a compact provenance line on results - not tucked away. (Tracked by
-`rustyweb-provenance-imd`.)
+Fixity is verifiable with `rustyweb verify` (re-hashing each WACZ against the stored
+SHA-256). Signature-based authenticity (`datapackage-digest.json`, the WACZ auth spec) is
+*Planned* (below).
 
 ### Faceted, temporal discovery
 
-The search experience moves from a fixed 20-result list toward a **search-first, faceted**
-interface: a facet sidebar (collection, year, domain/site, content type, language, crawler)
-with counts, date-range filtering and a result timeline, grouping of repeat captures of a
-URL, and pagination. Facets reuse fields from the search-enrichment work
-(`rustyweb-search-enrichment-6by`) plus the crawler/collection fields above. (Tracked by
-`rustyweb-faceted-discovery-4js`.)
+The results page is search-first and faceted, implemented in `search_faceted` +
+`views.rs`:
+
+- **Facet sidebar** with live counts for collection, year, site (domain), content type, and
+  language. Each value is a link that toggles a `field:value` filter on the query; applied
+  filters show as removable chips. Counts come from Tantivy *terms aggregations* over the
+  fast fields, computed in the **same query pass** as the results, so they always reflect
+  the current query.
+- **Month timeline** - a chronological histogram (a terms aggregation on `month`) above the
+  results; each bar toggles a `month:` filter.
+- **Repeat-capture grouping** - multiple captures of the same URL collapse into one result
+  showing "captured N times". Tantivy has no native field collapsing, so grouping is done
+  over the top `CANDIDATE_CAP` scored captures per query (`SearchResponse.capped` flags when
+  more matched).
+- **Pagination** over the grouped results (`?page=N`).
+- **Search-first homepage** - a prominent search box, "browse by year"/"top sites" entry
+  points (from an archive-wide facet overview), then the collection cards.
+
+A key distinction: **facet and timeline counts count captures and are exact over the whole
+match set; the result total counts distinct URLs and is bounded by `CANDIDATE_CAP`.** They
+measure different things, so a facet count is generally larger than the number of grouped
+results it yields.
+
+### Planned / not yet built
+
+- **Authenticity**: verify `datapackage-digest.json` signatures (WACZ auth spec), surfaced
+  alongside fixity. Tracked by `rustyweb-authenticity-671`.
+- **Search enrichment**: more page fields - keywords/author, a language fallback, a `site:`
+  registrable-domain facet, outbound links, HTTP status. Tracked by
+  `rustyweb-search-enrichment-6by`; a `crawler` facet lands with it.
+- **Browsertrix import**: pull WACZs from a Browsertrix org's public API into `<home>/archive`.
+  Tracked by `rustyweb-15z` (includes nested/multi-WACZ indexing).
 
 ### References
 
@@ -320,13 +369,15 @@ Input WACZ
                  │
                  └── Merge into one document per URL (body prefers rendered
                      text, then PDF text, then scraped HTML; title from HTML)
-                     └── Write page document to Tantivy
-                         (doc_type, url, timestamp, title, body, collection_id, collection_name)
+                     └── Derive domain/year/month/type/lang, then write the page
+                         document to Tantivy (see the schema table above)
 ```
 
 Records are collected across all inner WARCs before merging, because a page's
 rendered `urn:text` often lives in a different WARC than its HTML response.
-Collapsing to one document per URL also deduplicates repeat captures.
+Collapsing to one document per URL deduplicates repeat captures *within a WACZ*;
+repeat captures of the same URL *across* WACZs stay as separate documents and are
+grouped at query time instead (see *Faceted, temporal discovery*).
 
 Parallelism: Rayon parallel iterator over the WARC member list within each WACZ;
 merge and Tantivy writes happen once per WACZ.
