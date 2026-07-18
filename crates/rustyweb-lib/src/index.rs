@@ -48,7 +48,7 @@ pub trait IndexProgress: Sync {
 /// Index a local WACZ file (which must live under `<home>/archive`) under the
 /// given home dir. Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
-    index_location(&path.to_string_lossy(), home, name, None, false, false, None)
+    index_location(&path.to_string_lossy(), home, name, None, false, None)
 }
 
 /// Index a WACZ from a location into the home directory's `index/`. The location
@@ -69,13 +69,10 @@ pub fn index_location(
     home: &Path,
     name: Option<&str>,
     collection: Option<&str>,
-    // Force CDX (streaming) extraction for a local file. Remote URLs stream by
-    // default.
-    stream: bool,
     // Download a remote WACZ into <home>/archive and index it as a local file
-    // instead of streaming.
+    // instead of streaming it in place.
     download: bool,
-    // Optional progress sink for streaming indexes (the binary renders a bar).
+    // Optional progress sink for indexing (the binary renders a bar).
     progress: Option<&dyn IndexProgress>,
 ) -> Result<()> {
     // Validate the argument first (a bad path errors before we touch the index).
@@ -97,7 +94,7 @@ pub fn index_location(
 
     for source in &sources {
         let c = group.as_ref().map(|(id, n)| (id.as_str(), n.as_str()));
-        index_one(source, home, &mut manifest, &search, name, c, stream, download, progress)?;
+        index_one(source, home, &mut manifest, &search, name, c, download, progress)?;
     }
 
     search.into_inner().unwrap().commit()?;
@@ -178,7 +175,6 @@ pub fn reindex(home: &Path) -> Result<()> {
             &search,
             Some(name),
             Some((collection_id, collection_name)),
-            false,
             false,
             None,
         )
@@ -285,13 +281,10 @@ fn index_one(
     // The collection (id, display name) this WACZ joins. `None` makes the WACZ
     // its own singleton collection (id == WACZ id, name == WACZ name).
     collection: Option<(&str, &str)>,
-    // Force CDX (streaming) extraction (for a local file). Remote URLs stream by
-    // default regardless.
-    stream: bool,
     // Download a remote WACZ into <home>/archive and index it as a local file
     // (durable copy, whole-file fixity, offline replay) instead of streaming.
     download: bool,
-    // Optional progress sink for streaming indexes.
+    // Optional progress sink for indexing.
     progress: Option<&dyn IndexProgress>,
 ) -> Result<()> {
     // Show an indeterminate spinner from the very start: the setup work (probing
@@ -342,9 +335,6 @@ fn index_one(
             }
         }
     };
-    // Stream a local file only when explicitly asked (--stream on a File source).
-    let stream_local = stream && matches!(&effective_source, Source::File(_));
-
     let id = wacz_id(&effective_source);
 
     // Read metadata from the WACZ datapackage.json up front so its title can
@@ -372,29 +362,33 @@ fn index_one(
 
     // Index pages, tagging each with this WACZ (id/name) and its collection. The
     // pass also collects provenance and capture stats (no re-read of the WARCs).
-    // `--stream` uses CDX-guided extraction over the file; the default scans
-    // every WARC record.
+    // CDX-guided extraction is the default everywhere (replay already resolves
+    // records through the CDX, so indexing trusts it too); a full scan is only
+    // the fallback when a WACZ can't be CDX-guided (deflated WARCs / no CDX).
     let stats = match &remote_url {
         Some(u) => {
             info!(url = %u, "streaming remote WACZ index (no download)");
             let reader = crate::http_range::open_remote(u)?;
             index_wacz_streaming(reader, &id, &display_name, &collection_id, search, u, progress)?
         }
-        None if stream_local => {
-            let p = local.as_ref().unwrap();
-            let file = std::fs::File::open(p)
-                .with_context(|| format!("opening {} for streaming index", p.display()))?;
-            index_wacz_streaming(file, &id, &display_name, &collection_id, search, &p.display().to_string(), progress)?
-        }
         None => {
-            // The scan path has no cheap up-front record total, so it stays on
-            // the spinner (no determinate bar). Relabel it "indexing" so the
-            // spinner is accurate for the scan phase - after a `--download` it
-            // was still showing "downloading" while it scanned.
-            if let Some(p) = progress {
-                p.phase("indexing");
+            let p = local.as_ref().unwrap();
+            // CDX-guided when the WARCs are Stored (the WACZ spec's SHOULD, always
+            // true for Browsertrix output) so a CDX offset maps to a byte
+            // position; otherwise fall back to a full scan of every WARC record.
+            if local_warcs_streamable(p).unwrap_or(false) {
+                let file = std::fs::File::open(p)
+                    .with_context(|| format!("opening {} for CDX-guided index", p.display()))?;
+                index_wacz_streaming(file, &id, &display_name, &collection_id, search, &p.display().to_string(), progress)?
+            } else {
+                // The scan path has no cheap up-front record total, so it stays on
+                // the spinner (no determinate bar). Relabel it "indexing" so the
+                // spinner is accurate for the scan phase.
+                if let Some(pr) = progress {
+                    pr.phase("indexing");
+                }
+                index_wacz(p, &id, &display_name, &collection_id, search)?
             }
-            index_wacz(local.as_ref().unwrap(), &id, &display_name, &collection_id, search)?
         }
     };
 
@@ -506,6 +500,17 @@ fn remote_warcs_streamable(url: &str) -> Result<bool> {
     let reader = crate::http_range::open_remote(url)?;
     let mut zip = zip::ZipArchive::new(reader)
         .with_context(|| format!("reading remote ZIP central directory of {url}"))?;
+    crate::wacz::warcs_stored(&mut zip)
+}
+
+/// Whether a local WACZ can be CDX-guided: its `archive/` WARC entries are Stored
+/// (uncompressed), so a CDX byte offset maps to an absolute position. The file
+/// counterpart of [`remote_warcs_streamable`]; reads only the central directory.
+fn local_warcs_streamable(path: &Path) -> Result<bool> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading ZIP central directory of {}", path.display()))?;
     crate::wacz::warcs_stored(&mut zip)
 }
 
@@ -1004,6 +1009,14 @@ mod tests {
     }
 
     #[test]
+    fn local_warcs_streamable_gates_the_default_extraction() {
+        // The auto-decision for a local file: CDX-guided when WARCs are Stored,
+        // else a full scan. a.wacz is Stored; simple.wacz deflates its WARCs.
+        assert!(local_warcs_streamable(&fixture("a.wacz")).unwrap());
+        assert!(!local_warcs_streamable(&fixture("simple.wacz")).unwrap());
+    }
+
+    #[test]
     fn streaming_refuses_a_deflated_wacz() {
         use crate::search::SearchIndex;
         // simple.wacz deflates its WARC entries, which streaming can't seek into.
@@ -1115,7 +1128,7 @@ mod tests {
         let dest = archive.join("simple.wacz");
         std::fs::copy(fixture("simple.wacz"), &dest).unwrap();
 
-        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project"), false, false, None).unwrap();
+        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project"), false, None).unwrap();
 
         let m = crate::collections::Manifest::open(&tmp.path().join("index")).unwrap();
         assert!(

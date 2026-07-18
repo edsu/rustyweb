@@ -87,16 +87,10 @@ enum Commands {
         #[arg(long)]
         collection: Option<String>,
 
-        /// Index via the WACZ's CDX index (reading only page records) instead of
-        /// scanning every WARC record. Faster on media-heavy archives. Remote
-        /// (http/https) WACZs stream by default.
-        #[arg(long)]
-        stream: bool,
-
         /// Download a remote WACZ into <home>/archive and index it as a local
         /// file (durable copy, whole-file fixity, offline replay) instead of
-        /// streaming it. No effect on local sources.
-        #[arg(long, conflicts_with = "stream")]
+        /// streaming it in place. No effect on local sources.
+        #[arg(long)]
         download: bool,
 
         /// Verbose logging (debug level). Replaces the progress bar with detailed
@@ -325,7 +319,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // `verbose` is read up front (to set the log level / bar); ignore here.
-        Commands::Index { paths, from_file, home, name, collection, stream, download, verbose: _ } => {
+        Commands::Index { paths, from_file, home, name, collection, download, verbose: _ } => {
             // Sources come from the positional args plus, optionally, a
             // newline-delimited list from a file or stdin.
             let mut locations = paths;
@@ -377,7 +371,6 @@ async fn main() -> Result<()> {
                     &home,
                     name.as_deref(),
                     collection.as_deref(),
-                    stream,
                     download,
                     progress,
                 );
