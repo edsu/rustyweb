@@ -12,6 +12,12 @@ use anyhow::{Context, Result};
 /// one request; a read larger than this fetches exactly what's asked.
 const CHUNK: u64 = 256 * 1024;
 
+/// The end of a ZIP holds the EOCD and the central directory, which the reader
+/// touches repeatedly (once per entry) while also reading local headers scattered
+/// across the file. Cache this many bytes of the tail once so those end-of-file
+/// reads never re-fetch and don't get evicted by the rolling buffer.
+const TAIL_CACHE: u64 = 1024 * 1024;
+
 /// Fetches byte ranges of a resource. Abstracted from the buffering/seek logic
 /// so that logic can be unit-tested against an in-memory source.
 pub trait RangeFetch {
@@ -24,13 +30,18 @@ pub trait RangeFetch {
 pub struct RangeReader<F: RangeFetch> {
     fetch: F,
     pos: u64,
+    // Rolling forward buffer for reads in the body of the file.
     buf: Vec<u8>,
     buf_start: u64,
+    // Cached tail (end-of-file region: EOCD + central directory), fetched once.
+    tail: Option<Vec<u8>>,
+    tail_start: u64,
 }
 
 impl<F: RangeFetch> RangeReader<F> {
     pub fn new(fetch: F) -> Self {
-        Self { fetch, pos: 0, buf: Vec::new(), buf_start: 0 }
+        let tail_start = fetch.total_len().saturating_sub(TAIL_CACHE);
+        Self { fetch, pos: 0, buf: Vec::new(), buf_start: 0, tail: None, tail_start }
     }
 
     pub fn total_len(&self) -> u64 {
@@ -50,13 +61,29 @@ impl<F: RangeFetch> Read for RangeReader<F> {
         if self.pos >= total || out.is_empty() {
             return Ok(0);
         }
+
+        // Reads in the tail region (EOCD + central directory) come from a cache
+        // fetched once, so they don't thrash against scattered body reads.
+        if self.pos >= self.tail_start {
+            if self.tail.is_none() {
+                self.tail = Some(self.fetch.fetch(self.tail_start, total)?);
+            }
+            let tail = self.tail.as_ref().unwrap();
+            let off = (self.pos - self.tail_start) as usize;
+            let n = (tail.len() - off).min(out.len());
+            out[..n].copy_from_slice(&tail[off..off + n]);
+            self.pos += n as u64;
+            return Ok(n);
+        }
+
         let off = match self.buffered_offset(self.pos) {
             Some(o) => o,
             None => {
                 // Fetch a window at pos: at least the requested size, otherwise a
-                // read-ahead chunk, capped at the file end.
+                // read-ahead chunk, capped at the tail (or file end).
                 let want = (out.len() as u64).max(CHUNK).min(total - self.pos);
-                self.buf = self.fetch.fetch(self.pos, self.pos + want)?;
+                let end = (self.pos + want).min(total);
+                self.buf = self.fetch.fetch(self.pos, end)?;
                 self.buf_start = self.pos;
                 0
             }
@@ -203,5 +230,60 @@ mod tests {
         let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
         let mut rr = RangeReader::new(MemFetch(data.clone()));
         assert_eq!(read_n(&mut rr, n), data);
+    }
+
+    #[test]
+    fn range_reader_tail_and_body_regions_match_cursor() {
+        // Larger than the tail cache, so both the tail and the rolling body
+        // buffer are exercised.
+        let n = (TAIL_CACHE + 300_000) as usize;
+        let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let mut rr = RangeReader::new(MemFetch(data.clone()));
+        let mut cur = std::io::Cursor::new(data.clone());
+        for &(pos, len) in &[
+            (0u64, 1000usize),
+            (500_000, 4096),
+            (n as u64 - 50, 50),          // tail
+            (n as u64 - 300_000, 200_000), // spans body into tail
+        ] {
+            rr.seek(SeekFrom::Start(pos)).unwrap();
+            cur.seek(SeekFrom::Start(pos)).unwrap();
+            assert_eq!(read_n(&mut rr, len), read_n(&mut cur, len), "pos {pos} len {len}");
+        }
+    }
+
+    /// Counts fetches so we can assert the tail cache prevents re-fetching.
+    struct CountingFetch {
+        data: Vec<u8>,
+        count: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl RangeFetch for CountingFetch {
+        fn total_len(&self) -> u64 {
+            self.data.len() as u64
+        }
+        fn fetch(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+            self.count.set(self.count.get() + 1);
+            Ok(self.data[start as usize..end as usize].to_vec())
+        }
+    }
+
+    #[test]
+    fn tail_cache_avoids_thrashing_between_end_and_body() {
+        // Reproduces the ZIP pattern: read the central directory (end) and a
+        // local header (body), alternating. Each region must be fetched once.
+        let n = (TAIL_CACHE + 4_000_000) as usize;
+        let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let mut rr = RangeReader::new(CountingFetch { data: vec![9u8; n], count: count.clone() });
+        for _ in 0..20 {
+            rr.seek(SeekFrom::End(-100)).unwrap();
+            read_n(&mut rr, 40); // "central directory" read (tail)
+            rr.seek(SeekFrom::Start(2_000_000)).unwrap();
+            read_n(&mut rr, 30); // "local header" read (body)
+        }
+        assert!(
+            count.get() <= 3,
+            "tail cache should make ~2 fetches, not 40; got {}",
+            count.get()
+        );
     }
 }
