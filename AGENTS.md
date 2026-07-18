@@ -105,3 +105,10 @@ Also worth checking:
   comment density. Reference `file:line` when pointing at code.
 - **Docs are living.** README is user-facing; DESIGN is the architecture of record;
   update both when behavior or design changes, in the same change.
+- **Vendored ReplayWeb.page assets need manual refresh.** `static/replay/ui.js`
+  and `sw.js` are committed, pinned copies of the `replaywebpage` npm release (see
+  `scripts/fetch-replay.sh`). They are *not* a Cargo dependency, so Dependabot
+  won't bump them - upgrade deliberately: bump `VERSION` in the script, re-run it,
+  rebuild, re-test replay in a browser (`cargo test -p rustyweb-lib --test
+  browser`), then commit the refreshed assets. Do this periodically to pick up
+  wabac.js fixes (details in DESIGN → *ReplayWebPage Assets*).
