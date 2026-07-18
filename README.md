@@ -1,5 +1,7 @@
 # rustyweb
 
+[![CI](https://github.com/edsu/rustyweb/actions/workflows/ci.yml/badge.svg)](https://github.com/edsu/rustyweb/actions/workflows/ci.yml)
+
 **Note bene**: *rustyweb is alpha software and has been written extensively
 with the support of Claude Code. Like any piece of software it may contain
 bugs. The developer's understanding of how it operates at a low level may be
