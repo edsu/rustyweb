@@ -32,7 +32,7 @@ indicatif = "0.17"
 # Registrable-domain (public suffix list) for the cross-subdomain site: facet.
 psl = "2"
 # Pure-Rust language detection (fallback when a page has no <html lang>).
-whatlang = "0.16"
+whatlang = "0.18"
 
 # PDF text extraction
 pdf-extract = "0.7"
