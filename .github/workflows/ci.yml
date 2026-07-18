@@ -20,10 +20,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Installs the exact toolchain + components pinned in rust-toolchain.toml,
+      # so CI matches local `rustup` (single source of truth for the Rust version).
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2

@@ -1,0 +1,6 @@
+# Pin the Rust toolchain so local builds match CI exactly — same rustc/cargo
+# (and rustfmt/clippy behavior). rustup honors this file automatically in the
+# repo, and CI installs from it too. Bump `channel` to adopt a newer Rust.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
