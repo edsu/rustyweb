@@ -46,7 +46,8 @@ rustyweb/
 │   │       ├── server.rs    - Axum router and all HTTP handlers
 │   │       ├── collections.rs - Collection manifest (collections.json)
 │   │       ├── warc.rs      - WARC record iteration and HTML extraction
-│   │       └── wacz.rs      - WACZ ZIP handling, datapackage.json, CDX reader
+│   │       ├── wacz.rs      - WACZ ZIP handling, datapackage.json, CDX reader
+│   │       └── http_range.rs - Read+Seek over HTTP range requests (remote streaming)
 │   └── rustyweb-bin/        (thin CLI entry point)
 │       └── src/main.rs      - Clap CLI, subcommand dispatch, tokio::main
 └── static/replay/           (ReplayWebPage assets - embedded at compile time)
@@ -57,7 +58,7 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index          [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] <PATH|URL>...
+rustyweb index          [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--stream] [--download] <PATH|URL>...
 rustyweb reindex        [--home <DIR>]
 rustyweb serve          [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set [--home <DIR>] <COLLECTION> <WACZ_ID>...
@@ -72,7 +73,7 @@ index + the JSON manifest, see *Collection Management*). Keeping them together
 makes a home folder portable - move it to another disk or machine and it still
 resolves.
 
-- `index`: indexes one or more `.wacz` files or `http(s)://` URLs (downloaded to a temp file for indexing) - at least one argument is required. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. `--from-file <FILE>` (or `-f -` for stdin) reads a newline-delimited list of files/URLs, ignoring blank lines and `#` comments, and combines with any positional args. (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
+- `index`: indexes one or more `.wacz` files or `http(s)://` URLs - at least one argument is required. A **remote URL is streamed by default** (CDX-guided, over HTTP range requests, no download - see *Indexing Pipeline*); `--download` fetches it into `<home>/archive` for a durable local copy instead, and `--stream` forces CDX-guided extraction on a *local* file. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each local WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. `--from-file <FILE>` (or `-f -` for stdin) reads a newline-delimited list of files/URLs, ignoring blank lines and `#` comments, and combines with any positional args. (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
 - `reindex`: rebuild the full-text index from the sources already recorded in the manifest, preserving collection membership and metadata. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. Missing local files are skipped with a warning. This is the intended way to migrate the index after a schema change (see below).
 - `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
 - `collection set` / `collection list`: reassign WACZs to a collection (by WACZ id) / list collections and their members. Metadata like description and curator is edited in `collections.json` directly.
@@ -396,6 +397,41 @@ grouped at query time instead (see *Faceted, temporal discovery*).
 
 Parallelism: Rayon parallel iterator over the WARC member list within each WACZ;
 merge and Tantivy writes happen once per WACZ.
+
+### Scan vs. CDX-guided streaming
+
+There are two extraction modes, sharing the same per-record transform
+(`record_to_raw`) and merge step (`index_merged`) so they produce an identical
+index:
+
+- **Scan** (`index_wacz`): decompress and inspect *every* WARC record. Robust
+  (doesn't trust the CDX) and the default for local files.
+- **CDX-guided streaming** (`index_wacz_streaming`, over any `Read + Seek`): read
+  the WACZ's CDX, then fetch *only* the page records (HTML/PDF responses and
+  `urn:text:` rendered text) by seeking to `data_start + offset` for the length
+  the CDX gives. Media (images/JS/CSS/JSON) and pseudo-records (pageinfo,
+  thumbnail) are never read. This is the default for **remote** WACZs, where the
+  reader is an `HttpRangeReader` (`http_range.rs`) that issues HTTP range
+  requests - so a remote WACZ is indexed **without downloading it**, fetching
+  only the central directory, the CDX, and the page records. The same primitive
+  wabac.js uses for replay.
+
+Requirements and caveats, grounded in the WACZ spec:
+
+- Streaming relies on the spec's SHOULD that `archive/` WARCs are **Stored**
+  (uncompressed) in the ZIP, so a CDX byte offset maps to an absolute position.
+  A WARC gzip member is one record; the CDX `index.cdx.gz` is often a
+  multi-member gzip (ZipNum blocks), so it's read with `MultiGzDecoder`.
+- If a remote host doesn't support range requests, or a WACZ deflates its WARCs
+  (violating the SHOULD), streaming isn't possible; rustyweb **falls back to
+  downloading** a temp copy and scanning it, keeping the URL as the source.
+- `--download` instead fetches the remote WACZ into `<home>/archive` and indexes
+  it as a local file (durable copy, whole-file SHA-256, offline replay).
+- **Fixity of streamed sources**: a streamed remote is never read in full, so it
+  has no whole-file SHA-256 (empty in the manifest) and its `file_size` comes
+  from the HTTP `Content-Length`. `verify` already skips remote sources, so this
+  is consistent; per-resource integrity from `datapackage-digest.json` is future
+  work (see *Planned*).
 
 ---
 
