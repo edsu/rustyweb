@@ -426,13 +426,24 @@ fn index_one(
 
     // Fixity: a streamed remote is never fully read, so there's no whole-file
     // SHA-256 (empty; `verify` already skips remote sources). Its size comes
-    // from the HTTP Content-Length. A local/downloaded file is hashed as before.
+    // from the HTTP Content-Length. A local/downloaded file is hashed as before -
+    // reading the whole file, which dominates the tail for a large local WACZ (so
+    // it gets its own "checksumming" phase and timing, not lumped into indexing).
     let (sha, file_size) = match &remote_url {
         Some(u) => (String::new(), crate::http_range::open_remote(u)?.total_len()),
         None => {
             let p = local.as_ref().unwrap();
+            if let Some(pr) = progress {
+                pr.phase("checksumming");
+            }
+            let sha_start = std::time::Instant::now();
             let sha = file_sha256(p).with_context(|| format!("computing sha256 of {}", p.display()))?;
             let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            info!(
+                sha_ms = sha_start.elapsed().as_millis() as u64,
+                bytes = size,
+                "computed whole-file SHA-256 (fixity)"
+            );
             (sha, size)
         }
     };
