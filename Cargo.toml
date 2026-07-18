@@ -22,7 +22,7 @@ tantivy = "0.26"
 
 # WARC / WACZ
 warc = "0.4"
-zip = "2"
+zip = "8"
 
 # URL / HTML
 url = "2"

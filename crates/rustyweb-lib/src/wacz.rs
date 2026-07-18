@@ -291,8 +291,11 @@ pub(crate) fn warc_data_starts<R: std::io::Read + std::io::Seek>(
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
         let name = entry.name().to_string();
-        if is_warc_entry(&name) {
-            map.insert(basename(&name).to_string(), entry.data_start());
+        // `data_start()` is `Option<u64>` (zip 8+): `Some` once the local header
+        // has been read, which `by_index` does. A WARC without a known data start
+        // can't be seeked into, so skip it (its CDX records are then not fetched).
+        if let (true, Some(start)) = (is_warc_entry(&name), entry.data_start()) {
+            map.insert(basename(&name).to_string(), start);
         }
     }
     Ok(map)
