@@ -319,7 +319,10 @@ pub(crate) fn find_warcinfo_streaming<R: std::io::Read + std::io::Seek>(
         {
             continue;
         }
-        for rec in crate::warc::parse_warc_records(&decoded, 0, 0).into_iter().flatten() {
+        for rec in crate::warc::parse_warc_records(&decoded, 0, 0)
+            .into_iter()
+            .flatten()
+        {
             if let Some(info) = crate::warc::Warcinfo::from_record(&rec) {
                 if !info.is_empty() {
                     return Ok(Some(info));
@@ -446,7 +449,11 @@ pub fn extract_warc_from_wacz(
         .by_name(entry_name)
         .with_context(|| format!("entry {} not found in {}", entry_name, wacz_path.display()))?;
 
-    let suffix = if entry_name.ends_with(".warc.gz") { ".warc.gz" } else { ".warc" };
+    let suffix = if entry_name.ends_with(".warc.gz") {
+        ".warc.gz"
+    } else {
+        ".warc"
+    };
     let mut tmp = tempfile::Builder::new().suffix(suffix).tempfile()?;
     copy(&mut entry, &mut tmp)?;
 
@@ -476,10 +483,12 @@ pub(crate) fn record_at<R: std::io::Read + std::io::Seek>(
     flate2::read::GzDecoder::new(&buf[..])
         .read_to_end(&mut decompressed)
         .context("decompressing WARC record slice")?;
-    Ok(crate::warc::parse_warc_records(&decompressed, offset, length)
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect())
+    Ok(
+        crate::warc::parse_warc_records(&decompressed, offset, length)
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -504,15 +513,22 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            zw.start_file("indexes/index.cdx.gz", zip::write::SimpleFileOptions::default())
-                .unwrap();
+            zw.start_file(
+                "indexes/index.cdx.gz",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
             zw.write_all(&cdx_gz).unwrap();
             zw.finish().unwrap();
         }
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
         let recs = cdx_records(&mut zip).unwrap();
         let urls: Vec<&str> = recs.iter().map(|r| r.url.as_str()).collect();
-        assert_eq!(recs.len(), 2, "must read every gzip member of the CDX, not just the first");
+        assert_eq!(
+            recs.len(),
+            2,
+            "must read every gzip member of the CDX, not just the first"
+        );
         assert!(urls.contains(&"https://example.com/a") && urls.contains(&"https://example.com/b"));
     }
 
@@ -524,8 +540,11 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            zw.start_file("indexes/index.cdxj", zip::write::SimpleFileOptions::default())
-                .unwrap();
+            zw.start_file(
+                "indexes/index.cdxj",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
             zw.write_all(line.as_bytes()).unwrap();
             zw.finish().unwrap();
         }
@@ -618,7 +637,10 @@ mod tests {
         let meta = read_datapackage(&fixture("github-bitcoin-mining.wacz")).unwrap();
         assert_eq!(meta.title.as_deref(), Some("GitHub Bitcoin Mining"));
         let created = meta.created.expect("created should fall back to mtime");
-        assert!(created.starts_with("2021-04-17"), "created from mtime: {created}");
+        assert!(
+            created.starts_with("2021-04-17"),
+            "created from mtime: {created}"
+        );
     }
 
     #[test]
@@ -658,7 +680,10 @@ mod tests {
     fn search_cdx_finds_redirect_record() {
         let records = search_cdx(&fixture("a.wacz"), "https://arcg.is/1zLCSC4").unwrap();
         let redirect = records.iter().find(|r| r.status == 301);
-        assert!(redirect.is_some(), "arcg.is shortener should be a 301 redirect");
+        assert!(
+            redirect.is_some(),
+            "arcg.is shortener should be a 301 redirect"
+        );
     }
 
     #[test]
@@ -672,14 +697,19 @@ mod tests {
         // a.wacz records the crawler in datapackage.json's `software` field.
         let meta = read_datapackage(&fixture("a.wacz")).unwrap();
         let software = meta.software.expect("datapackage should carry software");
-        assert!(software.contains("Browsertrix-Crawler"), "unexpected software: {software}");
+        assert!(
+            software.contains("Browsertrix-Crawler"),
+            "unexpected software: {software}"
+        );
     }
 
     #[test]
     fn read_warcinfo_extracts_software_from_real_wacz() {
         // a.wacz was produced by Browsertrix-Crawler, which writes a warcinfo
         // record with a `software` field.
-        let info = read_warcinfo(&fixture("a.wacz")).unwrap().expect("a.wacz has a warcinfo record");
+        let info = read_warcinfo(&fixture("a.wacz"))
+            .unwrap()
+            .expect("a.wacz has a warcinfo record");
         let software = info.software.expect("warcinfo should carry software");
         assert!(
             software.contains("Browsertrix-Crawler"),

@@ -101,7 +101,9 @@ async fn drive_and_check(driver: &WebDriver, addr: SocketAddr, id: &str) -> Resu
     }
     if !rendered {
         let diag = diagnostics(driver).await.unwrap_or_else(|e| e);
-        return Err(format!("archived page title '2Tone' never rendered.\nDIAG: {diag}"));
+        return Err(format!(
+            "archived page title '2Tone' never rendered.\nDIAG: {diag}"
+        ));
     }
 
     check_banner_tracks_navigation(driver).await
@@ -135,7 +137,9 @@ async fn check_banner_tracks_navigation(driver: &WebDriver) -> Result<(), String
     if text == new_url {
         Ok(())
     } else {
-        Err(format!("banner did not track rwp-url-change: expected {new_url}, got {text:?}"))
+        Err(format!(
+            "banner did not track rwp-url-change: expected {new_url}, got {text:?}"
+        ))
     }
 }
 

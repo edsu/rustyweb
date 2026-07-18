@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::fmt::{
-    format::{FormatEvent, Format, Writer},
+    format::{Format, FormatEvent, Writer},
     FmtContext,
 };
 use tracing_subscriber::registry::LookupSpan;
@@ -12,13 +12,8 @@ use tracing_subscriber::EnvFilter;
 
 // Wraps the default log format so that WARN and ERROR lines are highlighted in
 // bold color across the entire line, not just the level label.
+#[derive(Default)]
 struct ColorLineFormat(Format);
-
-impl Default for ColorLineFormat {
-    fn default() -> Self {
-        Self(Format::default())
-    }
-}
 
 impl<S, N> FormatEvent<S, N> for ColorLineFormat
 where
@@ -35,7 +30,7 @@ where
         let color = if writer.has_ansi_escapes() {
             match level {
                 tracing::Level::ERROR => Some("\x1b[1;31m"),
-                tracing::Level::WARN  => Some("\x1b[1;33m"),
+                tracing::Level::WARN => Some("\x1b[1;33m"),
                 _ => None,
             }
         } else {
@@ -49,7 +44,7 @@ where
         let mut buf = String::new();
         self.0.format_event(ctx, Writer::new(&mut buf), event)?;
         let line = buf.trim_end_matches('\n');
-        write!(writer, "{start}{line}\x1b[0m\n")
+        writeln!(writer, "{start}{line}\x1b[0m")
     }
 }
 
@@ -175,8 +170,7 @@ fn read_source_list(src: &str) -> Result<Vec<String>> {
             .context("reading WACZ list from stdin")?;
         buf
     } else {
-        std::fs::read_to_string(src)
-            .with_context(|| format!("reading WACZ list from {src}"))?
+        std::fs::read_to_string(src).with_context(|| format!("reading WACZ list from {src}"))?
     };
     Ok(parse_source_lines(&text))
 }
@@ -212,7 +206,9 @@ struct Active {
 
 impl BarProgress {
     fn new() -> Self {
-        Self { inner: std::sync::Mutex::new(None) }
+        Self {
+            inner: std::sync::Mutex::new(None),
+        }
     }
 
     /// Clear any active bar (safety net for the error path, where `finish` on the
@@ -294,7 +290,11 @@ impl rustyweb_lib::index::IndexProgress for BarProgress {
     fn wacz_indexed(&self, label: &str, pages: u64) {
         // `println` on the active bar writes a line that persists after the bar is
         // cleared, so the run leaves a record of what it did.
-        let line = format!("✓ indexed {pages} page{} from {}", if pages == 1 { "" } else { "s" }, short_label(label));
+        let line = format!(
+            "✓ indexed {pages} page{} from {}",
+            if pages == 1 { "" } else { "s" },
+            short_label(label)
+        );
         match &*self.inner.lock().unwrap() {
             Some(a) => a.pb.println(line),
             None => eprintln!("{line}"),
@@ -340,7 +340,15 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // `verbose` is read up front (to set the log level / bar); ignore here.
-        Commands::Index { paths, from_file, home, name, collection, download, verbose: _ } => {
+        Commands::Index {
+            paths,
+            from_file,
+            home,
+            name,
+            collection,
+            download,
+            verbose: _,
+        } => {
             // Sources come from the positional args plus, optionally, a
             // newline-delimited list from a file or stdin.
             let mut locations = paths;
@@ -371,7 +379,9 @@ async fn main() -> Result<()> {
             // record is a separate HTTP range request) visible. Shown only on an
             // interactive stderr and not under -v (see `show_bar` above).
             let bar = show_bar.then(BarProgress::new);
-            let progress = bar.as_ref().map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
+            let progress = bar
+                .as_ref()
+                .map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
 
             let total = locations.len();
             for (i, location) in locations.iter().enumerate() {
@@ -459,7 +469,12 @@ async fn main() -> Result<()> {
         }
 
         Commands::Collection { action } => match action {
-            CollectionCmd::Set { name, description, curator, home } => {
+            CollectionCmd::Set {
+                name,
+                description,
+                curator,
+                home,
+            } => {
                 let id = rustyweb_lib::index::set_collection(&home, &name, description, curator)?;
                 println!("collection \"{name}\" ({id}) updated");
             }
@@ -568,7 +583,11 @@ fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
         // This debugging aid reads the CDX from the local WACZ; skip remote
         // sources rather than re-downloading them.
         if matches!(col.source, Source::Url(_)) {
-            eprintln!("skipping remote collection {} ({})", col.name, col.source.location());
+            eprintln!(
+                "skipping remote collection {} ({})",
+                col.name,
+                col.source.location()
+            );
             continue;
         }
         let path = col.source.resolve(home).unwrap();

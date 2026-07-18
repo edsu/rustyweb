@@ -6,10 +6,10 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use tracing::{debug, info};
 
-use crate::collections::{Manifest, Source, Wacz, file_sha256, wacz_id};
-use crate::search::{SearchIndex, extract_html_text};
-use crate::warc::{Warcinfo, WarcRecord, iter_records};
+use crate::collections::{file_sha256, wacz_id, Manifest, Source, Wacz};
+use crate::search::{extract_html_text, SearchIndex};
 use crate::wacz::{extract_warc_from_wacz, iter_warc_paths, read_datapackage};
+use crate::warc::{iter_records, WarcRecord, Warcinfo};
 
 /// Paths derived from a rustyweb home directory.
 pub fn index_dir(home: &Path) -> PathBuf {
@@ -99,7 +99,16 @@ pub fn index_location(
     let mut summaries: Vec<(String, u64)> = Vec::new();
     for source in &sources {
         let c = group.as_ref().map(|(id, n)| (id.as_str(), n.as_str()));
-        summaries.push(index_one(source, home, &mut manifest, &search, name, c, download, progress)?);
+        summaries.push(index_one(
+            source,
+            home,
+            &mut manifest,
+            &search,
+            name,
+            c,
+            download,
+            progress,
+        )?);
     }
 
     // The Tantivy commit (segment flush) is the slow tail, especially after fast
@@ -109,7 +118,10 @@ pub fn index_location(
     }
     let commit_start = std::time::Instant::now();
     search.into_inner().unwrap().commit()?;
-    debug!(commit_ms = commit_start.elapsed().as_millis() as u64, "committed index");
+    debug!(
+        commit_ms = commit_start.elapsed().as_millis() as u64,
+        "committed index"
+    );
     manifest.save()?;
     // Report per-WACZ page counts only now that the index is actually built and
     // committed - not while it's still being written (or if the commit failed).
@@ -150,7 +162,12 @@ pub fn reindex(home: &Path) -> Result<()> {
                 .collection_by_id(&w.collection)
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| w.name.clone());
-            (w.source.clone(), w.name.clone(), w.collection.clone(), coll_name)
+            (
+                w.source.clone(),
+                w.name.clone(),
+                w.collection.clone(),
+                coll_name,
+            )
         })
         .collect();
 
@@ -390,7 +407,15 @@ fn index_one(
         Some(u) => {
             info!(url = %u, "streaming remote WACZ index (no download)");
             let reader = crate::http_range::open_remote(u)?;
-            index_wacz_streaming(reader, &id, &display_name, &collection_id, search, u, progress)?
+            index_wacz_streaming(
+                reader,
+                &id,
+                &display_name,
+                &collection_id,
+                search,
+                u,
+                progress,
+            )?
         }
         None => {
             let p = local.as_ref().unwrap();
@@ -400,7 +425,15 @@ fn index_one(
             if local_warcs_streamable(p).unwrap_or(false) {
                 let file = std::fs::File::open(p)
                     .with_context(|| format!("opening {} for CDX-guided index", p.display()))?;
-                index_wacz_streaming(file, &id, &display_name, &collection_id, search, &p.display().to_string(), progress)?
+                index_wacz_streaming(
+                    file,
+                    &id,
+                    &display_name,
+                    &collection_id,
+                    search,
+                    &p.display().to_string(),
+                    progress,
+                )?
             } else {
                 // The scan path has no cheap up-front record total, so it stays on
                 // the spinner (no determinate bar). Label it "scanning" - it reads
@@ -430,14 +463,18 @@ fn index_one(
     // reading the whole file, which dominates the tail for a large local WACZ (so
     // it gets its own "checksumming" phase and timing, not lumped into indexing).
     let (sha, file_size) = match &remote_url {
-        Some(u) => (String::new(), crate::http_range::open_remote(u)?.total_len()),
+        Some(u) => (
+            String::new(),
+            crate::http_range::open_remote(u)?.total_len(),
+        ),
         None => {
             let p = local.as_ref().unwrap();
             if let Some(pr) = progress {
                 pr.phase("checksumming");
             }
             let sha_start = std::time::Instant::now();
-            let sha = file_sha256(p).with_context(|| format!("computing sha256 of {}", p.display()))?;
+            let sha =
+                file_sha256(p).with_context(|| format!("computing sha256 of {}", p.display()))?;
             let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
             debug!(
                 sha_ms = sha_start.elapsed().as_millis() as u64,
@@ -514,16 +551,22 @@ fn download_into_archive(url: &str, home: &Path) -> Result<PathBuf> {
         .rsplit('/')
         .find(|s| !s.is_empty())
         .unwrap_or("download");
-    let name = if stem.ends_with(".wacz") { stem.to_string() } else { format!("{stem}.wacz") };
+    let name = if stem.ends_with(".wacz") {
+        stem.to_string()
+    } else {
+        format!("{stem}.wacz")
+    };
 
     let archive = archive_dir(home);
     std::fs::create_dir_all(&archive)
         .with_context(|| format!("creating archive dir {}", archive.display()))?;
     let dest = archive.join(&name);
 
-    let resp = ureq::get(url).call().with_context(|| format!("HTTP GET {url}"))?;
-    let mut file = std::fs::File::create(&dest)
-        .with_context(|| format!("creating {}", dest.display()))?;
+    let resp = ureq::get(url)
+        .call()
+        .with_context(|| format!("HTTP GET {url}"))?;
+    let mut file =
+        std::fs::File::create(&dest).with_context(|| format!("creating {}", dest.display()))?;
     copy(&mut resp.into_reader(), &mut file)
         .with_context(|| format!("writing {url} to {}", dest.display()))?;
     file.flush()?;
@@ -544,8 +587,7 @@ fn remote_warcs_streamable(url: &str) -> Result<bool> {
 /// (uncompressed), so a CDX byte offset maps to an absolute position. The file
 /// counterpart of [`remote_warcs_streamable`]; reads only the central directory.
 fn local_warcs_streamable(path: &Path) -> Result<bool> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(file)
         .with_context(|| format!("reading ZIP central directory of {}", path.display()))?;
     crate::wacz::warcs_stored(&mut zip)
@@ -659,8 +701,9 @@ fn index_wacz(
     let per_warc: Vec<(Vec<RawRecord>, Option<Warcinfo>)> = warc_paths
         .par_iter()
         .map(|entry_name| {
-            let tmp = extract_warc_from_wacz(wacz_path, entry_name)
-                .with_context(|| format!("extracting {} from {}", entry_name, wacz_path.display()))?;
+            let tmp = extract_warc_from_wacz(wacz_path, entry_name).with_context(|| {
+                format!("extracting {} from {}", entry_name, wacz_path.display())
+            })?;
             collect_page_records(tmp.path())
         })
         .collect::<Result<Vec<_>>>()?;
@@ -675,7 +718,15 @@ fn index_wacz(
         }
         raws.extend(r);
     }
-    index_merged(raws, warcinfo, collection_id, collection_name, collection, search, &wacz_path.display().to_string())
+    index_merged(
+        raws,
+        warcinfo,
+        collection_id,
+        collection_name,
+        collection,
+        search,
+        &wacz_path.display().to_string(),
+    )
 }
 
 /// Index a WACZ by CDX-guided/streaming extraction over a `Read + Seek` source
@@ -692,7 +743,15 @@ fn index_wacz_streaming<R: std::io::Read + std::io::Seek>(
     progress: Option<&dyn IndexProgress>,
 ) -> Result<CrawlStats> {
     let (raws, warcinfo) = collect_page_records_via_cdx(reader, progress)?;
-    index_merged(raws, warcinfo, collection_id, collection_name, collection, search, label)
+    index_merged(
+        raws,
+        warcinfo,
+        collection_id,
+        collection_name,
+        collection,
+        search,
+        label,
+    )
 }
 
 /// Merge per-record contributions into one document per URL and index them.
@@ -712,50 +771,67 @@ fn index_merged(
     {
         for raw in raws {
             match raw {
-            RawRecord::Html { url, timestamp, title, body, description, headings, keywords, author, media_type, lang, status, modified_year } => {
-                let e = pages.entry(url).or_default();
-                // The HTML capture is the authoritative timestamp for replay.
-                e.timestamp = timestamp;
-                if !title.is_empty() {
-                    e.title = Some(title);
-                }
-                if !body.is_empty() {
-                    e.html_body = Some(body);
-                }
-                if !description.is_empty() {
-                    e.description = Some(description);
-                }
-                if !headings.is_empty() {
-                    e.headings = Some(headings);
-                }
-                if !keywords.is_empty() {
-                    e.keywords = Some(keywords);
-                }
-                if !author.is_empty() {
-                    e.author = Some(author);
-                }
-                if !media_type.is_empty() {
-                    e.media_type = Some(media_type);
-                }
-                if !lang.is_empty() {
-                    e.lang = Some(lang);
-                }
-                if status.is_some() {
-                    e.status = status;
-                }
-                if modified_year.is_some() {
-                    e.modified_year = modified_year;
-                }
-            }
-            RawRecord::Text { url, timestamp, text } => {
-                let e = pages.entry(url).or_default();
-                if e.timestamp.is_empty() {
+                RawRecord::Html {
+                    url,
+                    timestamp,
+                    title,
+                    body,
+                    description,
+                    headings,
+                    keywords,
+                    author,
+                    media_type,
+                    lang,
+                    status,
+                    modified_year,
+                } => {
+                    let e = pages.entry(url).or_default();
+                    // The HTML capture is the authoritative timestamp for replay.
                     e.timestamp = timestamp;
+                    if !title.is_empty() {
+                        e.title = Some(title);
+                    }
+                    if !body.is_empty() {
+                        e.html_body = Some(body);
+                    }
+                    if !description.is_empty() {
+                        e.description = Some(description);
+                    }
+                    if !headings.is_empty() {
+                        e.headings = Some(headings);
+                    }
+                    if !keywords.is_empty() {
+                        e.keywords = Some(keywords);
+                    }
+                    if !author.is_empty() {
+                        e.author = Some(author);
+                    }
+                    if !media_type.is_empty() {
+                        e.media_type = Some(media_type);
+                    }
+                    if !lang.is_empty() {
+                        e.lang = Some(lang);
+                    }
+                    if status.is_some() {
+                        e.status = status;
+                    }
+                    if modified_year.is_some() {
+                        e.modified_year = modified_year;
+                    }
                 }
-                e.rendered_text = Some(text);
-                // Rendered text always comes from an HTML page.
-                e.media_type.get_or_insert_with(|| "html".to_string());
-            }
+                RawRecord::Text {
+                    url,
+                    timestamp,
+                    text,
+                } => {
+                    let e = pages.entry(url).or_default();
+                    if e.timestamp.is_empty() {
+                        e.timestamp = timestamp;
+                    }
+                    e.rendered_text = Some(text);
+                    // Rendered text always comes from an HTML page.
+                    e.media_type.get_or_insert_with(|| "html".to_string());
+                }
             }
         }
     }
@@ -1018,7 +1094,10 @@ fn pdf_title_from_url(url: &str) -> String {
 
 /// Strip archive extensions to get a clean display name.
 fn file_display_name(path: &Path) -> String {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
     for suffix in &[".warc.gz", ".warc", ".wacz"] {
         if let Some(stem) = name.strip_suffix(suffix) {
             return stem.to_string();
@@ -1057,7 +1136,10 @@ mod tests {
         let scan = indexed_page_count("a.wacz", false);
         let stream = indexed_page_count("a.wacz", true);
         assert!(scan > 0, "fixture should index some pages");
-        assert_eq!(scan, stream, "CDX-guided streaming must index the same page count as scanning");
+        assert_eq!(
+            scan, stream,
+            "CDX-guided streaming must index the same page count as scanning"
+        );
     }
 
     #[test]
@@ -1080,18 +1162,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .to_lowercase();
-        assert!(err.contains("stored") || err.contains("compress"), "unexpected error: {err}");
+        assert!(
+            err.contains("stored") || err.contains("compress"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn last_modified_year_parses_http_date() {
         let headers = vec![
             ("Content-Type".to_string(), "text/html".to_string()),
-            ("Last-Modified".to_string(), "Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            (
+                "Last-Modified".to_string(),
+                "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+            ),
         ];
         assert_eq!(last_modified_year(&headers), Some(2015));
         // Header name match is case-insensitive.
-        let headers = vec![("last-modified".to_string(), "Mon, 01 Jan 2001 00:00:00 GMT".to_string())];
+        let headers = vec![(
+            "last-modified".to_string(),
+            "Mon, 01 Jan 2001 00:00:00 GMT".to_string(),
+        )];
         assert_eq!(last_modified_year(&headers), Some(2001));
         // Absent or unparseable -> None.
         assert_eq!(last_modified_year(&[]), None);
@@ -1165,7 +1256,9 @@ mod tests {
         let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
         let col = &manifest.waczs[0];
         assert!(
-            col.software.iter().any(|s| s.contains("Browsertrix-Crawler")),
+            col.software
+                .iter()
+                .any(|s| s.contains("Browsertrix-Crawler")),
             "unexpected software: {:?}",
             col.software
         );
@@ -1180,15 +1273,28 @@ mod tests {
         let dest = archive.join("simple.wacz");
         std::fs::copy(fixture("simple.wacz"), &dest).unwrap();
 
-        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project"), false, None).unwrap();
+        index_location(
+            &dest.to_string_lossy(),
+            tmp.path(),
+            None,
+            Some("My Project"),
+            false,
+            None,
+        )
+        .unwrap();
 
         let m = crate::collections::Manifest::open(&tmp.path().join("index")).unwrap();
         assert!(
-            m.collections.iter().any(|c| c.id == "my-project" && c.name == "My Project"),
+            m.collections
+                .iter()
+                .any(|c| c.id == "my-project" && c.name == "My Project"),
             "collection should be created: {:?}",
             m.collections.iter().map(|c| &c.id).collect::<Vec<_>>()
         );
-        assert_eq!(m.waczs[0].collection, "my-project", "WACZ should reference the collection");
+        assert_eq!(
+            m.waczs[0].collection, "my-project",
+            "WACZ should reference the collection"
+        );
     }
 
     #[test]
@@ -1200,10 +1306,12 @@ mod tests {
         std::fs::copy(fixture("simple.wacz"), &stray).unwrap();
 
         let err = index_path(&stray, home.path(), None)
-            .err()
-            .expect("indexing a WACZ outside the archive folder should fail");
+            .expect_err("indexing a WACZ outside the archive folder should fail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("archive"), "error should mention the archive folder: {msg}");
+        assert!(
+            msg.contains("archive"),
+            "error should mention the archive folder: {msg}"
+        );
     }
 
     #[test]
@@ -1212,11 +1320,13 @@ mod tests {
         let archive = tmp.path().join("archive");
         std::fs::create_dir_all(&archive).unwrap();
 
-        let err = index_path(&archive, tmp.path(), None)
-            .err()
-            .expect("indexing a directory should fail");
+        let err =
+            index_path(&archive, tmp.path(), None).expect_err("indexing a directory should fail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("directory"), "error should say it is a directory: {msg}");
+        assert!(
+            msg.contains("directory"),
+            "error should say it is a directory: {msg}"
+        );
     }
 
     #[test]
@@ -1260,7 +1370,10 @@ mod tests {
 
         // ...and the content is searchable again.
         let idx = crate::search::SearchIndex::open(full_text.as_path()).unwrap();
-        assert!(!idx.search("example", 10).unwrap().is_empty(), "reindexed content should be searchable");
+        assert!(
+            !idx.search("example", 10).unwrap().is_empty(),
+            "reindexed content should be searchable"
+        );
     }
 
     #[test]
@@ -1280,10 +1393,16 @@ mod tests {
         let manifest = r#"[{"id":"deadbeef","source":"archive/bad.wacz","name":"BadOne","date_indexed":"2026-01-01T00:00:00Z","file_size":14,"sha256":"00"}]"#;
         std::fs::write(tmp.path().join("index/collections.json"), manifest).unwrap();
 
-        let err = reindex(tmp.path()).err().expect("reindex should fail on a corrupt WACZ");
+        let err = reindex(tmp.path()).expect_err("reindex should fail on a corrupt WACZ");
         let msg = format!("{err:#}");
-        assert!(msg.contains("BadOne"), "error should name the failing collection: {msg}");
-        assert!(msg.contains("reindex"), "error should tell the user to reindex again: {msg}");
+        assert!(
+            msg.contains("BadOne"),
+            "error should name the failing collection: {msg}"
+        );
+        assert!(
+            msg.contains("reindex"),
+            "error should tell the user to reindex again: {msg}"
+        );
     }
 
     #[test]
@@ -1293,7 +1412,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("pdf-doc.wacz", tmp.path(), None);
 
-        let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+        let idx =
+            crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path())
+                .unwrap();
         let results = idx.search("type:pdf", 10).unwrap();
         assert!(
             results.iter().any(|r| r.doc_type == "page"),
@@ -1306,7 +1427,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), None);
 
-        let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+        let idx =
+            crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path())
+                .unwrap();
         let results = idx.search("example", 10).unwrap();
         assert!(!results.is_empty(), "should find HTML content from WACZ");
         assert_eq!(results[0].collection_name, "simple");
@@ -1331,7 +1454,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), None);
 
-        let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+        let idx =
+            crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path())
+                .unwrap();
         // The seed page URL "http://example.com/" is part of the collection body.
         let results = idx.search("example.com", 10).unwrap();
         assert!(
@@ -1346,7 +1471,9 @@ mod tests {
         index_fixture("simple.wacz", tmp.path(), None);
         index_fixture("simple.wacz", tmp.path(), None);
 
-        let idx = crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+        let idx =
+            crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path())
+                .unwrap();
         let results = idx.search("example", 50).unwrap();
         let pages = results.iter().filter(|r| r.doc_type == "page").count();
         assert_eq!(pages, 1, "re-indexing should upsert, not duplicate pages");

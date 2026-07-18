@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use axum::body::{Body, to_bytes};
+use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -34,15 +34,24 @@ fn index_into(home: &Path, name: &str) {
 #[test]
 fn index_wacz_html_response_indexed() {
     let tmp = make_index(&["simple.wacz"]);
-    let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+    let idx = rustyweb_lib::search::SearchIndex::open(
+        tmp.path().join("index").join("full_text").as_path(),
+    )
+    .unwrap();
     let results = idx.search("example", 10).unwrap();
-    assert!(!results.is_empty(), "HTML content from WACZ should be in fulltext index");
+    assert!(
+        !results.is_empty(),
+        "HTML content from WACZ should be in fulltext index"
+    );
 }
 
 #[test]
 fn index_wacz_collection_document_indexed() {
     let tmp = make_index(&["simple.wacz"]);
-    let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+    let idx = rustyweb_lib::search::SearchIndex::open(
+        tmp.path().join("index").join("full_text").as_path(),
+    )
+    .unwrap();
     // The seed page URL ends with "example.com" so searching example.com finds the collection doc.
     let results = idx.search("example.com", 10).unwrap();
     assert!(
@@ -54,10 +63,16 @@ fn index_wacz_collection_document_indexed() {
 #[test]
 fn index_wacz_result_has_collection_fields() {
     let tmp = make_index(&["simple.wacz"]);
-    let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+    let idx = rustyweb_lib::search::SearchIndex::open(
+        tmp.path().join("index").join("full_text").as_path(),
+    )
+    .unwrap();
     let results = idx.search("example", 10).unwrap();
     let page = results.iter().find(|r| r.doc_type == "page").unwrap();
-    assert!(!page.collection_id.is_empty(), "page should have collection_id");
+    assert!(
+        !page.collection_id.is_empty(),
+        "page should have collection_id"
+    );
     assert_eq!(page.collection_name, "simple");
 }
 
@@ -71,7 +86,10 @@ fn index_wacz_writes_manifest_with_metadata() {
     assert!(!col.id.is_empty());
     assert!(!col.sha256.is_empty());
     // simple.wacz has a pages/pages.jsonl with one page
-    assert!(!col.seed_pages.is_empty(), "should have seed pages from pages.jsonl");
+    assert!(
+        !col.seed_pages.is_empty(),
+        "should have seed pages from pages.jsonl"
+    );
 }
 
 // ── Search API ────────────────────────────────────────────────────────────────
@@ -81,13 +99,17 @@ async fn search_api_returns_results() {
     let tmp = make_index(&["simple.wacz"]);
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
     let req = Request::get("/api/search?q=example")
-        .body(Body::empty()).unwrap();
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(
-        json["results"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        json["results"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "search should return results: {json}"
     );
 }
@@ -97,14 +119,19 @@ async fn search_api_result_includes_collection_fields() {
     let tmp = make_index(&["simple.wacz"]);
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
     let req = Request::get("/api/search?q=example")
-        .body(Body::empty()).unwrap();
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let results = json["results"].as_array().unwrap();
     let first = &results[0];
-    assert!(first.get("collection_id").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false));
+    assert!(first
+        .get("collection_id")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false));
     assert!(first.get("collection_name").is_some());
     assert!(first.get("doc_type").is_some());
 }
@@ -114,13 +141,17 @@ async fn search_api_no_results() {
     let tmp = make_index(&["simple.wacz"]);
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
     let req = Request::get("/api/search?q=zzz_nonexistent_zzz")
-        .body(Body::empty()).unwrap();
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let results = json["results"].as_array().unwrap();
-    assert!(results.is_empty(), "nonexistent query should return empty results: {json}");
+    assert!(
+        results.is_empty(),
+        "nonexistent query should return empty results: {json}"
+    );
 }
 
 // ── File serving ──────────────────────────────────────────────────────────────
@@ -133,7 +164,8 @@ async fn files_route_serves_registered_wacz() {
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     let req = Request::get(format!("/files/{id}"))
-        .body(Body::empty()).unwrap();
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
@@ -147,11 +179,16 @@ async fn files_route_range_request() {
 
     let req = Request::get(format!("/files/{id}"))
         .header("range", "bytes=0-99")
-        .body(Body::empty()).unwrap();
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(body.len(), 100, "byte range should return exactly 100 bytes");
+    assert_eq!(
+        body.len(),
+        100,
+        "byte range should return exactly 100 bytes"
+    );
 }
 
 #[tokio::test]
@@ -179,14 +216,24 @@ async fn served_wacz_is_byte_identical_to_disk() {
     let id = manifest.waczs[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
-    let req = Request::get(format!("/files/{id}")).body(Body::empty()).unwrap();
+    let req = Request::get(format!("/files/{id}"))
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let served = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
     let on_disk = std::fs::read(fixture("a.wacz")).unwrap();
-    assert_eq!(served.len(), on_disk.len(), "served length should match file");
-    assert_eq!(served.as_ref(), on_disk.as_slice(), "served bytes must equal the WACZ on disk");
+    assert_eq!(
+        served.len(),
+        on_disk.len(),
+        "served length should match file"
+    );
+    assert_eq!(
+        served.as_ref(),
+        on_disk.as_slice(),
+        "served bytes must equal the WACZ on disk"
+    );
 }
 
 #[tokio::test]
@@ -199,17 +246,25 @@ async fn served_range_matches_the_file_slice() {
     // Request an interior slice and verify the exact bytes, not just the length.
     let req = Request::get(format!("/files/{id}"))
         .header("range", "bytes=100-199")
-        .body(Body::empty()).unwrap();
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(
         resp.headers().get("content-range").unwrap(),
-        &format!("bytes 100-199/{}", std::fs::metadata(fixture("a.wacz")).unwrap().len()),
+        &format!(
+            "bytes 100-199/{}",
+            std::fs::metadata(fixture("a.wacz")).unwrap().len()
+        ),
     );
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
     let on_disk = std::fs::read(fixture("a.wacz")).unwrap();
-    assert_eq!(body.as_ref(), &on_disk[100..=199], "range must return the exact file slice");
+    assert_eq!(
+        body.as_ref(),
+        &on_disk[100..=199],
+        "range must return the exact file slice"
+    );
 }
 
 #[tokio::test]
@@ -220,7 +275,9 @@ async fn served_wacz_cdx_resolves_a_replayable_page() {
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     // Pull the whole WACZ through the HTTP endpoint the browser would use...
-    let req = Request::get(format!("/files/{id}")).body(Body::empty()).unwrap();
+    let req = Request::get(format!("/files/{id}"))
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let served = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
 
@@ -230,8 +287,13 @@ async fn served_wacz_cdx_resolves_a_replayable_page() {
     std::fs::write(&served_path, &served).unwrap();
 
     let records = rustyweb_lib::wacz::search_cdx(&served_path, REAL_URL).unwrap();
-    let page = records.iter().find(|r| r.status == 200 && r.mime.contains("html"));
-    assert!(page.is_some(), "served WACZ should contain a replayable 200 HTML page for {REAL_URL}");
+    let page = records
+        .iter()
+        .find(|r| r.status == 200 && r.mime.contains("html"));
+    assert!(
+        page.is_some(),
+        "served WACZ should contain a replayable 200 HTML page for {REAL_URL}"
+    );
 }
 
 #[tokio::test]
@@ -243,12 +305,21 @@ async fn viewer_wires_up_replay_web_page() {
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
 
-    assert!(html.contains("replay-web-page"), "viewer must mount the component");
+    assert!(
+        html.contains("replay-web-page"),
+        "viewer must mount the component"
+    );
     // Absolute replaybase is what makes the service worker resolve to
     // /replay/sw.js rather than /replay/replay/sw.js - the bug we hit.
     assert!(html.contains("replaybase"), "viewer must set replaybase");
-    assert!(html.contains("/replay/"), "replaybase should be the absolute /replay/ path");
-    assert!(html.contains("rwp-url-change"), "viewer should track navigation for the banner");
+    assert!(
+        html.contains("/replay/"),
+        "replaybase should be the absolute /replay/ path"
+    );
+    assert!(
+        html.contains("rwp-url-change"),
+        "viewer should track navigation for the banner"
+    );
 }
 
 // ── Static assets ─────────────────────────────────────────────────────────────
@@ -269,7 +340,10 @@ async fn replay_asset_has_etag_and_no_cache() {
     let req = Request::get("/replay/viewer").body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp.headers().get("etag").is_some(), "asset should carry an ETag");
+    assert!(
+        resp.headers().get("etag").is_some(),
+        "asset should carry an ETag"
+    );
     assert_eq!(
         resp.headers().get("cache-control").unwrap(),
         "no-cache",
@@ -285,12 +359,19 @@ async fn replay_asset_returns_304_when_etag_matches() {
     // First request to learn the ETag.
     let req = Request::get("/replay/viewer").body(Body::empty()).unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    let etag = resp.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    let etag = resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
 
     // Second request with matching If-None-Match should be 304.
     let req = Request::get("/replay/viewer")
         .header("if-none-match", &etag)
-        .body(Body::empty()).unwrap();
+        .body(Body::empty())
+        .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -322,7 +403,10 @@ async fn homepage_shows_collection_name() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("simple"), "homepage should show collection name: {text}");
+    assert!(
+        text.contains("simple"),
+        "homepage should show collection name: {text}"
+    );
 }
 
 #[tokio::test]
@@ -331,7 +415,10 @@ async fn homepage_card_links_to_collection_page() {
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
     let id = manifest.waczs[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
-    let resp = app.oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+    let resp = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(
@@ -348,7 +435,11 @@ async fn wacz_page_shows_metadata_and_pages() {
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     let resp = app
-        .oneshot(Request::get(format!("/wacz/{id}")).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get(format!("/wacz/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -372,14 +463,21 @@ async fn collection_page_lists_members() {
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
 
     let resp = app
-        .oneshot(Request::get(format!("/collection/{coll_id}")).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get(format!("/collection/{coll_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
 
-    assert!(html.contains("WACZs"), "collection page should have a members section");
+    assert!(
+        html.contains("WACZs"),
+        "collection page should have a members section"
+    );
     assert!(
         html.contains(&format!("/wacz/{wacz_id}")),
         "collection page should link to its member WACZ"
@@ -391,7 +489,11 @@ async fn collection_page_unknown_id_404() {
     let tmp = TempDir::new().unwrap();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
     let resp = app
-        .oneshot(Request::get("/collection/deadbeef").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/collection/deadbeef")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -424,10 +526,18 @@ async fn home_directory_is_portable() {
 
     let app = rustyweb_lib::server::router(&home_b).unwrap();
     let resp = app
-        .oneshot(Request::get(format!("/files/{id}")).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get(format!("/files/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "moved home should still resolve the WACZ");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "moved home should still resolve the WACZ"
+    );
 }
 
 #[tokio::test]
@@ -481,7 +591,9 @@ async fn index_from_http_url_and_link_directly() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service()).await.unwrap();
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
     });
 
     let url = format!("http://{addr}/simple.wacz");
@@ -500,19 +612,29 @@ async fn index_from_http_url_and_link_directly() {
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
     assert_eq!(manifest.waczs.len(), 1);
     let col = &manifest.waczs[0];
-    assert_eq!(col.source, rustyweb_lib::collections::Source::Url(url.clone()));
+    assert_eq!(
+        col.source,
+        rustyweb_lib::collections::Source::Url(url.clone())
+    );
 
     // The downloaded WACZ was indexed and is searchable. Scope the index so its
     // writer lock is released before the router opens its own SearchIndex.
     {
-        let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+        let idx = rustyweb_lib::search::SearchIndex::open(
+            tmp.path().join("index").join("full_text").as_path(),
+        )
+        .unwrap();
         assert!(!idx.search("example", 10).unwrap().is_empty());
     }
 
     // The WACZ page links wabac directly at the remote URL, not through /files/{id}.
     let app2 = rustyweb_lib::server::router(tmp.path()).unwrap();
     let resp = app2
-        .oneshot(Request::get(format!("/wacz/{}", col.id)).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get(format!("/wacz/{}", col.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -534,9 +656,15 @@ const REAL_URL: &str = "https://storymaps.arcgis.com/stories/278e1b5c18a3474082e
 #[test]
 fn index_real_wacz_searchable() {
     let tmp = make_index(&["a.wacz"]);
-    let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+    let idx = rustyweb_lib::search::SearchIndex::open(
+        tmp.path().join("index").join("full_text").as_path(),
+    )
+    .unwrap();
     let results = idx.search("Britain", 10).unwrap();
-    assert!(!results.is_empty(), "real wacz should be searchable for a term in its title/text");
+    assert!(
+        !results.is_empty(),
+        "real wacz should be searchable for a term in its title/text"
+    );
     // The storymaps page (title "2Tone: The Sound of Britain") should be among the hits.
     assert!(
         results.iter().any(|r| r.url == REAL_URL),
@@ -547,10 +675,15 @@ fn index_real_wacz_searchable() {
 #[test]
 fn index_real_wacz_has_correct_url() {
     let tmp = make_index(&["a.wacz"]);
-    let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+    let idx = rustyweb_lib::search::SearchIndex::open(
+        tmp.path().join("index").join("full_text").as_path(),
+    )
+    .unwrap();
     let results = idx.search("Britain", 10).unwrap();
     assert!(
-        results.iter().any(|r| r.doc_type == "page" && r.url == REAL_URL),
+        results
+            .iter()
+            .any(|r| r.doc_type == "page" && r.url == REAL_URL),
         "a page document for the storymaps URL should exist"
     );
 }
@@ -561,7 +694,10 @@ fn index_pdf_text_is_searchable() {
     // application/pdf response. Its body text ("flux capacitor ...") exists
     // only inside the PDF, so a hit proves PDF extraction ran during indexing.
     let tmp = make_index(&["pdf-doc.wacz"]);
-    let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+    let idx = rustyweb_lib::search::SearchIndex::open(
+        tmp.path().join("index").join("full_text").as_path(),
+    )
+    .unwrap();
     let results = idx.search("\"flux capacitor\"", 10).unwrap();
     assert!(!results.is_empty(), "PDF text should be searchable");
     let hit = &results[0];
@@ -581,7 +717,10 @@ fn index_real_wacz_indexes_rendered_text() {
     // urn:text record carries the fully rendered text (author name, body prose),
     // which we now index. "Scout Butler" (the author) appears only there.
     let tmp = make_index(&["a.wacz"]);
-    let idx = rustyweb_lib::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path()).unwrap();
+    let idx = rustyweb_lib::search::SearchIndex::open(
+        tmp.path().join("index").join("full_text").as_path(),
+    )
+    .unwrap();
     let results = idx.search("\"Scout Butler\"", 10).unwrap();
     assert!(
         !results.is_empty(),

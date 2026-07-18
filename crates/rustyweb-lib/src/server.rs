@@ -67,7 +67,8 @@ pub fn router(home: &Path) -> Result<Router> {
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|req: &axum::http::Request<Body>| {
-                    let ip = req.extensions()
+                    let ip = req
+                        .extensions()
                         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
                         .map(|ci| ci.0.ip().to_string())
                         .unwrap_or_else(|| "-".to_string());
@@ -78,21 +79,24 @@ pub fn router(home: &Path) -> Result<Router> {
                         client_ip = %ip,
                     )
                 })
-                .on_response(|res: &Response, latency: std::time::Duration, _span: &tracing::Span| {
-                    let ct = res.headers()
-                        .get(axum::http::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("-");
-                    let status = res.status().as_u16();
-                    let ms = latency.as_millis();
-                    if status >= 500 {
-                        tracing::error!(status, content_type = ct, latency_ms = ms);
-                    } else if status >= 400 {
-                        tracing::warn!(status, content_type = ct, latency_ms = ms);
-                    } else {
-                        tracing::info!(status, content_type = ct, latency_ms = ms);
-                    }
-                }),
+                .on_response(
+                    |res: &Response, latency: std::time::Duration, _span: &tracing::Span| {
+                        let ct = res
+                            .headers()
+                            .get(axum::http::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("-");
+                        let status = res.status().as_u16();
+                        let ms = latency.as_millis();
+                        if status >= 500 {
+                            tracing::error!(status, content_type = ct, latency_ms = ms);
+                        } else if status >= 400 {
+                            tracing::warn!(status, content_type = ct, latency_ms = ms);
+                        } else {
+                            tracing::info!(status, content_type = ct, latency_ms = ms);
+                        }
+                    },
+                ),
         )
         .with_state(state);
 
@@ -171,7 +175,10 @@ fn browse_links(
         .map(|b| views::BrowseLink {
             label: b.value.clone(),
             count: b.count,
-            href: format!("/search?q={}", url_encode(&format!("{query_field}:{}", b.value))),
+            href: format!(
+                "/search?q={}",
+                url_encode(&format!("{query_field}:{}", b.value))
+            ),
         })
         .collect()
 }
@@ -265,16 +272,26 @@ async fn search_page(
             .unwrap_or_else(|| format!("/files/{wacz_id}"))
     };
     // Curated collection id -> display name, for the "in <collection>" link.
-    let collection_names: std::collections::HashMap<String, String> = Manifest::open(&state.index_dir)
-        .map(|m| m.collections.iter().map(|c| (c.id.clone(), c.name.clone())).collect())
-        .unwrap_or_default();
+    let collection_names: std::collections::HashMap<String, String> =
+        Manifest::open(&state.index_dir)
+            .map(|m| {
+                m.collections
+                    .iter()
+                    .map(|c| (c.id.clone(), c.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
     let rows: Vec<views::SearchResultRow> = results
         .iter()
         .map(|r| {
             let is_collection = r.doc_type == "collection";
             let title = if r.title.is_empty() {
-                if is_collection { r.collection_name.clone() } else { r.url.clone() }
+                if is_collection {
+                    r.collection_name.clone()
+                } else {
+                    r.url.clone()
+                }
             } else {
                 r.title.clone()
             };
@@ -290,7 +307,10 @@ async fn search_page(
             let name_enc = url_encode(&r.collection_name);
             let source_enc = url_encode(&source_for(&r.collection_id));
             // Carry the collection breadcrumb (name + id) into the replay viewer.
-            let coll_q = format!("&collection={}&collection_id={coll_href}", url_encode(&coll_display));
+            let coll_q = format!(
+                "&collection={}&collection_id={coll_href}",
+                url_encode(&coll_display)
+            );
 
             let href = if is_collection {
                 // Link to the collection's root in the viewer.
@@ -387,7 +407,13 @@ async fn search_page(
 
     // Timeline: one clickable bar per crawl month, oldest first, height scaled
     // to the busiest month. Clicking toggles a `month:YYYYMM` filter.
-    let max_count = response.timeline.iter().map(|t| t.count).max().unwrap_or(1).max(1);
+    let max_count = response
+        .timeline
+        .iter()
+        .map(|t| t.count)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let timeline: Vec<views::TimelineBar> = response
         .timeline
         .iter()
@@ -478,7 +504,13 @@ async fn wacz_page(
     let col = manifest.collection_by_id(&c.collection);
     let crumb = col.map(|col| (col.id.clone(), col.name.clone()));
     let coll_q = col
-        .map(|col| format!("&collection={}&collection_id={}", url_encode(&col.name), url_encode(&col.id)))
+        .map(|col| {
+            format!(
+                "&collection={}&collection_id={}",
+                url_encode(&col.name),
+                url_encode(&col.id)
+            )
+        })
         .unwrap_or_default();
 
     // Replay button: first seed page, else the collection root.
@@ -540,7 +572,11 @@ async fn wacz_page(
             .crawl_date
             .as_deref()
             .map(|d| d.get(..10).unwrap_or(d).to_string()),
-        indexed: c.date_indexed.get(..10).unwrap_or(&c.date_indexed).to_string(),
+        indexed: c
+            .date_indexed
+            .get(..10)
+            .unwrap_or(&c.date_indexed)
+            .to_string(),
         present: c.is_present(&state.home),
         pages,
     };
@@ -825,7 +861,11 @@ fn capture_range(c: &Wacz) -> Option<String> {
     match (c.capture_start.as_deref(), c.capture_end.as_deref()) {
         (Some(s), Some(e)) => {
             let (sd, ed) = (ymd(s), ymd(e));
-            Some(if sd == ed { sd } else { format!("{sd} → {ed}") })
+            Some(if sd == ed {
+                sd
+            } else {
+                format!("{sd} → {ed}")
+            })
         }
         (Some(s), None) => Some(ymd(s)),
         (None, Some(e)) => Some(ymd(e)),
@@ -853,7 +893,11 @@ fn members_capture_range(members: &[&Wacz]) -> Option<String> {
     match (start, end) {
         (Some(s), Some(e)) => {
             let (sd, ed) = (ymd(&s), ymd(&e));
-            Some(if sd == ed { sd } else { format!("{sd} → {ed}") })
+            Some(if sd == ed {
+                sd
+            } else {
+                format!("{sd} → {ed}")
+            })
         }
         (Some(s), None) => Some(ymd(&s)),
         (None, Some(e)) => Some(ymd(&e)),
@@ -942,16 +986,25 @@ mod tests {
 
     #[test]
     fn query_with_filter_appends_once() {
-        assert_eq!(query_with_filter("climate", "type", "pdf"), "climate type:pdf");
+        assert_eq!(
+            query_with_filter("climate", "type", "pdf"),
+            "climate type:pdf"
+        );
         // Idempotent: already-present filter is not duplicated.
-        assert_eq!(query_with_filter("climate type:pdf", "type", "pdf"), "climate type:pdf");
+        assert_eq!(
+            query_with_filter("climate type:pdf", "type", "pdf"),
+            "climate type:pdf"
+        );
         // Empty base query yields just the filter.
         assert_eq!(query_with_filter("  ", "year", "2021"), "year:2021");
     }
 
     #[test]
     fn query_without_filter_removes_that_token() {
-        assert_eq!(query_without_filter("climate type:pdf", "type", "pdf"), "climate");
+        assert_eq!(
+            query_without_filter("climate type:pdf", "type", "pdf"),
+            "climate"
+        );
         // Leaves other filters and free text intact.
         assert_eq!(
             query_without_filter("climate type:pdf domain:ex.com", "type", "pdf"),
@@ -966,6 +1019,9 @@ mod tests {
         let q = "coral reef";
         let added = query_with_filter(q, "collection", "coralreef-gov");
         assert_eq!(added, "coral reef collection:coralreef-gov");
-        assert_eq!(query_without_filter(&added, "collection", "coralreef-gov"), "coral reef");
+        assert_eq!(
+            query_without_filter(&added, "collection", "coralreef-gov"),
+            "coral reef"
+        );
     }
 }

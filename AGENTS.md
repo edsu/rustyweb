@@ -21,13 +21,20 @@ the design changes). [PRIMER.md](PRIMER.md) teaches Rust *through this codebase*
 
 ## Build & verify
 
-Before committing, the workspace must be clean:
+Before committing, run the same checks CI enforces — the tree should be clean:
 
 ```sh
-cargo build --workspace
-cargo test --workspace       # unit (in-module #[cfg(test)]) + integration (tests/)
-cargo clippy --workspace     # no new warnings beyond the known pre-existing ones
+cargo fmt --all --check                                # rustfmt (formatting)
+cargo clippy --workspace --all-targets -- -D warnings  # lints; warnings are errors
+cargo build --workspace --locked
+cargo test --workspace --locked   # unit (in-module #[cfg(test)]) + integration (tests/)
 ```
+
+**CI:** GitHub Actions (`.github/workflows/ci.yml`) runs these four checks on every
+push to `main` and every pull request, and the README shows a build badge. The
+codebase is rustfmt-formatted and warning-clean — keep it that way so CI (and the
+badge) stay green. If you add a dependency, commit the updated `Cargo.lock` (CI
+builds `--locked`).
 
 Fixtures for tests live in `crates/rustyweb-lib/tests/fixtures/`. Prefer adding a
 focused test alongside the code it covers.
