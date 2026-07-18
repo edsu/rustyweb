@@ -97,8 +97,16 @@ pub fn index_location(
         index_one(source, home, &mut manifest, &search, name, c, download, progress)?;
     }
 
+    // The Tantivy commit (segment flush) is the slow tail, especially after fast
+    // local reads. Show it as a spinner, then clear the indicator.
+    if let Some(p) = progress {
+        p.phase("committing");
+    }
     search.into_inner().unwrap().commit()?;
     manifest.save()?;
+    if let Some(p) = progress {
+        p.finish();
+    }
 
     Ok(())
 }
@@ -444,9 +452,9 @@ fn index_one(
         capture_end: stats.latest_capture,
     });
 
-    if let Some(p) = progress {
-        p.finish();
-    }
+    // Note: the spinner/bar is *not* finished here - the Tantivy commit happens
+    // once per `index_location` (after all sources), and that's where it's cleared
+    // (via a final "committing" spinner). See `index_location`.
     Ok(())
 }
 
@@ -855,6 +863,13 @@ fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
         if let Some(p) = progress {
             p.set_records(done);
         }
+    }
+    // Records read. The merge + Tantivy indexing that follows has no per-record
+    // total, so drop the determinate bar back to a spinner - otherwise it sits at
+    // 100% with a decaying rate/ETA during the slow tail (very visible for a local
+    // file, where reads are near-instant and the tail dominates).
+    if let Some(p) = progress {
+        p.phase("indexing");
     }
     Ok((out, warcinfo))
 }

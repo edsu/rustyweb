@@ -224,6 +224,12 @@ impl BarProgress {
     }
 }
 
+/// The indeterminate style, for phases with no per-record total (setup, and the
+/// merge/commit tail after records are read).
+fn spinner_style() -> indicatif::ProgressStyle {
+    indicatif::ProgressStyle::with_template("{spinner:.green} {msg} ({elapsed})").unwrap()
+}
+
 /// The determinate style, once we know the record total. {per_sec} + {eta} answer
 /// "how long will this take?" — indicatif derives both from a moving window of
 /// recent progress, so they track the current streaming rate rather than a naive
@@ -252,17 +258,23 @@ impl rustyweb_lib::index::IndexProgress for BarProgress {
         // Indeterminate spinner: the record total isn't known until the CDX is
         // read. steady_tick animates it during the blocking network setup. The
         // verb is filled in by `phase`; until then just show the label.
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(old) = guard.take() {
+            old.pb.finish_and_clear();
+        }
         let pb = indicatif::ProgressBar::new_spinner();
-        pb.set_style(
-            indicatif::ProgressStyle::with_template("{spinner:.green} {msg} ({elapsed})").unwrap(),
-        );
+        pb.set_style(spinner_style());
         let label = short_label(label);
         pb.set_message(label.clone());
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
-        *self.inner.lock().unwrap() = Some(Active { pb, label });
+        *guard = Some(Active { pb, label });
     }
     fn phase(&self, phase: &str) {
         if let Some(a) = &*self.inner.lock().unwrap() {
+            // Reset to the spinner style: `phase` marks an indeterminate phase,
+            // including the transition *back* from the determinate records bar
+            // (merge/commit tail) so it doesn't sit at 100% with a decaying ETA.
+            a.pb.set_style(spinner_style());
             a.pb.set_message(format!("{} — {phase}…", a.label));
         }
     }
