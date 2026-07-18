@@ -35,7 +35,7 @@ psl = "2"
 whatlang = "0.18"
 
 # PDF text extraction
-pdf-extract = "0.7"
+pdf-extract = "0.12"
 
 # HTTP client for indexing remote WACZ files
 ureq = "3"
