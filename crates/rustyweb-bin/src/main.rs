@@ -341,6 +341,23 @@ async fn main() -> Result<()> {
         .event_format(ColorLineFormat::default())
         .init();
 
+    // pdf-extract / lopdf can *panic* on malformed PDFs. `extract_pdf_text`
+    // already catches these via `catch_unwind` (a bad PDF is skipped, indexing
+    // continues), but the default panic hook still prints the alarming, progress-
+    // bar-stomping "thread 'main' panicked at pdf-extract..." message. Suppress
+    // panics originating in those crates; delegate everything else to the default
+    // hook. Set once here (thread-safe) so it also holds for parallel indexing.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let from_pdf = info.location().is_some_and(|loc| {
+            let f = loc.file();
+            f.contains("pdf-extract") || f.contains("lopdf")
+        });
+        if !from_pdf {
+            default_hook(info);
+        }
+    }));
+
     match cli.command {
         // `verbose` is read up front (to set the log level / bar); ignore here.
         Commands::Index {
