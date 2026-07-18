@@ -37,4 +37,4 @@ version = "3"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 # Headless-browser replay smoke test (run with `cargo test -- --ignored`).
-thirtyfour = "0.35"
+thirtyfour = "0.37"
