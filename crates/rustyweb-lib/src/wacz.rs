@@ -214,6 +214,11 @@ fn basename(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
+/// Whether a ZIP entry name is an embedded WARC (`archive/*.warc` or `.warc.gz`).
+fn is_warc_entry(name: &str) -> bool {
+    name.starts_with("archive/") && (name.ends_with(".warc.gz") || name.ends_with(".warc"))
+}
+
 /// Read and parse **all** CDX records from a WACZ ZIP (any `Read + Seek`), for
 /// CDX-guided/streaming indexing. Unlike [`search_cdx`], no URL filter.
 pub(crate) fn cdx_records<R: std::io::Read + std::io::Seek>(
@@ -255,8 +260,8 @@ pub(crate) fn ensure_warcs_stored<R: std::io::Read + std::io::Seek>(
     } else {
         anyhow::bail!(
             "WACZ stores its WARC entries compressed (deflate); CDX-guided \
-             streaming needs uncompressed (stored) WARCs. Index without --stream \
-             (scan mode), or use --download."
+             extraction needs uncompressed (stored) WARCs. rustyweb falls back to \
+             a full WARC scan for such files automatically."
         )
     }
 }
@@ -269,10 +274,7 @@ pub(crate) fn warcs_stored<R: std::io::Read + std::io::Seek>(
 ) -> Result<bool> {
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
-        let name = entry.name();
-        let is_warc =
-            name.starts_with("archive/") && (name.ends_with(".warc.gz") || name.ends_with(".warc"));
-        if is_warc && entry.compression() != zip::CompressionMethod::Stored {
+        if is_warc_entry(entry.name()) && entry.compression() != zip::CompressionMethod::Stored {
             return Ok(false);
         }
     }
@@ -289,7 +291,7 @@ pub(crate) fn warc_data_starts<R: std::io::Read + std::io::Seek>(
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
         let name = entry.name().to_string();
-        if name.starts_with("archive/") && (name.ends_with(".warc.gz") || name.ends_with(".warc")) {
+        if is_warc_entry(&name) {
             map.insert(basename(&name).to_string(), entry.data_start());
         }
     }
@@ -305,7 +307,7 @@ pub(crate) fn find_warcinfo_streaming<R: std::io::Read + std::io::Seek>(
 ) -> Result<Option<crate::warc::Warcinfo>> {
     let names: Vec<String> = (0..zip.len())
         .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
-        .filter(|n| n.starts_with("archive/") && (n.ends_with(".warc.gz") || n.ends_with(".warc")))
+        .filter(|n| is_warc_entry(n))
         .collect();
     for name in names {
         let mut decoded = Vec::new();
