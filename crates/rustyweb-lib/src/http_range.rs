@@ -137,7 +137,7 @@ impl HttpFetch {
         let agent = ureq::agent();
         let resp = agent
             .get(url)
-            .set("Range", "bytes=0-0")
+            .header("Range", "bytes=0-0")
             .call()
             .with_context(|| format!("HTTP range probe of {url}"))?;
         if resp.status() != 206 {
@@ -149,7 +149,9 @@ impl HttpFetch {
         }
         // Content-Range: "bytes 0-0/<total>"
         let len = resp
-            .header("Content-Range")
+            .headers()
+            .get("Content-Range")
+            .and_then(|cr| cr.to_str().ok())
             .and_then(|cr| cr.rsplit('/').next())
             .map(str::trim)
             .and_then(|n| n.parse::<u64>().ok())
@@ -171,11 +173,11 @@ impl RangeFetch for HttpFetch {
         let resp = self
             .agent
             .get(&self.url)
-            .set("Range", &format!("bytes={}-{}", start, end - 1))
+            .header("Range", &format!("bytes={}-{}", start, end - 1))
             .call()
             .map_err(|e| io::Error::other(format!("range GET of {}: {e}", self.url)))?;
         let mut v = Vec::with_capacity((end - start) as usize);
-        resp.into_reader().read_to_end(&mut v)?;
+        resp.into_body().into_reader().read_to_end(&mut v)?;
         Ok(v)
     }
 }
