@@ -463,6 +463,17 @@ text extraction (CPU) across cores. Remote is latency-bound so more workers than
 cores helps; local fetch is cheap and the work is CPU-bound extraction, so the
 core count is the sweet spot.
 
+**Resilient + polite remote fetching.** Every HTTP fetch (the range GETs and the
+whole-file downloads) retries transient failures - network errors and HTTP
+`429`/`502`/`503`/`504` - with capped exponential backoff + jitter, honoring a
+server `Retry-After` (`with_retry` in `http_range.rs`). This makes a long ingest
+survive blips, and is deliberately *polite*: when a host pushes back we wait
+rather than hammer it. That matters because a single WACZ's `--concurrency`
+requests all hit one host, so an aggressive setting against a small (non-object-
+store) server could otherwise overload it or get the client IP-blocked. The agent
+is built with `http_status_as_error(false)` so `4xx`/`5xx` come back as
+inspectable responses (status + `Retry-After`) rather than opaque errors.
+
 ### Progress reporting
 
 Indexing reports progress through a small, UI-agnostic `IndexProgress` trait

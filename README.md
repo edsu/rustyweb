@@ -202,11 +202,15 @@ uncompressed so they can be read by range; a few tools don't).
 
 Streaming a large remote WACZ makes one HTTP range request per page record. Those
 requests are latency-bound and independent, so rustyweb fetches them concurrently
-(16 at a time by default for remote WACZs; tune with `--concurrency <N>`). `index`
-shows a progress bar - a spinner while it reads the CDX, then a bar with the
-throughput and an ETA once it knows how many records there are - so you can see it
-working. Add `-v`/`--verbose` for detailed logs instead of the bar; when output
-isn't a terminal (piping to a file or CI) it prints plain log lines and no bar.
+(16 at a time by default for remote WACZs; tune with `--concurrency <N>`). Fetches
+retry transient failures (rate limits and `5xx`) with backoff, honoring
+`Retry-After`, so a long ingest survives blips and stays gentle on the host - be
+mindful that a high `--concurrency` all hits a single host, so dial it down for
+small servers (it's fine for object stores like S3). `index` shows a progress
+bar - a spinner while it reads the CDX, then a bar with the throughput and an ETA
+once it knows how many records there are - so you can see it working. Add
+`-v`/`--verbose` for detailed logs instead of the bar; when output isn't a
+terminal (piping to a file or CI) it prints plain log lines and no bar.
 
 ### How indexing reads a WACZ
 
