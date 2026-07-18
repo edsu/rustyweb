@@ -103,6 +103,17 @@ pub fn parse_warc_fields(bytes: &[u8]) -> Vec<(String, String)> {
     out
 }
 
+/// Parse all WARC records from a decompressed WARC byte buffer (one gzip
+/// member's worth, or any plain-WARC slice). Used by CDX-guided/streaming
+/// indexing, which gunzips a single record slice located via the CDX offset and
+/// parses it without touching the rest of the WARC. `offset`/`record_length`
+/// are informational (carried onto each record for provenance).
+pub(crate) fn parse_warc_records(data: &[u8], offset: u64, record_length: u64) -> Vec<Result<WarcRecord>> {
+    let mut out = Vec::new();
+    parse_all_warc_records_from(data, offset, record_length, &mut out);
+    out
+}
+
 /// Iterate over records in a `.warc` or `.warc.gz` file.
 ///
 /// For `.warc.gz`, each gzip member is read individually to track the

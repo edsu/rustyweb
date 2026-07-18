@@ -39,8 +39,15 @@ pub struct CdxjRecord {
 pub fn read_datapackage(wacz_path: &Path) -> Result<WaczMetadata> {
     let file = std::fs::File::open(wacz_path)
         .with_context(|| format!("opening WACZ {}", wacz_path.display()))?;
-    let mut zip = zip::ZipArchive::new(file)
-        .with_context(|| format!("reading ZIP {}", wacz_path.display()))?;
+    read_datapackage_from(file)
+}
+
+/// Read `datapackage.json` + `pages/pages.jsonl` metadata from any `Read + Seek`
+/// WACZ — a local file, or an HTTP range reader for streaming indexing.
+pub(crate) fn read_datapackage_from<R: std::io::Read + std::io::Seek>(
+    reader: R,
+) -> Result<WaczMetadata> {
+    let mut zip = zip::ZipArchive::new(reader).context("reading WACZ ZIP")?;
 
     // --- datapackage.json -------------------------------------------------
     // Descriptive fields live at the top level in some WACZs and under a
@@ -155,9 +162,10 @@ pub fn search_cdx(wacz_path: &Path, url: &str) -> Result<Vec<CdxjRecord>> {
     let mut raw = Vec::new();
     entry.read_to_end(&mut raw)?;
 
-    // Decompress if gzipped.
+    // Decompress if gzipped. The CDX is often a multi-member gzip (ZipNum
+    // blocks), so use MultiGzDecoder to read every block, not just the first.
     let text = if cdx_name.ends_with(".gz") {
-        let mut decoder = flate2::read::GzDecoder::new(raw.as_slice());
+        let mut decoder = flate2::read::MultiGzDecoder::new(raw.as_slice());
         let mut out = String::new();
         decoder.read_to_string(&mut out)?;
         out
@@ -181,14 +189,142 @@ pub fn search_cdx(wacz_path: &Path, url: &str) -> Result<Vec<CdxjRecord>> {
     Ok(results)
 }
 
-fn find_cdx_entry(zip: &mut zip::ZipArchive<std::fs::File>) -> Result<Option<String>> {
+fn find_cdx_entry<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Option<String>> {
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
         let name = entry.name().to_string();
+        // The index holds CDXJ data; the extension varies by tool: compressed
+        // `.cdx.gz`/`.cdxj.gz` or plain `.cdx`/`.cdxj`. Match any of them.
         if name.starts_with("indexes/")
-            && (name.ends_with(".cdx.gz") || name.ends_with(".cdx"))
+            && (name.ends_with(".cdx.gz")
+                || name.ends_with(".cdxj.gz")
+                || name.ends_with(".cdx")
+                || name.ends_with(".cdxj"))
         {
             return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// The basename of a slash-separated path (`archive/x.warc.gz` -> `x.warc.gz`).
+fn basename(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// Whether a ZIP entry name is an embedded WARC (`archive/*.warc` or `.warc.gz`).
+fn is_warc_entry(name: &str) -> bool {
+    name.starts_with("archive/") && (name.ends_with(".warc.gz") || name.ends_with(".warc"))
+}
+
+/// Read and parse **all** CDX records from a WACZ ZIP (any `Read + Seek`), for
+/// CDX-guided/streaming indexing. Unlike [`search_cdx`], no URL filter.
+pub(crate) fn cdx_records<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Vec<CdxjRecord>> {
+    let Some(cdx_name) = find_cdx_entry(zip)? else {
+        return Ok(Vec::new());
+    };
+    let mut raw = Vec::new();
+    zip.by_name(&cdx_name)?.read_to_end(&mut raw)?;
+    let text = if cdx_name.ends_with(".gz") {
+        // The CDX is often a multi-member gzip (ZipNum-clustered blocks); use
+        // MultiGzDecoder so every block is read, not just the first.
+        let mut out = String::new();
+        flate2::read::MultiGzDecoder::new(raw.as_slice()).read_to_string(&mut out)?;
+        out
+    } else {
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+    Ok(text
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            (!l.is_empty()).then(|| parse_cdx_line(l)).flatten()
+        })
+        .collect())
+}
+
+/// Error unless every embedded WARC is `Stored` (uncompressed). CDX-guided
+/// streaming needs this: a CDX byte offset maps to an absolute WACZ position
+/// only when the WARC isn't ZIP-compressed. Browsertrix / py-wacz store WARCs
+/// uncompressed (they're already gzipped); some tools deflate them, and those
+/// can't be streamed (fall back to scan / `--download`).
+pub(crate) fn ensure_warcs_stored<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<()> {
+    if warcs_stored(zip)? {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "WACZ stores its WARC entries compressed (deflate); CDX-guided \
+             extraction needs uncompressed (stored) WARCs. rustyweb falls back to \
+             a full WARC scan for such files automatically."
+        )
+    }
+}
+
+/// Whether every embedded WARC is `Stored` (streamable). `false` if any is
+/// compressed — used to decide whether a remote WACZ can be streamed or must be
+/// downloaded.
+pub(crate) fn warcs_stored<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<bool> {
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i)?;
+        if is_warc_entry(entry.name()) && entry.compression() != zip::CompressionMethod::Stored {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Map each embedded WARC's basename to the absolute byte offset of its data
+/// within the WACZ (`ZipFile::data_start`). Since WARCs are stored uncompressed,
+/// a CDX record at `offset` lives at `data_start + offset` in the WACZ.
+pub(crate) fn warc_data_starts<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<std::collections::HashMap<String, u64>> {
+    let mut map = std::collections::HashMap::new();
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i)?;
+        let name = entry.name().to_string();
+        if is_warc_entry(&name) {
+            map.insert(basename(&name).to_string(), entry.data_start());
+        }
+    }
+    Ok(map)
+}
+
+/// Find the crawl's `warcinfo` by decoding the first gzip member of each
+/// embedded WARC (warcinfo is the first record) and parsing it — so streaming
+/// indexing gets provenance without reading whole WARCs. Returns the first
+/// non-empty warcinfo found.
+pub(crate) fn find_warcinfo_streaming<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Option<crate::warc::Warcinfo>> {
+    let names: Vec<String> = (0..zip.len())
+        .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
+        .filter(|n| is_warc_entry(n))
+        .collect();
+    for name in names {
+        let mut decoded = Vec::new();
+        // read::GzDecoder decodes only the first member, which is enough.
+        if flate2::read::GzDecoder::new(zip.by_name(&name)?)
+            .read_to_end(&mut decoded)
+            .is_err()
+            || decoded.is_empty()
+        {
+            continue;
+        }
+        for rec in crate::warc::parse_warc_records(&decoded, 0, 0).into_iter().flatten() {
+            if let Some(info) = crate::warc::Warcinfo::from_record(&rec) {
+                if !info.is_empty() {
+                    return Ok(Some(info));
+                }
+            }
         }
     }
     Ok(None)
@@ -317,9 +453,117 @@ pub fn extract_warc_from_wacz(
     Ok(tmp)
 }
 
+/// Read a single WARC record located at absolute byte `offset` in a `Read + Seek`
+/// WACZ, where the record is one gzip member of `length` bytes (both as given by
+/// a CDX entry, translated to an absolute position via the WARC ZIP entry's
+/// `data_start`). Gunzips just that slice and parses it, so CDX-guided/streaming
+/// indexing can pull one record without reading the rest of the WARC. Returns
+/// the record(s) in the member (usually one).
+pub(crate) fn record_at<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<crate::warc::WarcRecord>> {
+    use std::io::{Read, SeekFrom};
+    reader
+        .seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking to offset {offset}"))?;
+    let mut buf = vec![0u8; length as usize];
+    reader
+        .read_exact(&mut buf)
+        .with_context(|| format!("reading {length} bytes at offset {offset}"))?;
+    let mut decompressed = Vec::new();
+    flate2::read::GzDecoder::new(&buf[..])
+        .read_to_end(&mut decompressed)
+        .context("decompressing WARC record slice")?;
+    Ok(crate::warc::parse_warc_records(&decompressed, offset, length)
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdx_records_reads_all_members_of_a_multimember_gzip() {
+        use std::io::Write;
+        // Two CDX lines, each in its OWN gzip member (ZipNum-style clustering).
+        let line = |u: &str| {
+            format!("com,example)/ 20200101000000 {{\"url\":\"{u}\",\"mime\":\"text/html\",\"filename\":\"x.warc.gz\",\"offset\":0,\"length\":10,\"status\":200}}\n")
+        };
+        let gz = |s: String| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(s.as_bytes()).unwrap();
+            e.finish().unwrap()
+        };
+        let mut cdx_gz = gz(line("https://example.com/a"));
+        cdx_gz.extend_from_slice(&gz(line("https://example.com/b"))); // 2nd member appended
+
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("indexes/index.cdx.gz", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&cdx_gz).unwrap();
+            zw.finish().unwrap();
+        }
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+        let recs = cdx_records(&mut zip).unwrap();
+        let urls: Vec<&str> = recs.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(recs.len(), 2, "must read every gzip member of the CDX, not just the first");
+        assert!(urls.contains(&"https://example.com/a") && urls.contains(&"https://example.com/b"));
+    }
+
+    #[test]
+    fn cdx_records_recognizes_a_plain_cdxj_index() {
+        use std::io::Write;
+        // Some WACZs name the (uncompressed) index `indexes/index.cdxj`.
+        let line = "com,example)/ 20200101000000 {\"url\":\"https://example.com/\",\"mime\":\"text/html\",\"filename\":\"x.warc.gz\",\"offset\":0,\"length\":10,\"status\":200}\n";
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("indexes/index.cdxj", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(line.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+        let recs = cdx_records(&mut zip).unwrap();
+        assert_eq!(recs.len(), 1, "a plain .cdxj index must be recognized");
+        assert_eq!(recs[0].url, "https://example.com/");
+    }
+
+    #[test]
+    fn record_at_reads_one_gzipped_warc_record_slice() {
+        use std::io::Write;
+        // Build a WARC response record, gzip it as one member.
+        let block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>hi</html>";
+        let mut warc = format!(
+            "WARC/1.0\r\nWARC-Type: response\r\nWARC-Target-URI: https://ex.com/p\r\n\
+             Content-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
+            block.len()
+        )
+        .into_bytes();
+        warc.extend_from_slice(block);
+        warc.extend_from_slice(b"\r\n\r\n");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&warc).unwrap();
+        let member = enc.finish().unwrap();
+
+        // Place the member after padding so the offset is exercised.
+        let mut buf = vec![0xEEu8; 64];
+        let offset = buf.len() as u64;
+        let len = member.len() as u64;
+        buf.extend_from_slice(&member);
+
+        let mut cur = std::io::Cursor::new(buf);
+        let recs = record_at(&mut cur, offset, len).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].target_uri, "https://ex.com/p");
+        assert_eq!(recs[0].http_status, Some(200));
+    }
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
