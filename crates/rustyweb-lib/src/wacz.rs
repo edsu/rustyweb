@@ -469,21 +469,20 @@ pub fn extract_warc_from_wacz(
 /// `data_start`). Gunzips just that slice and parses it, so CDX-guided/streaming
 /// indexing can pull one record without reading the rest of the WARC. Returns
 /// the record(s) in the member (usually one).
-pub(crate) fn record_at<R: std::io::Read + std::io::Seek>(
-    reader: &mut R,
+/// Gunzip a single WARC record slice (one gzip member of `length` bytes, located
+/// at `offset` — both informational) and parse it. The CDX-guided extractor
+/// fetches a record's byte range (a `data_start + offset` slice, possibly
+/// concurrently via [`crate::http_range::RangeFetch`]) and hands the bytes here
+/// to gunzip + parse without a `Read + Seek`. Returns the record(s) in the member
+/// (usually one).
+pub(crate) fn records_from_slice(
+    buf: &[u8],
     offset: u64,
     length: u64,
 ) -> Result<Vec<crate::warc::WarcRecord>> {
-    use std::io::{Read, SeekFrom};
-    reader
-        .seek(SeekFrom::Start(offset))
-        .with_context(|| format!("seeking to offset {offset}"))?;
-    let mut buf = vec![0u8; length as usize];
-    reader
-        .read_exact(&mut buf)
-        .with_context(|| format!("reading {length} bytes at offset {offset}"))?;
+    use std::io::Read;
     let mut decompressed = Vec::new();
-    flate2::read::GzDecoder::new(&buf[..])
+    flate2::read::GzDecoder::new(buf)
         .read_to_end(&mut decompressed)
         .context("decompressing WARC record slice")?;
     Ok(
@@ -558,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn record_at_reads_one_gzipped_warc_record_slice() {
+    fn records_from_slice_reads_one_gzipped_warc_record() {
         use std::io::Write;
         // Build a WARC response record, gzip it as one member.
         let block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>hi</html>";
@@ -574,14 +573,10 @@ mod tests {
         enc.write_all(&warc).unwrap();
         let member = enc.finish().unwrap();
 
-        // Place the member after padding so the offset is exercised.
-        let mut buf = vec![0xEEu8; 64];
-        let offset = buf.len() as u64;
+        // The extractor fetches exactly the record's byte slice, then gunzips +
+        // parses it (offset/length are informational).
         let len = member.len() as u64;
-        buf.extend_from_slice(&member);
-
-        let mut cur = std::io::Cursor::new(buf);
-        let recs = record_at(&mut cur, offset, len).unwrap();
+        let recs = records_from_slice(&member, 64, len).unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].target_uri, "https://ex.com/p");
         assert_eq!(recs[0].http_status, Some(200));
