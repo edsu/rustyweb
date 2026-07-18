@@ -245,20 +245,33 @@ pub(crate) fn cdx_records<R: std::io::Read + std::io::Seek>(
 pub(crate) fn ensure_warcs_stored<R: std::io::Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
 ) -> Result<()> {
+    if warcs_stored(zip)? {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "WACZ stores its WARC entries compressed (deflate); CDX-guided \
+             streaming needs uncompressed (stored) WARCs. Index without --stream \
+             (scan mode), or use --download."
+        )
+    }
+}
+
+/// Whether every embedded WARC is `Stored` (streamable). `false` if any is
+/// compressed — used to decide whether a remote WACZ can be streamed or must be
+/// downloaded.
+pub(crate) fn warcs_stored<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<bool> {
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
         let name = entry.name();
         let is_warc =
             name.starts_with("archive/") && (name.ends_with(".warc.gz") || name.ends_with(".warc"));
         if is_warc && entry.compression() != zip::CompressionMethod::Stored {
-            anyhow::bail!(
-                "WACZ stores its WARC entries compressed (deflate); CDX-guided \
-                 streaming needs uncompressed (stored) WARCs. Index without --stream \
-                 (scan mode), or use --download."
-            );
+            return Ok(false);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Map each embedded WARC's basename to the absolute byte offset of its data

@@ -22,7 +22,7 @@ pub fn archive_dir(home: &Path) -> PathBuf {
 /// Index a local WACZ file (which must live under `<home>/archive`) under the
 /// given home dir. Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
-    index_location(&path.to_string_lossy(), home, name, None, false)
+    index_location(&path.to_string_lossy(), home, name, None, false, false)
 }
 
 /// Index a WACZ from a location into the home directory's `index/`. The location
@@ -43,8 +43,12 @@ pub fn index_location(
     home: &Path,
     name: Option<&str>,
     collection: Option<&str>,
-    // Extract via the CDX (streaming) instead of scanning every WARC record.
+    // Force CDX (streaming) extraction for a local file. Remote URLs stream by
+    // default.
     stream: bool,
+    // Download a remote WACZ into <home>/archive and index it as a local file
+    // instead of streaming.
+    download: bool,
 ) -> Result<()> {
     // Validate the argument first (a bad path errors before we touch the index).
     let sources = resolve_sources(location, home)?;
@@ -65,7 +69,7 @@ pub fn index_location(
 
     for source in &sources {
         let c = group.as_ref().map(|(id, n)| (id.as_str(), n.as_str()));
-        index_one(source, home, &mut manifest, &search, name, c, stream)?;
+        index_one(source, home, &mut manifest, &search, name, c, stream, download)?;
     }
 
     search.into_inner().unwrap().commit()?;
@@ -146,6 +150,7 @@ pub fn reindex(home: &Path) -> Result<()> {
             &search,
             Some(name),
             Some((collection_id, collection_name)),
+            false,
             false,
         )
         .with_context(|| {
@@ -241,6 +246,7 @@ fn resolve_archive_file(path: &Path, home: &Path) -> Result<Source> {
 
 /// Index a single WACZ source: obtain a local readable copy (downloading a URL
 /// to a temp file), index its pages and metadata, and upsert its manifest entry.
+#[allow(clippy::too_many_arguments)]
 fn index_one(
     source: &Source,
     home: &Path,
@@ -250,33 +256,56 @@ fn index_one(
     // The collection (id, display name) this WACZ joins. `None` makes the WACZ
     // its own singleton collection (id == WACZ id, name == WACZ name).
     collection: Option<(&str, &str)>,
-    // Extract via the CDX (streaming) instead of scanning every WARC record.
+    // Force CDX (streaming) extraction (for a local file). Remote URLs stream by
+    // default regardless.
     stream: bool,
+    // Download a remote WACZ into <home>/archive and index it as a local file
+    // (durable copy, whole-file fixity, offline replay) instead of streaming.
+    download: bool,
 ) -> Result<()> {
-    // A remote URL with --stream is indexed directly over HTTP range requests
-    // (no download); its `remote_url` is set and `local` stays None. Otherwise
-    // resolve to a local file (a File source in place, or a URL downloaded to a
-    // temp file kept alive as `_tmp`).
-    let remote_url: Option<&str> = match source {
-        Source::Url(u) if stream => Some(u),
-        _ => None,
-    };
-    let (local, _tmp): (Option<PathBuf>, Option<tempfile::NamedTempFile>) = match source {
-        _ if remote_url.is_some() => (None, None),
-        Source::File(_) => (Some(source.resolve(home).unwrap()), None),
-        Source::Url(u) => {
-            info!(url = %u, "downloading remote WACZ for indexing");
-            let tmp = download_to_temp(u).with_context(|| format!("downloading {u}"))?;
-            (Some(tmp.path().to_path_buf()), Some(tmp))
+    // Resolve how the WACZ is read (`.3` mode logic):
+    //  - A local File source: read in place.
+    //  - A remote URL + --download: fetch into <home>/archive and adopt as a
+    //    local File source (durable/offline; the recorded source becomes local).
+    //  - A remote URL (default): stream over HTTP range requests, no download —
+    //    but only if its WARCs are Stored; if they're deflated, fall back to a
+    //    temp download + scan (keeping the URL as the source).
+    let effective_source: Source = match source {
+        Source::Url(u) if download => {
+            info!(url = %u, "downloading remote WACZ into archive");
+            Source::File(download_into_archive(u, home)?)
         }
+        _ => source.clone(),
     };
 
-    let id = wacz_id(source);
+    let mut _tmp: Option<tempfile::NamedTempFile> = None;
+    let (remote_url, local): (Option<String>, Option<PathBuf>) = match &effective_source {
+        Source::File(_p) => (None, Some(effective_source.resolve(home).unwrap())),
+        Source::Url(u) => {
+            // Stream by default, but only if the host supports range requests and
+            // the WARCs are Stored. Otherwise (no range, deflated WARCs, or a
+            // probe error) fall back to downloading a temp copy and scanning it,
+            // keeping the URL as the source.
+            if remote_warcs_streamable(u).unwrap_or(false) {
+                (Some(u.clone()), None)
+            } else {
+                info!(url = %u, "remote WACZ can't be streamed (no range support or compressed WARCs); downloading to index");
+                let tmp = download_to_temp(u).with_context(|| format!("downloading {u}"))?;
+                let p = tmp.path().to_path_buf();
+                _tmp = Some(tmp);
+                (None, Some(p))
+            }
+        }
+    };
+    // Stream a local file only when explicitly asked (--stream on a File source).
+    let stream_local = stream && matches!(&effective_source, Source::File(_));
+
+    let id = wacz_id(&effective_source);
 
     // Read metadata from the WACZ datapackage.json up front so its title can
     // name the collection. Precedence: explicit --name, then the WACZ title,
     // then the filename/URL stem.
-    let meta = match remote_url {
+    let meta = match &remote_url {
         Some(u) => crate::wacz::read_datapackage_from(crate::http_range::open_remote(u)?)
             .unwrap_or_default(),
         None => read_datapackage(local.as_ref().unwrap()).unwrap_or_default(),
@@ -284,7 +313,7 @@ fn index_one(
     let display_name = name
         .map(|n| n.to_string())
         .or_else(|| meta.title.clone().filter(|t| !t.trim().is_empty()))
-        .unwrap_or_else(|| source_display_name(source));
+        .unwrap_or_else(|| source_display_name(&effective_source));
 
     // Resolve the curated collection this WACZ joins: the one given, else a
     // singleton of its own (id == WACZ id, name == WACZ name).
@@ -300,13 +329,13 @@ fn index_one(
     // pass also collects provenance and capture stats (no re-read of the WARCs).
     // `--stream` uses CDX-guided extraction over the file; the default scans
     // every WARC record.
-    let stats = match remote_url {
+    let stats = match &remote_url {
         Some(u) => {
             info!(url = %u, "streaming remote WACZ index (no download)");
             let reader = crate::http_range::open_remote(u)?;
             index_wacz_streaming(reader, &id, &display_name, &collection_id, search, u)?
         }
-        None if stream => {
+        None if stream_local => {
             let p = local.as_ref().unwrap();
             let file = std::fs::File::open(p)
                 .with_context(|| format!("opening {} for streaming index", p.display()))?;
@@ -325,7 +354,7 @@ fn index_one(
     // Fixity: a streamed remote is never fully read, so there's no whole-file
     // SHA-256 (empty; `verify` already skips remote sources). Its size comes
     // from the HTTP Content-Length. A local/downloaded file is hashed as before.
-    let (sha, file_size) = match remote_url {
+    let (sha, file_size) = match &remote_url {
         Some(u) => (String::new(), crate::http_range::open_remote(u)?.total_len()),
         None => {
             let p = local.as_ref().unwrap();
@@ -350,7 +379,7 @@ fn index_one(
     manifest.upsert_wacz(Wacz {
         id,
         collection: collection_id,
-        source: source.clone(),
+        source: effective_source.clone(),
         name: display_name,
         date_indexed,
         file_size,
@@ -382,6 +411,45 @@ fn download_to_temp(url: &str) -> Result<tempfile::NamedTempFile> {
     copy(&mut reader, &mut tmp).with_context(|| format!("writing {url} to temp file"))?;
     tmp.flush()?;
     Ok(tmp)
+}
+
+/// Download a remote WACZ into `<home>/archive/<name>.wacz` and return its path
+/// relative to `home` (so the manifest stores a portable local source). The name
+/// comes from the URL's last path segment. Used by `--download`.
+fn download_into_archive(url: &str, home: &Path) -> Result<PathBuf> {
+    use std::io::{copy, Write};
+
+    let stem = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("download");
+    let name = if stem.ends_with(".wacz") { stem.to_string() } else { format!("{stem}.wacz") };
+
+    let archive = archive_dir(home);
+    std::fs::create_dir_all(&archive)
+        .with_context(|| format!("creating archive dir {}", archive.display()))?;
+    let dest = archive.join(&name);
+
+    let resp = ureq::get(url).call().with_context(|| format!("HTTP GET {url}"))?;
+    let mut file = std::fs::File::create(&dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    copy(&mut resp.into_reader(), &mut file)
+        .with_context(|| format!("writing {url} to {}", dest.display()))?;
+    file.flush()?;
+
+    Ok(PathBuf::from("archive").join(&name))
+}
+
+/// Whether a remote WACZ can be stream-indexed: reachable, range-capable, and
+/// its WARC entries Stored (uncompressed). Reads only the ZIP central directory.
+fn remote_warcs_streamable(url: &str) -> Result<bool> {
+    let reader = crate::http_range::open_remote(url)?;
+    let mut zip = zip::ZipArchive::new(reader)
+        .with_context(|| format!("reading remote ZIP central directory of {url}"))?;
+    crate::wacz::warcs_stored(&mut zip)
 }
 
 /// Display name for a source: the WACZ filename stem, for a file or URL.
@@ -975,7 +1043,7 @@ mod tests {
         let dest = archive.join("simple.wacz");
         std::fs::copy(fixture("simple.wacz"), &dest).unwrap();
 
-        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project"), false).unwrap();
+        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project"), false, false).unwrap();
 
         let m = crate::collections::Manifest::open(&tmp.path().join("index")).unwrap();
         assert!(

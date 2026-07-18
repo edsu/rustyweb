@@ -87,9 +87,16 @@ enum Commands {
         collection: Option<String>,
 
         /// Index via the WACZ's CDX index (reading only page records) instead of
-        /// scanning every WARC record. Faster on media-heavy archives.
+        /// scanning every WARC record. Faster on media-heavy archives. Remote
+        /// (http/https) WACZs stream by default.
         #[arg(long)]
         stream: bool,
+
+        /// Download a remote WACZ into <home>/archive and index it as a local
+        /// file (durable copy, whole-file fixity, offline replay) instead of
+        /// streaming it. No effect on local sources.
+        #[arg(long, conflicts_with = "stream")]
+        download: bool,
     },
     /// Start the replay web server.
     Serve {
@@ -200,7 +207,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index { paths, from_file, home, name, collection, stream } => {
+        Commands::Index { paths, from_file, home, name, collection, stream, download } => {
             // Sources come from the positional args plus, optionally, a
             // newline-delimited list from a file or stdin.
             let mut locations = paths;
@@ -245,6 +252,7 @@ async fn main() -> Result<()> {
                     name.as_deref(),
                     collection.as_deref(),
                     stream,
+                    download,
                 );
                 drop(quiet);
                 result?;
