@@ -291,6 +291,15 @@ impl rustyweb_lib::index::IndexProgress for BarProgress {
             a.pb.set_position(done);
         }
     }
+    fn wacz_indexed(&self, label: &str, pages: u64) {
+        // `println` on the active bar writes a line that persists after the bar is
+        // cleared, so the run leaves a record of what it did.
+        let line = format!("✓ indexed {pages} page{} from {}", if pages == 1 { "" } else { "s" }, short_label(label));
+        match &*self.inner.lock().unwrap() {
+            Some(a) => a.pb.println(line),
+            None => eprintln!("{line}"),
+        }
+    }
     fn finish(&self) {
         if let Some(a) = self.inner.lock().unwrap().take() {
             a.pb.finish_and_clear();

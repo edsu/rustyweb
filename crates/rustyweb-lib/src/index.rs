@@ -41,6 +41,10 @@ pub trait IndexProgress: Sync {
     fn set_total(&self, total: u64);
     /// `done` of the current WACZ's page records have been fetched.
     fn set_records(&self, done: u64);
+    /// A WACZ finished indexing with `pages` pages. Emits a persistent one-line
+    /// summary (the bar itself is transient and, in bar mode, the INFO logs that
+    /// would otherwise report this are hushed).
+    fn wacz_indexed(&self, label: &str, pages: u64);
     /// Work on the current WACZ finished (clear the spinner/bar).
     fn finish(&self);
 }
@@ -399,6 +403,11 @@ fn index_one(
             }
         }
     };
+
+    // Persist a one-line summary of what was indexed (the bar is transient).
+    if let Some(p) = progress {
+        p.wacz_indexed(&display_name, stats.pages);
+    }
 
     // Index the WACZ's metadata as a searchable document, tagged with its collection.
     let coll_body = build_collection_body(&meta);
