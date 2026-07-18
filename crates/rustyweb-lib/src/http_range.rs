@@ -279,9 +279,13 @@ impl RangeFetch for HttpFetch {
             if is_transient_status(code) {
                 return Attempt::Retry(retry_after(&resp));
             }
-            if code != 200 && code != 206 {
+            // Require 206: `open` confirmed range support and every fetch asks for
+            // a sub-file slice, so a 200 means the server ignored the Range and is
+            // sending the *whole file* — reject it rather than read a multi-GB body
+            // into memory for one record.
+            if code != 206 {
                 return Attempt::Fatal(io::Error::other(format!(
-                    "range GET of {} returned HTTP {code}",
+                    "range GET of {} returned HTTP {code} (expected 206)",
                     self.url
                 )));
             }
