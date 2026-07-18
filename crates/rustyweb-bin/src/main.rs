@@ -91,6 +91,7 @@ enum Commands {
         /// Number of records to fetch concurrently while CDX-guided (streaming)
         /// indexing. Default: 4 for remote URLs (gentle on the host; raise it,
         /// e.g. 16, for object stores like S3), CPU count for local files.
+        /// Capped at 64 per host as a proactive politeness ceiling.
         #[arg(long, value_name = "N")]
         concurrency: Option<usize>,
 

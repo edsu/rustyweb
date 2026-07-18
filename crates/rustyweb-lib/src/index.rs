@@ -188,6 +188,7 @@ pub fn reindex(home: &Path) -> Result<()> {
 
     let total = targets.len();
     let mut done = 0usize;
+    let mut skipped = 0usize;
     for (source, name, collection_id, collection_name) in &targets {
         // Skip local files that no longer exist rather than failing the run;
         // their manifest entry is preserved (see `rustyweb verify`).
@@ -196,20 +197,22 @@ pub fn reindex(home: &Path) -> Result<()> {
                 Some(p) if p.exists() => {}
                 _ => {
                     tracing::warn!(source = %source.location(), "skipping missing local WACZ");
+                    skipped += 1;
                     continue;
                 }
             }
         }
         info!(
             source = %source.location(),
-            progress = format!("{}/{}", done + 1, total),
+            progress = format!("{}/{}", done + skipped + 1, total),
             "reindexing"
         );
-        // Fail fast, but say which collection failed and make clear the index is
-        // now partially rebuilt (the old one was already dropped) so the user
-        // knows to fix the cause and run reindex again. Membership is preserved
-        // by re-supplying each WACZ's existing collection.
-        index_one(
+        // Resilient: a source that fails after retries (e.g. a remote host that's
+        // down or blocking) is skipped with a warning rather than aborting the
+        // whole rebuild — a long reindex over many remote sources shouldn't be
+        // torched by one bad source. Its manifest entry is preserved, and
+        // membership is re-supplied so the collection survives.
+        match index_one(
             source,
             home,
             &mut manifest,
@@ -219,23 +222,31 @@ pub fn reindex(home: &Path) -> Result<()> {
             false,
             None,
             None,
-        )
-        .with_context(|| {
-            format!(
-                "reindexing collection \"{}\" ({}) failed after {}/{} done; \
-                 the search index is now incomplete - fix the problem and run \
-                 `rustyweb reindex` again",
-                name,
-                source.location(),
-                done,
-                total,
-            )
-        })?;
-        done += 1;
+        ) {
+            Ok(_) => done += 1,
+            Err(e) => {
+                tracing::warn!(
+                    source = %source.location(),
+                    "skipping WACZ that failed to reindex: {e:#}"
+                );
+                skipped += 1;
+            }
+        }
     }
 
+    // The rebuild always runs to completion and the (possibly partial) index is
+    // committed and saved, so it's usable even if some sources were skipped.
     search.into_inner().unwrap().commit()?;
     manifest.save()?;
+    if skipped > 0 {
+        // Usable but incomplete: return an error so the process exits non-zero and
+        // cron/CI notices, while leaving the mostly-rebuilt index in place.
+        anyhow::bail!(
+            "reindex finished but {skipped} of {total} source(s) were skipped \
+             (indexed {done}); the search index is missing them — fix the cause \
+             and run `rustyweb reindex` again to include them"
+        );
+    }
     info!(reindexed = done, total, "reindex complete");
     Ok(())
 }
@@ -411,8 +422,19 @@ fn index_one(
     // CDX-guided extraction is the default everywhere (replay already resolves
     // records through the CDX, so indexing trusts it too); a full scan is only
     // the fallback when a WACZ can't be CDX-guided (deflated WARCs / no CDX).
-    // Resolve fetch concurrency once we know whether this WACZ is remote.
-    let workers = concurrency.unwrap_or_else(|| default_concurrency(remote_url.is_some()));
+    // Resolve fetch concurrency once we know whether this WACZ is remote, then
+    // clamp it to a per-host ceiling so no `--concurrency` setting can flood a
+    // single host with an unbounded number of in-flight range requests (polite
+    // by default, and a guard against a mis-typed value like `--concurrency 500`).
+    let requested = concurrency.unwrap_or_else(|| default_concurrency(remote_url.is_some()));
+    let workers = requested.clamp(1, MAX_CONCURRENCY);
+    if requested > MAX_CONCURRENCY {
+        tracing::warn!(
+            requested,
+            cap = MAX_CONCURRENCY,
+            "capping fetch concurrency to the per-host ceiling"
+        );
+    }
     let stats = match &remote_url {
         Some(u) => {
             info!(url = %u, "streaming remote WACZ index (no download)");
@@ -1037,6 +1059,13 @@ where
     Ok((out, warcinfo))
 }
 
+/// Per-host ceiling on fetch concurrency. Even when a user asks for more (or the
+/// local core count is very high), we never run more than this many concurrent
+/// range requests against a single WACZ's host — a proactive politeness cap that
+/// bounds simultaneous load and defends against a mis-typed `--concurrency`. 64 is
+/// generous for object stores like S3 while still a hard bound for small servers.
+const MAX_CONCURRENCY: usize = 64;
+
 /// Default worker count for the concurrent CDX-guided record fetch+extract, when
 /// `--concurrency` isn't given.
 ///
@@ -1474,24 +1503,56 @@ mod tests {
     }
 
     #[test]
-    fn reindex_failure_names_the_collection_and_suggests_rerun() {
-        // A manifest that points at a file which exists but isn't a valid WACZ.
+    fn reindex_skips_a_failing_source_and_keeps_going() {
+        // A resilient reindex: one good WACZ plus one that exists but isn't a
+        // valid WACZ. The bad source is skipped (warned) rather than aborting the
+        // whole rebuild, so the good source is still indexed and searchable, and
+        // the skipped source's manifest entry is preserved for a later re-run.
         let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("index")).unwrap();
-        std::fs::create_dir_all(tmp.path().join("archive")).unwrap();
-        std::fs::write(tmp.path().join("archive/bad.wacz"), b"not a zip file").unwrap();
-        let manifest = r#"[{"id":"deadbeef","source":"archive/bad.wacz","name":"BadOne","date_indexed":"2026-01-01T00:00:00Z","file_size":14,"sha256":"00"}]"#;
-        std::fs::write(tmp.path().join("index/collections.json"), manifest).unwrap();
+        index_fixture("simple.wacz", tmp.path(), None);
 
-        let err = reindex(tmp.path()).expect_err("reindex should fail on a corrupt WACZ");
+        // Plant a corrupt WACZ and register it as a member alongside the good one.
+        std::fs::write(tmp.path().join("archive/bad.wacz"), b"not a zip file").unwrap();
+        let waczs_path = tmp.path().join("index/waczs.json");
+        let mut entries: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&waczs_path).unwrap()).unwrap();
+        entries.push(serde_json::json!({
+            "id": "deadbeef",
+            "collection": "deadbeef",
+            "source": "archive/bad.wacz",
+            "name": "BadOne",
+            "date_indexed": "2026-01-01T00:00:00Z",
+            "file_size": 14,
+            "sha256": "00"
+        }));
+        std::fs::write(&waczs_path, serde_json::to_string(&entries).unwrap()).unwrap();
+
+        // Rebuild from the manifest: the run completes over the good source but
+        // reports a non-zero exit (an error) because one source was skipped.
+        let err = reindex(tmp.path())
+            .expect_err("a skipped source should surface as a non-zero exit, not abort mid-run");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("BadOne"),
-            "error should name the failing collection: {msg}"
+            msg.contains("skipped") && msg.contains("reindex"),
+            "error should summarize the skipped source(s) and suggest re-running: {msg}"
         );
+
+        // ...yet the good source is still fully indexed and searchable.
+        let idx =
+            crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path())
+                .unwrap();
         assert!(
-            msg.contains("reindex"),
-            "error should tell the user to reindex again: {msg}"
+            !idx.search("example", 10).unwrap().is_empty(),
+            "the good source should still be indexed after skipping the bad one"
+        );
+
+        // ...and the skipped source's manifest entry is preserved (not dropped),
+        // so `rustyweb reindex` can pick it up again once the cause is fixed.
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(
+            manifest.waczs.len(),
+            2,
+            "skipped source's manifest entry should be preserved"
         );
     }
 

@@ -207,7 +207,8 @@ requests are latency-bound and independent, so rustyweb fetches them concurrentl
 retry transient failures (rate limits and `5xx`) with backoff, honoring
 `Retry-After`, so a long ingest survives blips and stays gentle on the host - be
 mindful that a high `--concurrency` all hits a single host, so dial it down for
-small servers (it's fine for object stores like S3). `index` shows a progress
+small servers (it's fine for object stores like S3). As a backstop the worker
+count is capped at 64 per host, so a mis-typed value can't flood a single server. `index` shows a progress
 bar - a spinner while it reads the CDX, then a bar with the throughput and an ETA
 once it knows how many records there are - so you can see it working. Add
 `-v`/`--verbose` for detailed logs instead of the bar; when output isn't a
@@ -295,16 +296,21 @@ derived siblings under it.
   read from stdin); blank lines and `#` comments are ignored, and it combines with
   any positional args. `--concurrency <N>` sets how many records are fetched at
   once during CDX-guided (streaming) indexing (default: 4 for remote URLs — gentle
-  on the host, raise for object stores like S3; CPU count for local files).
-  Indexing shows a progress bar on an interactive terminal; `-v`/`--verbose`
-  replaces it with debug logs.
+  on the host, raise for object stores like S3; CPU count for local files; capped
+  at 64 per host). Indexing shows a progress bar on an interactive terminal;
+  `-v`/`--verbose` replaces it with debug logs.
 - **`collection`** - `collection list` shows collections and their members;
   `collection set <COLLECTION> <WACZ_ID>...` moves WACZs into a collection.
 - **`reindex`** - rebuild the search index from the WACZs already in the
   manifest, preserving collection membership and metadata. Re-fetches remote URL
   sources and recreates the index from scratch, so it's the way to migrate after
-  an upgrade changes the index schema. (If you try to `index` or `serve` against
-  an index built by an older version, rustyweb tells you to run this.)
+  an upgrade changes the index schema. It's resilient: a source that can't be
+  indexed (a missing local file, or a remote source still failing after retries)
+  is skipped with a warning rather than aborting the rebuild; the mostly-rebuilt
+  index is still usable, and if anything was skipped the command exits non-zero
+  with a summary count so you (or cron/CI) know to re-run it once fixed. (If you try
+  to `index` or `serve` against an index built by an older version, rustyweb tells
+  you to run this.)
 - **`serve`** - opens the index read-only and starts the HTTP server (so you can
   `index` while it runs). Defaults to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and
