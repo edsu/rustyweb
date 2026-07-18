@@ -226,13 +226,16 @@ fn spinner_style() -> indicatif::ProgressStyle {
     indicatif::ProgressStyle::with_template("{spinner:.green} {msg} ({elapsed})").unwrap()
 }
 
-/// The determinate style, once we know the record total. {per_sec} + {eta} answer
+/// The determinate style, once we know the record total. The unit is **records**
+/// (CDX entries fetched: HTML/PDF responses + `urn:text` rendered text), not
+/// pages — several records merge into one page, so this is always >= the final
+/// page count reported by the "indexed N pages" summary. {per_sec} + {eta} answer
 /// "how long will this take?" — indicatif derives both from a moving window of
 /// recent progress, so they track the current streaming rate rather than a naive
 /// lifetime average.
 fn bar_style() -> indicatif::ProgressStyle {
     indicatif::ProgressStyle::with_template(
-        "{spinner:.green} {msg} [{bar:30.cyan/blue}] {pos}/{len} pages \
+        "{spinner:.green} {msg} [{bar:30.cyan/blue}] {pos}/{len} records \
          ({per_sec}, {elapsed} elapsed, eta {eta})",
     )
     .unwrap()
