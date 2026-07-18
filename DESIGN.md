@@ -500,14 +500,18 @@ and shows no bar, so logs aren't lost.
 
 ## ReplayWebPage Assets
 
-`static/replay/` holds the ReplayWebPage JS bundle, embedded at compile time via `rust-embed`. The directory is **not committed** - a script downloads from npm before building.
+`static/replay/` holds the [ReplayWeb.page][rwp] JS bundle (`ui.js` + `sw.js`), embedded in the binary at compile time via `rust-embed` and served under `/replay/`. Replay runs in WACZ-direct mode: the `<replay-web-page>` component reads the WACZ over byte-range from our `/files/{id}` endpoint and serves every resource client-side through its service worker (`sw.js`); rustyweb does no server-side rewriting (see *viewer.html* / `server.rs`).
+
+These two files **are committed**, **pinned** to a specific `replaywebpage` npm release (currently **2.4.6**), so builds are reproducible and offline. They are vendored assets, not a Cargo dependency, so **Dependabot does not track them** - upgrading is a deliberate manual step via `scripts/fetch-replay.sh`:
 
 ```sh
-./scripts/fetch-replay.sh          # download latest
-./scripts/fetch-replay.sh 2.4.0   # pin a version
+./scripts/fetch-replay.sh          # re-fetch the pinned VERSION (2.4.6)
+./scripts/fetch-replay.sh 2.4.7    # fetch a specific version (one-off)
 ```
 
-The script downloads `ui.js` and `sw.js` from the ReplayWebPage GitHub release. Builds are reproducible without network access - users run the script once on setup and re-run to upgrade.
+To upgrade: pick a version from <https://www.npmjs.com/package/replaywebpage>, bump `VERSION` in `scripts/fetch-replay.sh`, re-run it (downloads `ui.js`/`sw.js` from the jsDelivr npm CDN), rebuild, **re-test replay in a browser** (`cargo test -p rustyweb-lib --test browser` needs Chrome + chromedriver), then commit the refreshed assets. Do this periodically so replay keeps up with wabac.js fixes.
+
+[rwp]: https://replayweb.page
 
 ---
 
