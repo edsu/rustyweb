@@ -202,7 +202,8 @@ uncompressed so they can be read by range; a few tools don't).
 
 Streaming a large remote WACZ makes one HTTP range request per page record. Those
 requests are latency-bound and independent, so rustyweb fetches them concurrently
-(16 at a time by default for remote WACZs; tune with `--concurrency <N>`). Fetches
+(4 at a time by default — gentle on arbitrary hosts; raise it, e.g.
+`--concurrency 16`, for object stores like S3). Fetches
 retry transient failures (rate limits and `5xx`) with backoff, honoring
 `Retry-After`, so a long ingest survives blips and stays gentle on the host - be
 mindful that a high `--concurrency` all hits a single host, so dial it down for
@@ -293,9 +294,10 @@ derived siblings under it.
   a newline-delimited list of files/URLs with `--from-file <FILE>` (or `-f -` to
   read from stdin); blank lines and `#` comments are ignored, and it combines with
   any positional args. `--concurrency <N>` sets how many records are fetched at
-  once during CDX-guided (streaming) indexing (default: 16 for remote URLs, CPU
-  count for local files). Indexing shows a progress bar on an interactive
-  terminal; `-v`/`--verbose` replaces it with debug logs.
+  once during CDX-guided (streaming) indexing (default: 4 for remote URLs — gentle
+  on the host, raise for object stores like S3; CPU count for local files).
+  Indexing shows a progress bar on an interactive terminal; `-v`/`--verbose`
+  replaces it with debug logs.
 - **`collection`** - `collection list` shows collections and their members;
   `collection set <COLLECTION> <WACZ_ID>...` moves WACZs into a collection.
 - **`reindex`** - rebuild the search index from the WACZs already in the

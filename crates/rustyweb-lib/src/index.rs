@@ -1038,12 +1038,18 @@ where
 }
 
 /// Default worker count for the concurrent CDX-guided record fetch+extract, when
-/// `--concurrency` isn't given. Remote fetches are round-trip-latency-bound, so
-/// more workers than cores hides that latency; local fetch is cheap and the work
-/// is CPU-bound text extraction, so the core count is the sweet spot.
+/// `--concurrency` isn't given.
+///
+/// Remote defaults to a deliberately gentle 4: a single WACZ's requests all hit
+/// one host, and rustyweb is meant to be pointed at arbitrary (often small)
+/// servers, so it's polite by default while still ~4x faster than serial. Users
+/// hitting an object store (e.g. S3) can raise it with `--concurrency`.
+///
+/// Local defaults to the core count: it's your own disk (no politeness concern)
+/// and the work is CPU-bound text extraction, so cores are the sweet spot.
 fn default_concurrency(remote: bool) -> usize {
     if remote {
-        16
+        4
     } else {
         std::thread::available_parallelism()
             .map(|n| n.get())

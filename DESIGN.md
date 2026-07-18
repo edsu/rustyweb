@@ -455,7 +455,7 @@ of a multi-GB ZIP64 WACZ into hundreds of range requests.
 
 The per-record **fetch** phase is **concurrent**: the CDX gives each record an
 independent `(offset, length)`, so a dedicated pool of `--concurrency` workers
-(default 16 for remote, CPU count for local) each does an independent
+(default 4 for remote — gentle on the host; CPU count for local) each does an independent
 `RangeFetch::fetch` + gunzip + extract, driven by an atomic progress counter.
 This hides per-record round-trip latency - the big win for remote WACZs, which
 would otherwise be one serial HTTP round trip each - and parallelizes HTML/PDF
