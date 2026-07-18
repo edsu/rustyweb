@@ -38,7 +38,7 @@ whatlang = "0.16"
 pdf-extract = "0.7"
 
 # HTTP client for indexing remote WACZ files
-ureq = "2"
+ureq = "3"
 
 # Temporarily redirect stdout (to silence third-party PDF extraction noise)
 gag = "1"
