@@ -455,13 +455,24 @@ of a multi-GB ZIP64 WACZ into hundreds of range requests.
 
 The per-record **fetch** phase is **concurrent**: the CDX gives each record an
 independent `(offset, length)`, so a dedicated pool of `--concurrency` workers
-(default 16 for remote, CPU count for local) each does an independent
+(default 4 for remote — gentle on the host; CPU count for local) each does an independent
 `RangeFetch::fetch` + gunzip + extract, driven by an atomic progress counter.
 This hides per-record round-trip latency - the big win for remote WACZs, which
 would otherwise be one serial HTTP round trip each - and parallelizes HTML/PDF
 text extraction (CPU) across cores. Remote is latency-bound so more workers than
 cores helps; local fetch is cheap and the work is CPU-bound extraction, so the
 core count is the sweet spot.
+
+**Resilient + polite remote fetching.** Every HTTP fetch (the range GETs and the
+whole-file downloads) retries transient failures - network errors and HTTP
+`429`/`502`/`503`/`504` - with capped exponential backoff + jitter, honoring a
+server `Retry-After` (`with_retry` in `http_range.rs`). This makes a long ingest
+survive blips, and is deliberately *polite*: when a host pushes back we wait
+rather than hammer it. That matters because a single WACZ's `--concurrency`
+requests all hit one host, so an aggressive setting against a small (non-object-
+store) server could otherwise overload it or get the client IP-blocked. The agent
+is built with `http_status_as_error(false)` so `4xx`/`5xx` come back as
+inspectable responses (status + `Retry-After`) rather than opaque errors.
 
 ### Progress reporting
 

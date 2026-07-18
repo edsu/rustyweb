@@ -5,6 +5,7 @@
 //! records — are fetched. This is the same primitive wabac.js uses for replay.
 
 use std::io::{self, Read, Seek, SeekFrom};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -122,10 +123,95 @@ impl<F: RangeFetch> Seek for RangeReader<F> {
     }
 }
 
-/// A [`RangeFetch`] backed by HTTP range GETs via `ureq`. `Clone` is cheap (the
-/// `ureq::Agent` is `Arc`-backed) and `fetch` takes `&self`, so a single
-/// `HttpFetch` can drive many concurrent range requests (see the parallel
-/// CDX-guided extractor).
+// ── Transient-failure retry / politeness ────────────────────────────────────
+//
+// Remote fetches (range GETs and downloads) retry transient failures — network
+// errors and HTTP 429/502/503/504 — with capped exponential backoff + jitter,
+// honoring a server `Retry-After`. This makes long ingests survive blips, and is
+// *polite*: when a host pushes back we wait instead of hammering it, so we're far
+// less likely to overload a small server or get IP-blocked — which matters
+// because a single WACZ's concurrent record fetches all hit one host.
+
+const MAX_ATTEMPTS: u32 = 5;
+const BASE_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Outcome of one HTTP attempt.
+enum Attempt<T> {
+    Done(T),
+    /// Transient failure; optional server-suggested delay (`Retry-After`).
+    Retry(Option<Duration>),
+    Fatal(io::Error),
+}
+
+/// Run `attempt`, retrying transient failures with capped exponential backoff +
+/// jitter (or a server-suggested `Retry-After`), up to [`MAX_ATTEMPTS`].
+fn with_retry<T>(label: &str, mut attempt: impl FnMut() -> Attempt<T>) -> io::Result<T> {
+    let mut backoff = BASE_BACKOFF;
+    for n in 1..=MAX_ATTEMPTS {
+        match attempt() {
+            Attempt::Done(v) => return Ok(v),
+            Attempt::Fatal(e) => return Err(e),
+            Attempt::Retry(after) => {
+                if n == MAX_ATTEMPTS {
+                    return Err(io::Error::other(format!(
+                        "{label}: gave up after {MAX_ATTEMPTS} attempts"
+                    )));
+                }
+                let base = after.unwrap_or(backoff).min(MAX_BACKOFF);
+                let wait = base + jitter(base);
+                tracing::debug!("{label}: transient failure, retry {n}/{MAX_ATTEMPTS} in {wait:?}");
+                std::thread::sleep(wait);
+                backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+            }
+        }
+    }
+    unreachable!("the last iteration returns")
+}
+
+/// Up to ~20% of `base`, to spread concurrent workers' retries so they don't all
+/// re-hit a rate-limited host in lockstep (thundering herd).
+fn jitter(base: Duration) -> Duration {
+    let span = base.as_millis() as u64 / 5;
+    if span == 0 {
+        return Duration::ZERO;
+    }
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    Duration::from_millis(n % (span + 1))
+}
+
+/// HTTP statuses worth retrying: rate-limit and transient server errors.
+fn is_transient_status(code: u16) -> bool {
+    matches!(code, 429 | 502 | 503 | 504)
+}
+
+/// Parse `Retry-After` as delta-seconds (the HTTP-date form is ignored, falling
+/// back to computed backoff). Generic over the body type to avoid naming it.
+fn retry_after<B>(resp: &ureq::http::Response<B>) -> Option<Duration> {
+    resp.headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+/// The shared HTTP agent. `http_status_as_error(false)` returns 4xx/5xx as a
+/// normal response we can inspect (status + `Retry-After`), rather than an opaque
+/// error — needed to classify 429/503 for retry.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+}
+
+/// A [`RangeFetch`] backed by HTTP range GETs via `ureq`, with transient-failure
+/// retry/backoff. `Clone` is cheap (the `ureq::Agent` is `Arc`-backed) and
+/// `fetch` takes `&self`, so a single `HttpFetch` can drive many concurrent range
+/// requests (see the parallel CDX-guided extractor).
 #[derive(Clone)]
 pub struct HttpFetch {
     agent: ureq::Agent,
@@ -135,31 +221,40 @@ pub struct HttpFetch {
 
 impl HttpFetch {
     /// Probe the resource for its total size and confirm the server honors range
-    /// requests (a `206` with `Content-Range`). Errors if it doesn't — the
-    /// caller can then fall back to downloading.
+    /// requests (a `206` with `Content-Range`). Retries transient failures;
+    /// errors otherwise so the caller can fall back to downloading.
     pub fn open(url: &str) -> Result<Self> {
-        let agent = ureq::agent();
-        let resp = agent
-            .get(url)
-            .header("Range", "bytes=0-0")
-            .call()
-            .with_context(|| format!("HTTP range probe of {url}"))?;
-        if resp.status() != 206 {
-            anyhow::bail!(
-                "{url} did not honor a range request (status {}); the server must \
-                 support HTTP range requests to stream-index it — use --download instead",
-                resp.status()
-            );
-        }
-        // Content-Range: "bytes 0-0/<total>"
-        let len = resp
-            .headers()
-            .get("Content-Range")
-            .and_then(|cr| cr.to_str().ok())
-            .and_then(|cr| cr.rsplit('/').next())
-            .map(str::trim)
-            .and_then(|n| n.parse::<u64>().ok())
-            .with_context(|| format!("no total length in Content-Range from {url}"))?;
+        let agent = http_agent();
+        let len = with_retry(&format!("HTTP range probe of {url}"), || {
+            let resp = match agent.get(url).header("Range", "bytes=0-0").call() {
+                Ok(r) => r,
+                Err(_) => return Attempt::Retry(None),
+            };
+            let code = resp.status().as_u16();
+            if is_transient_status(code) {
+                return Attempt::Retry(retry_after(&resp));
+            }
+            if code != 206 {
+                return Attempt::Fatal(io::Error::other(format!(
+                    "{url} did not honor a range request (HTTP {code}); the server must \
+                     support HTTP range requests to stream-index it — use --download instead"
+                )));
+            }
+            // Content-Range: "bytes 0-0/<total>"
+            match resp
+                .headers()
+                .get("Content-Range")
+                .and_then(|cr| cr.to_str().ok())
+                .and_then(|cr| cr.rsplit('/').next())
+                .map(str::trim)
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                Some(len) => Attempt::Done(len),
+                None => Attempt::Fatal(io::Error::other(format!(
+                    "no total length in Content-Range from {url}"
+                ))),
+            }
+        })?;
         Ok(Self {
             agent,
             url: url.to_string(),
@@ -174,15 +269,33 @@ impl RangeFetch for HttpFetch {
     }
 
     fn fetch(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
-        let resp = self
-            .agent
-            .get(&self.url)
-            .header("Range", &format!("bytes={}-{}", start, end - 1))
-            .call()
-            .map_err(|e| io::Error::other(format!("range GET of {}: {e}", self.url)))?;
-        let mut v = Vec::with_capacity((end - start) as usize);
-        resp.into_body().into_reader().read_to_end(&mut v)?;
-        Ok(v)
+        let range = format!("bytes={}-{}", start, end - 1);
+        with_retry(&format!("range GET of {}", self.url), || {
+            let resp = match self.agent.get(&self.url).header("Range", &range).call() {
+                Ok(r) => r,
+                Err(_) => return Attempt::Retry(None),
+            };
+            let code = resp.status().as_u16();
+            if is_transient_status(code) {
+                return Attempt::Retry(retry_after(&resp));
+            }
+            // Require 206: `open` confirmed range support and every fetch asks for
+            // a sub-file slice, so a 200 means the server ignored the Range and is
+            // sending the *whole file* — reject it rather than read a multi-GB body
+            // into memory for one record.
+            if code != 206 {
+                return Attempt::Fatal(io::Error::other(format!(
+                    "range GET of {} returned HTTP {code} (expected 206)",
+                    self.url
+                )));
+            }
+            let mut v = Vec::with_capacity((end - start) as usize);
+            match resp.into_body().into_reader().read_to_end(&mut v) {
+                Ok(_) => Attempt::Done(v),
+                // A mid-stream read failure is usually transient; retry the range.
+                Err(_) => Attempt::Retry(None),
+            }
+        })
     }
 }
 
@@ -220,6 +333,28 @@ impl RangeFetch for FileFetch {
         f.read_exact(&mut v)?;
         Ok(v)
     }
+}
+
+/// A retried whole-file GET returning the response body reader (for downloads).
+/// Retries the request start on transient failures; a mid-stream connection drop
+/// is not resumed.
+pub fn get_reader(url: &str) -> Result<impl Read> {
+    let agent = http_agent();
+    let resp = with_retry(&format!("HTTP GET {url}"), || {
+        let resp = match agent.get(url).call() {
+            Ok(r) => r,
+            Err(_) => return Attempt::Retry(None),
+        };
+        let code = resp.status().as_u16();
+        if is_transient_status(code) {
+            Attempt::Retry(retry_after(&resp))
+        } else if (200..300).contains(&code) {
+            Attempt::Done(resp)
+        } else {
+            Attempt::Fatal(io::Error::other(format!("HTTP {code} for {url}")))
+        }
+    })?;
+    Ok(resp.into_body().into_reader())
 }
 
 /// Open a remote WACZ as a `Read + Seek` HTTP range stream.
@@ -358,5 +493,54 @@ mod tests {
             "tail cache should make ~2 fetches, not 40; got {}",
             count.get()
         );
+    }
+
+    // Zero-delay retries keep these instant (no real sleeps).
+    #[test]
+    fn with_retry_succeeds_after_transient_failures() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: io::Result<u32> = with_retry("t", || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n < 3 {
+                Attempt::Retry(Some(Duration::ZERO))
+            } else {
+                Attempt::Done(n)
+            }
+        });
+        assert_eq!(out.unwrap(), 3);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn with_retry_gives_up_after_max_attempts() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: io::Result<u32> = with_retry("t", || {
+            calls.set(calls.get() + 1);
+            Attempt::Retry(Some(Duration::ZERO))
+        });
+        assert!(out.is_err());
+        assert_eq!(calls.get(), MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn with_retry_returns_fatal_without_retrying() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: io::Result<u32> = with_retry("t", || {
+            calls.set(calls.get() + 1);
+            Attempt::Fatal(io::Error::other("nope"))
+        });
+        assert!(out.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn transient_statuses_are_rate_limit_and_5xx() {
+        for c in [429, 502, 503, 504] {
+            assert!(is_transient_status(c), "{c} should be transient");
+        }
+        for c in [200, 206, 301, 404, 416, 500, 501] {
+            assert!(!is_transient_status(c), "{c} should not be transient");
+        }
     }
 }

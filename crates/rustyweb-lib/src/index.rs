@@ -540,11 +540,8 @@ fn index_one(
 fn download_to_temp(url: &str) -> Result<tempfile::NamedTempFile> {
     use std::io::{copy, Write};
 
-    let resp = ureq::get(url)
-        .call()
-        .with_context(|| format!("HTTP GET {url}"))?;
     let mut tmp = tempfile::Builder::new().suffix(".wacz").tempfile()?;
-    let mut reader = resp.into_body().into_reader();
+    let mut reader = crate::http_range::get_reader(url)?;
     copy(&mut reader, &mut tmp).with_context(|| format!("writing {url} to temp file"))?;
     tmp.flush()?;
     Ok(tmp)
@@ -574,12 +571,9 @@ fn download_into_archive(url: &str, home: &Path) -> Result<PathBuf> {
         .with_context(|| format!("creating archive dir {}", archive.display()))?;
     let dest = archive.join(&name);
 
-    let resp = ureq::get(url)
-        .call()
-        .with_context(|| format!("HTTP GET {url}"))?;
     let mut file =
         std::fs::File::create(&dest).with_context(|| format!("creating {}", dest.display()))?;
-    copy(&mut resp.into_body().into_reader(), &mut file)
+    copy(&mut crate::http_range::get_reader(url)?, &mut file)
         .with_context(|| format!("writing {url} to {}", dest.display()))?;
     file.flush()?;
 
@@ -1044,12 +1038,18 @@ where
 }
 
 /// Default worker count for the concurrent CDX-guided record fetch+extract, when
-/// `--concurrency` isn't given. Remote fetches are round-trip-latency-bound, so
-/// more workers than cores hides that latency; local fetch is cheap and the work
-/// is CPU-bound text extraction, so the core count is the sweet spot.
+/// `--concurrency` isn't given.
+///
+/// Remote defaults to a deliberately gentle 4: a single WACZ's requests all hit
+/// one host, and rustyweb is meant to be pointed at arbitrary (often small)
+/// servers, so it's polite by default while still ~4x faster than serial. Users
+/// hitting an object store (e.g. S3) can raise it with `--concurrency`.
+///
+/// Local defaults to the core count: it's your own disk (no politeness concern)
+/// and the work is CPU-bound text extraction, so cores are the sweet spot.
 fn default_concurrency(remote: bool) -> usize {
     if remote {
-        16
+        4
     } else {
         std::thread::available_parallelism()
             .map(|n| n.get())

@@ -734,3 +734,64 @@ fn index_real_wacz_indexes_rendered_text() {
         hit.snippet
     );
 }
+
+// ── Remote-fetch resilience ──────────────────────────────────────────────────
+
+/// A transient HTTP failure (503 + Retry-After) is retried, then succeeds. This
+/// exercises the retry *wiring* end to end: the agent built with
+/// `http_status_as_error(false)` (so 4xx/5xx come back as responses), the
+/// transient-status classification, `Retry-After` parsing, and `with_retry`.
+#[tokio::test]
+async fn get_reader_retries_a_transient_status() {
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let app = axum::Router::new().route(
+        "/f",
+        get(move || {
+            let h = h.clone();
+            async move {
+                // First request: transient failure, retry immediately (Retry-After: 0).
+                if h.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "0")], "").into_response()
+                } else {
+                    (StatusCode::OK, "hello world").into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let url = format!("http://{addr}/f");
+    // get_reader is blocking (ureq); run it off the async runtime.
+    let body = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut r = rustyweb_lib::http_range::get_reader(&url).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        s
+    })
+    .await
+    .unwrap();
+    server.abort();
+
+    assert_eq!(
+        body, "hello world",
+        "should have retried past the 503 and read the 200 body"
+    );
+    assert!(
+        hits.load(Ordering::SeqCst) >= 2,
+        "the 503 should have triggered a retry (got {} requests)",
+        hits.load(Ordering::SeqCst)
+    );
+}
