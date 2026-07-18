@@ -390,10 +390,10 @@ fn index_one(
                 index_wacz_streaming(file, &id, &display_name, &collection_id, search, &p.display().to_string(), progress)?
             } else {
                 // The scan path has no cheap up-front record total, so it stays on
-                // the spinner (no determinate bar). Relabel it "indexing" so the
-                // spinner is accurate for the scan phase.
+                // the spinner (no determinate bar). Label it "scanning" - it reads
+                // every WARC record, unlike the CDX-guided path.
                 if let Some(pr) = progress {
-                    pr.phase("indexing");
+                    pr.phase("scanning");
                 }
                 index_wacz(p, &id, &display_name, &collection_id, search)?
             }
@@ -869,7 +869,7 @@ fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
     // 100% with a decaying rate/ETA during the slow tail (very visible for a local
     // file, where reads are near-instant and the tail dominates).
     if let Some(p) = progress {
-        p.phase("indexing");
+        p.phase("building index");
     }
     Ok((out, warcinfo))
 }
