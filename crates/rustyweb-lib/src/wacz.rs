@@ -195,8 +195,13 @@ fn find_cdx_entry<R: std::io::Read + std::io::Seek>(
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
         let name = entry.name().to_string();
+        // The index holds CDXJ data; the extension varies by tool: compressed
+        // `.cdx.gz`/`.cdxj.gz` or plain `.cdx`/`.cdxj`. Match any of them.
         if name.starts_with("indexes/")
-            && (name.ends_with(".cdx.gz") || name.ends_with(".cdx"))
+            && (name.ends_with(".cdx.gz")
+                || name.ends_with(".cdxj.gz")
+                || name.ends_with(".cdx")
+                || name.ends_with(".cdxj"))
         {
             return Ok(Some(name));
         }
@@ -507,6 +512,25 @@ mod tests {
         let urls: Vec<&str> = recs.iter().map(|r| r.url.as_str()).collect();
         assert_eq!(recs.len(), 2, "must read every gzip member of the CDX, not just the first");
         assert!(urls.contains(&"https://example.com/a") && urls.contains(&"https://example.com/b"));
+    }
+
+    #[test]
+    fn cdx_records_recognizes_a_plain_cdxj_index() {
+        use std::io::Write;
+        // Some WACZs name the (uncompressed) index `indexes/index.cdxj`.
+        let line = "com,example)/ 20200101000000 {\"url\":\"https://example.com/\",\"mime\":\"text/html\",\"filename\":\"x.warc.gz\",\"offset\":0,\"length\":10,\"status\":200}\n";
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("indexes/index.cdxj", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(line.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+        let recs = cdx_records(&mut zip).unwrap();
+        assert_eq!(recs.len(), 1, "a plain .cdxj index must be recognized");
+        assert_eq!(recs[0].url, "https://example.com/");
     }
 
     #[test]
