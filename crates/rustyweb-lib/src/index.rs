@@ -41,9 +41,9 @@ pub trait IndexProgress: Sync {
     fn set_total(&self, total: u64);
     /// `done` of the current WACZ's page records have been fetched.
     fn set_records(&self, done: u64);
-    /// A WACZ finished indexing with `pages` pages. Emits a persistent one-line
-    /// summary (the bar itself is transient and, in bar mode, the INFO logs that
-    /// would otherwise report this are hushed).
+    /// A WACZ was indexed with `pages` pages, and the index has been committed.
+    /// Emits a persistent one-line summary (the bar itself is transient and, in
+    /// bar mode, the INFO logs that would otherwise report this are hushed).
     fn wacz_indexed(&self, label: &str, pages: u64);
     /// Work on the current WACZ finished (clear the spinner/bar).
     fn finish(&self);
@@ -96,9 +96,10 @@ pub fn index_location(
     // Resolve `--collection NAME` to (id, name); `None` => a singleton per WACZ.
     let group = collection.map(|cn| (crate::collections::slugify(cn), cn.to_string()));
 
+    let mut summaries: Vec<(String, u64)> = Vec::new();
     for source in &sources {
         let c = group.as_ref().map(|(id, n)| (id.as_str(), n.as_str()));
-        index_one(source, home, &mut manifest, &search, name, c, download, progress)?;
+        summaries.push(index_one(source, home, &mut manifest, &search, name, c, download, progress)?);
     }
 
     // The Tantivy commit (segment flush) is the slow tail, especially after fast
@@ -108,7 +109,12 @@ pub fn index_location(
     }
     search.into_inner().unwrap().commit()?;
     manifest.save()?;
+    // Report per-WACZ page counts only now that the index is actually built and
+    // committed - not while it's still being written (or if the commit failed).
     if let Some(p) = progress {
+        for (name, pages) in &summaries {
+            p.wacz_indexed(name, *pages);
+        }
         p.finish();
     }
 
@@ -283,6 +289,7 @@ fn resolve_archive_file(path: &Path, home: &Path) -> Result<Source> {
 
 /// Index a single WACZ source: obtain a local readable copy (downloading a URL
 /// to a temp file), index its pages and metadata, and upsert its manifest entry.
+/// Returns the WACZ's display name and page count, for a post-commit summary.
 #[allow(clippy::too_many_arguments)]
 fn index_one(
     source: &Source,
@@ -298,7 +305,7 @@ fn index_one(
     download: bool,
     // Optional progress sink for indexing.
     progress: Option<&dyn IndexProgress>,
-) -> Result<()> {
+) -> Result<(String, u64)> {
     // Show an indeterminate spinner from the very start: the setup work (probing
     // the host, downloading, reading the ZIP directory and CDX) happens before
     // any record total is known, and can take many seconds on a large remote
@@ -404,10 +411,9 @@ fn index_one(
         }
     };
 
-    // Persist a one-line summary of what was indexed (the bar is transient).
-    if let Some(p) = progress {
-        p.wacz_indexed(&display_name, stats.pages);
-    }
+    // Capture the outcome to report once the index is committed (see
+    // `index_location`), not here - the commit could still fail.
+    let outcome = (display_name.clone(), stats.pages);
 
     // Index the WACZ's metadata as a searchable document, tagged with its collection.
     let coll_body = build_collection_body(&meta);
@@ -463,8 +469,9 @@ fn index_one(
 
     // Note: the spinner/bar is *not* finished here - the Tantivy commit happens
     // once per `index_location` (after all sources), and that's where it's cleared
-    // (via a final "committing" spinner). See `index_location`.
-    Ok(())
+    // (via a final "committing" spinner) and the summary is emitted. See
+    // `index_location`.
+    Ok(outcome)
 }
 
 /// Download a remote WACZ to a temp file for indexing.
