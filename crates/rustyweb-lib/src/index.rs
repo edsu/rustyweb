@@ -109,7 +109,7 @@ pub fn index_location(
     }
     let commit_start = std::time::Instant::now();
     search.into_inner().unwrap().commit()?;
-    info!(commit_ms = commit_start.elapsed().as_millis() as u64, "committed index");
+    debug!(commit_ms = commit_start.elapsed().as_millis() as u64, "committed index");
     manifest.save()?;
     // Report per-WACZ page counts only now that the index is actually built and
     // committed - not while it's still being written (or if the commit failed).
@@ -439,7 +439,7 @@ fn index_one(
             let sha_start = std::time::Instant::now();
             let sha = file_sha256(p).with_context(|| format!("computing sha256 of {}", p.display()))?;
             let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            info!(
+            debug!(
                 sha_ms = sha_start.elapsed().as_millis() as u64,
                 bytes = size,
                 "computed whole-file SHA-256 (fixity)"
@@ -810,12 +810,8 @@ fn index_merged(
         }
     }
 
-    info!(
-        pages = count,
-        build_ms = build_start.elapsed().as_millis() as u64,
-        wacz = %label,
-        "indexed pages from WACZ"
-    );
+    debug!(build_ms = build_start.elapsed().as_millis() as u64, wacz = %label, "built index");
+    info!(pages = count, wacz = %label, "indexed pages from WACZ");
     Ok(CrawlStats {
         pages: count,
         earliest_capture: earliest,
@@ -900,7 +896,7 @@ fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
             p.set_records(done);
         }
     }
-    info!(
+    debug!(
         records = done,
         read_ms = read_start.elapsed().as_millis() as u64,
         "read page records via CDX"
