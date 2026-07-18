@@ -73,7 +73,7 @@ index + the JSON manifest, see *Collection Management*). Keeping them together
 makes a home folder portable - move it to another disk or machine and it still
 resolves.
 
-- `index`: indexes one or more `.wacz` files or `http(s)://` URLs - at least one argument is required. A **remote URL is streamed by default** (CDX-guided, over HTTP range requests, no download - see *Indexing Pipeline*); `--download` fetches it into `<home>/archive` for a durable local copy instead, and `--stream` forces CDX-guided extraction on a *local* file. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each local WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. `--from-file <FILE>` (or `-f -` for stdin) reads a newline-delimited list of files/URLs, ignoring blank lines and `#` comments, and combines with any positional args. (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
+- `index`: indexes one or more `.wacz` files or `http(s)://` URLs - at least one argument is required. A **remote URL is streamed by default** (CDX-guided, over HTTP range requests, no download - see *Indexing Pipeline*); `--download` fetches it into `<home>/archive` for a durable local copy instead, and `--stream` forces CDX-guided extraction on a *local* file. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each local WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. `--from-file <FILE>` (or `-f -` for stdin) reads a newline-delimited list of files/URLs, ignoring blank lines and `#` comments, and combines with any positional args. Progress is shown as a bar on an interactive terminal; `-v`/`--verbose` replaces it with `DEBUG` logs (see *Indexing Pipeline → Progress reporting*). (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
 - `reindex`: rebuild the full-text index from the sources already recorded in the manifest, preserving collection membership and metadata. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. Missing local files are skipped with a warning. This is the intended way to migrate the index after a schema change (see below).
 - `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
 - `collection set` / `collection list`: reassign WACZs to a collection (by WACZ id) / list collections and their members. Metadata like description and curator is edited in `collections.json` directly.
@@ -433,6 +433,33 @@ Requirements and caveats, grounded in the WACZ spec:
   is consistent; per-resource integrity from `datapackage-digest.json` is future
   work (see *Planned*).
 
+The `HttpRangeReader` uses a rolling read-ahead buffer for forward body reads,
+plus a one-time cache of the last 1 MiB (the EOCD + central directory). The ZIP
+central directory is at the end of the file and is touched once per entry while
+local headers are read scattered across the file; without the tail cache those
+two regions thrash a single buffer, turning the open of a multi-GB ZIP64 WACZ
+into hundreds of range requests. Serial per-record fetching is still round-trip
+latency-bound; concurrent fetching is a planned optimization
+(`rustyweb-streaming-index-r0n.7`).
+
+### Progress reporting
+
+Indexing reports progress through a small, UI-agnostic `IndexProgress` trait
+(`begin` / `phase` / `set_total` / `set_records` / `finish`): the library only
+emits counts and phase labels, so it stays free of any UI dependency. The binary
+implements the trait with an [indicatif] bar - an indeterminate spinner during
+setup (probe / download / reading the CDX), which flips to a determinate bar with
+throughput and ETA once the CDX yields the page-record total. A fresh bar is
+created per WACZ (and cleared when it finishes), so it's only on screen while a
+WACZ is being worked on and never collides with log lines.
+
+Logging vs. the bar (all overridable via `RUST_LOG`): an interactive `index`
+hushes `INFO` (the bar carries progress; `WARN`/`ERROR` still print); `-v` /
+`--verbose` shows `DEBUG` logs and no bar; a non-TTY (piping / CI) keeps `INFO`
+and shows no bar, so logs aren't lost.
+
+[indicatif]: https://docs.rs/indicatif
+
 ---
 
 ## ReplayWebPage Assets
@@ -456,6 +483,7 @@ The script downloads `ui.js` and `sw.js` from the ReplayWebPage GitHub release. 
 | `tokio` 1.x | Async runtime |
 | `tower-http` 0.7 | Compression, tracing middleware |
 | `clap` 4.x | CLI (derive API) |
+| `indicatif` 0.17 | Indexing progress bar / spinner |
 | `tantivy` 0.26 | Full-text search engine with snippet generation |
 | `zip` 2.x | WACZ ZIP reading |
 | `url` 2.x | URL parsing |
