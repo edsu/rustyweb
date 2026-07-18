@@ -88,6 +88,12 @@ enum Commands {
         #[arg(long)]
         download: bool,
 
+        /// Number of records to fetch concurrently while CDX-guided (streaming)
+        /// indexing. Default: 16 for remote URLs (hides network latency), CPU
+        /// count for local files (extraction is CPU-bound).
+        #[arg(long, value_name = "N")]
+        concurrency: Option<usize>,
+
         /// Verbose logging (debug level). Replaces the progress bar with detailed
         /// per-record logs.
         #[arg(short = 'v', long)]
@@ -375,6 +381,7 @@ async fn main() -> Result<()> {
             name,
             collection,
             download,
+            concurrency,
             verbose: _,
         } => {
             // Sources come from the positional args plus, optionally, a
@@ -431,6 +438,7 @@ async fn main() -> Result<()> {
                     name.as_deref(),
                     collection.as_deref(),
                     download,
+                    concurrency,
                     progress,
                 );
                 drop(quiet);

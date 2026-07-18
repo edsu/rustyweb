@@ -122,7 +122,11 @@ impl<F: RangeFetch> Seek for RangeReader<F> {
     }
 }
 
-/// A [`RangeFetch`] backed by HTTP range GETs via `ureq`.
+/// A [`RangeFetch`] backed by HTTP range GETs via `ureq`. `Clone` is cheap (the
+/// `ureq::Agent` is `Arc`-backed) and `fetch` takes `&self`, so a single
+/// `HttpFetch` can drive many concurrent range requests (see the parallel
+/// CDX-guided extractor).
+#[derive(Clone)]
 pub struct HttpFetch {
     agent: ureq::Agent,
     url: String,
@@ -178,6 +182,42 @@ impl RangeFetch for HttpFetch {
             .map_err(|e| io::Error::other(format!("range GET of {}: {e}", self.url)))?;
         let mut v = Vec::with_capacity((end - start) as usize);
         resp.into_body().into_reader().read_to_end(&mut v)?;
+        Ok(v)
+    }
+}
+
+/// A [`RangeFetch`] over a local file — the file counterpart of [`HttpFetch`], so
+/// the CDX-guided extractor can read record byte-ranges the same way whether the
+/// WACZ is local or remote. Each `fetch` opens the file and reads the slice, so it
+/// needs no `&mut` and is safe to call concurrently from many threads.
+#[derive(Clone)]
+pub struct FileFetch {
+    path: std::path::PathBuf,
+    len: u64,
+}
+
+impl FileFetch {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let len = std::fs::metadata(path)
+            .with_context(|| format!("stat {}", path.display()))?
+            .len();
+        Ok(Self {
+            path: path.to_path_buf(),
+            len,
+        })
+    }
+}
+
+impl RangeFetch for FileFetch {
+    fn total_len(&self) -> u64 {
+        self.len
+    }
+
+    fn fetch(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        let mut f = std::fs::File::open(&self.path)?;
+        f.seek(SeekFrom::Start(start))?;
+        let mut v = vec![0u8; (end - start) as usize];
+        f.read_exact(&mut v)?;
         Ok(v)
     }
 }

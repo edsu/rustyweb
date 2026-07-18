@@ -58,7 +58,7 @@ rustyweb/
 ## CLI Interface
 
 ```
-rustyweb index          [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [-v|--verbose] <PATH|URL>...
+rustyweb index          [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
 rustyweb reindex        [--home <DIR>]
 rustyweb serve          [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set [--home <DIR>] <COLLECTION> <WACZ_ID>...
@@ -404,15 +404,15 @@ There are two extraction modes, sharing the same per-record transform
 (`record_to_raw`) and merge step (`index_merged`) so they produce an identical
 index:
 
-- **CDX-guided** (`index_wacz_streaming`, over any `Read + Seek`) - **the
-  default**: read the WACZ's CDX, then fetch *only* the page records (HTML/PDF
-  responses and `urn:text:` rendered text) by seeking to `data_start + offset`
-  for the length the CDX gives. Media (images/JS/CSS/JSON) and pseudo-records
-  (pageinfo, thumbnail) are never read. The reader is pluggable: a local `File`,
-  or an `HttpRangeReader` (`http_range.rs`) that issues HTTP range requests for a
-  remote WACZ - so a remote WACZ is indexed **without downloading it**, fetching
-  only the central directory, the CDX, and the page records. The same primitive
-  wabac.js uses for replay.
+- **CDX-guided** (`index_wacz_streaming`, over a pluggable `RangeFetch` byte
+  source) - **the default**: read the WACZ's CDX, then fetch *only* the page
+  records (HTML/PDF responses and `urn:text:` rendered text) at
+  `data_start + offset` for the length the CDX gives. Media (images/JS/CSS/JSON)
+  and pseudo-records (pageinfo, thumbnail) are never read. The byte source is
+  pluggable (`http_range.rs`): a local `FileFetch`, or an `HttpFetch` issuing HTTP
+  range requests for a remote WACZ - so a remote WACZ is indexed **without
+  downloading it**, fetching only the central directory, the CDX, and the page
+  records. The same primitive wabac.js uses for replay.
 - **Scan** (`index_wacz`) - **the fallback**: decompress and inspect *every*
   WARC record. Used only when a WACZ can't be CDX-guided (see below).
 
@@ -445,14 +445,23 @@ Requirements and caveats, grounded in the WACZ spec:
   is consistent; per-resource integrity from `datapackage-digest.json` is future
   work (see *Planned*).
 
-The `HttpRangeReader` uses a rolling read-ahead buffer for forward body reads,
-plus a one-time cache of the last 1 MiB (the EOCD + central directory). The ZIP
-central directory is at the end of the file and is touched once per entry while
-local headers are read scattered across the file; without the tail cache those
-two regions thrash a single buffer, turning the open of a multi-GB ZIP64 WACZ
-into hundreds of range requests. Serial per-record fetching is still round-trip
-latency-bound; concurrent fetching is a planned optimization
-(`rustyweb-streaming-index-r0n.7`).
+The ZIP/CDX **setup** (central directory, CDX, per-WARC data-starts, warcinfo)
+runs serially over a buffered `RangeReader`, which uses a rolling read-ahead
+buffer for forward reads plus a one-time cache of the last 1 MiB (the EOCD +
+central directory). The ZIP central directory is at the end of the file and is
+touched once per entry while local headers are read scattered across the file;
+without the tail cache those two regions thrash a single buffer, turning the open
+of a multi-GB ZIP64 WACZ into hundreds of range requests.
+
+The per-record **fetch** phase is **concurrent**: the CDX gives each record an
+independent `(offset, length)`, so a dedicated pool of `--concurrency` workers
+(default 16 for remote, CPU count for local) each does an independent
+`RangeFetch::fetch` + gunzip + extract, driven by an atomic progress counter.
+This hides per-record round-trip latency - the big win for remote WACZs, which
+would otherwise be one serial HTTP round trip each - and parallelizes HTML/PDF
+text extraction (CPU) across cores. Remote is latency-bound so more workers than
+cores helps; local fetch is cheap and the work is CPU-bound extraction, so the
+core count is the sweet spot.
 
 ### Progress reporting
 
@@ -502,7 +511,7 @@ The script downloads `ui.js` and `sw.js` from the ReplayWebPage GitHub release. 
 | `scraper` 0.27 | HTML parsing and text extraction |
 | `serde_json` 1.x | JSON APIs and CDXJ parsing |
 | `rust-embed` 8.x | Embed ReplayWebPage assets at compile time |
-| `rayon` 1.x | Parallel WARC indexing |
+| `rayon` 1.x | Parallel WARC scan + concurrent CDX-guided record fetch |
 | `tracing` + `tracing-subscriber` | Structured logging with per-level line coloring |
 | `anyhow` 1.x | Error propagation |
 | `flate2` 1.x | gzip decompression (WARC, WACZ CDX) |

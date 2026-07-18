@@ -52,7 +52,7 @@ pub trait IndexProgress: Sync {
 /// Index a local WACZ file (which must live under `<home>/archive`) under the
 /// given home dir. Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
-    index_location(&path.to_string_lossy(), home, name, None, false, None)
+    index_location(&path.to_string_lossy(), home, name, None, false, None, None)
 }
 
 /// Index a WACZ from a location into the home directory's `index/`. The location
@@ -76,6 +76,9 @@ pub fn index_location(
     // Download a remote WACZ into <home>/archive and index it as a local file
     // instead of streaming it in place.
     download: bool,
+    // Concurrent record fetches for CDX-guided streaming; `None` = per-source
+    // default (16 remote, CPU count local).
+    concurrency: Option<usize>,
     // Optional progress sink for indexing (the binary renders a bar).
     progress: Option<&dyn IndexProgress>,
 ) -> Result<()> {
@@ -107,6 +110,7 @@ pub fn index_location(
             name,
             c,
             download,
+            concurrency,
             progress,
         )?);
     }
@@ -213,6 +217,7 @@ pub fn reindex(home: &Path) -> Result<()> {
             Some(name),
             Some((collection_id, collection_name)),
             false,
+            None,
             None,
         )
         .with_context(|| {
@@ -322,6 +327,9 @@ fn index_one(
     // Download a remote WACZ into <home>/archive and index it as a local file
     // (durable copy, whole-file fixity, offline replay) instead of streaming.
     download: bool,
+    // Concurrent record fetches for CDX-guided streaming; `None` picks a
+    // per-source default (see `default_concurrency`).
+    concurrency: Option<usize>,
     // Optional progress sink for indexing.
     progress: Option<&dyn IndexProgress>,
 ) -> Result<(String, u64)> {
@@ -403,17 +411,20 @@ fn index_one(
     // CDX-guided extraction is the default everywhere (replay already resolves
     // records through the CDX, so indexing trusts it too); a full scan is only
     // the fallback when a WACZ can't be CDX-guided (deflated WARCs / no CDX).
+    // Resolve fetch concurrency once we know whether this WACZ is remote.
+    let workers = concurrency.unwrap_or_else(|| default_concurrency(remote_url.is_some()));
     let stats = match &remote_url {
         Some(u) => {
             info!(url = %u, "streaming remote WACZ index (no download)");
-            let reader = crate::http_range::open_remote(u)?;
+            let fetch = crate::http_range::HttpFetch::open(u)?;
             index_wacz_streaming(
-                reader,
+                fetch,
                 &id,
                 &display_name,
                 &collection_id,
                 search,
                 u,
+                workers,
                 progress,
             )?
         }
@@ -423,15 +434,16 @@ fn index_one(
             // true for Browsertrix output) so a CDX offset maps to a byte
             // position; otherwise fall back to a full scan of every WARC record.
             if local_warcs_streamable(p).unwrap_or(false) {
-                let file = std::fs::File::open(p)
+                let fetch = crate::http_range::FileFetch::open(p)
                     .with_context(|| format!("opening {} for CDX-guided index", p.display()))?;
                 index_wacz_streaming(
-                    file,
+                    fetch,
                     &id,
                     &display_name,
                     &collection_id,
                     search,
                     &p.display().to_string(),
+                    workers,
                     progress,
                 )?
             } else {
@@ -733,16 +745,21 @@ fn index_wacz(
 /// (a local file or an HTTP range reader): read only the page-relevant records
 /// the CDX points at, rather than scanning every WARC record. Produces the same
 /// index as [`index_wacz`] (both share [`record_to_raw`] and [`index_merged`]).
-fn index_wacz_streaming<R: std::io::Read + std::io::Seek>(
-    reader: R,
+#[allow(clippy::too_many_arguments)]
+fn index_wacz_streaming<F>(
+    fetch: F,
     collection_id: &str,
     collection_name: &str,
     collection: &str,
     search: &Mutex<SearchIndex>,
     label: &str,
+    concurrency: usize,
     progress: Option<&dyn IndexProgress>,
-) -> Result<CrawlStats> {
-    let (raws, warcinfo) = collect_page_records_via_cdx(reader, progress)?;
+) -> Result<CrawlStats>
+where
+    F: crate::http_range::RangeFetch + Clone + Send + Sync,
+{
+    let (raws, warcinfo) = collect_page_records_via_cdx(fetch, concurrency, progress)?;
     index_merged(
         raws,
         warcinfo,
@@ -929,52 +946,91 @@ fn collect_page_records(warc_path: &Path) -> Result<(Vec<RawRecord>, Option<Warc
 /// seeking to `data_start + offset`, and transform each with [`record_to_raw`].
 /// Images/JS/JSON/pageinfo/thumbnail captures are never fetched. Streaming
 /// indexes exactly what the CDX lists (authoritative for Browsertrix WACZs).
-fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
-    reader: R,
+fn collect_page_records_via_cdx<F>(
+    fetch: F,
+    concurrency: usize,
     progress: Option<&dyn IndexProgress>,
-) -> Result<(Vec<RawRecord>, Option<Warcinfo>)> {
+) -> Result<(Vec<RawRecord>, Option<Warcinfo>)>
+where
+    F: crate::http_range::RangeFetch + Clone + Send + Sync,
+{
     use crate::wacz;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     if let Some(p) = progress {
         p.phase("reading index");
     }
     let read_start = std::time::Instant::now();
-    let mut zip = zip::ZipArchive::new(reader).context("opening WACZ ZIP")?;
+
+    // Setup (serial): read the ZIP central directory, the CDX, each WARC's
+    // data-start, and the warcinfo over a buffered range reader.
+    let mut zip = zip::ZipArchive::new(crate::http_range::RangeReader::new(fetch.clone()))
+        .context("opening WACZ ZIP")?;
     wacz::ensure_warcs_stored(&mut zip)?;
     let cdx = wacz::cdx_records(&mut zip)?;
     let starts = wacz::warc_data_starts(&mut zip)?;
     let warcinfo = wacz::find_warcinfo_streaming(&mut zip)?;
-    let mut reader = zip.into_inner();
+    drop(zip);
 
-    // Records that can become a page; skip media/pseudo-records. Counting up
-    // front gives the progress bar a total (each fetch is an HTTP range request),
-    // which switches the setup spinner over to a determinate bar.
-    let wanted = |c: &crate::wacz::CdxjRecord| {
-        c.length != 0
-            && (c.url.starts_with("urn:text:") || c.mime.contains("html") || c.mime.contains("pdf"))
-    };
-    let total = cdx.iter().filter(|c| wanted(c)).count() as u64;
+    // Records that can become a page; skip media/pseudo-records. The count is the
+    // determinate-bar total (each is one fetch + extract).
+    let wanted: Vec<&crate::wacz::CdxjRecord> = cdx
+        .iter()
+        .filter(|c| {
+            c.length != 0
+                && (c.url.starts_with("urn:text:")
+                    || c.mime.contains("html")
+                    || c.mime.contains("pdf"))
+        })
+        .collect();
     if let Some(p) = progress {
-        p.set_total(total);
+        p.set_total(wanted.len() as u64);
     }
 
-    let mut out = Vec::new();
-    let mut done: u64 = 0;
-    for c in cdx.iter().filter(|c| wanted(c)) {
-        let base = c.filename.rsplit('/').next().unwrap_or(&c.filename);
-        if let Some(&start) = starts.get(base) {
-            match wacz::record_at(&mut reader, start + c.offset, c.length) {
-                Ok(records) => out.extend(records.iter().filter_map(record_to_raw)),
-                Err(e) => tracing::warn!(url = %c.url, "skipping unreadable CDX record: {e:#}"),
-            }
-        }
-        done += 1;
-        if let Some(p) = progress {
-            p.set_records(done);
-        }
-    }
+    // Fetch + extract each wanted record concurrently. The CDX gives every record
+    // an independent (offset, length), so fetches don't depend on each other:
+    // fanning out hides per-record round-trip latency (the win for remote WACZs)
+    // and parallelizes HTML/PDF text extraction (CPU) across cores.
+    let done = AtomicU64::new(0);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .build()
+        .context("building record-fetch thread pool")?;
+    let out: Vec<RawRecord> = pool.install(|| {
+        wanted
+            .par_iter()
+            .flat_map_iter(|c| {
+                let base = c.filename.rsplit('/').next().unwrap_or(&c.filename);
+                let raws: Vec<RawRecord> = match starts.get(base) {
+                    Some(&start) => {
+                        let (from, len) = (start + c.offset, c.length);
+                        match fetch
+                            .fetch(from, from + len)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|bytes| wacz::records_from_slice(&bytes, from, len))
+                        {
+                            Ok(records) => records.iter().filter_map(record_to_raw).collect(),
+                            Err(e) => {
+                                tracing::warn!(url = %c.url, "skipping unreadable CDX record: {e:#}");
+                                Vec::new()
+                            }
+                        }
+                    }
+                    None => Vec::new(),
+                };
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(p) = progress {
+                    p.set_records(n);
+                }
+                raws
+            })
+            .collect()
+    });
+
     debug!(
-        records = done,
+        records = wanted.len(),
         read_ms = read_start.elapsed().as_millis() as u64,
+        concurrency,
         "read page records via CDX"
     );
     // Records read. The merge + Tantivy indexing that follows has no per-record
@@ -985,6 +1041,20 @@ fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
         p.phase("building index");
     }
     Ok((out, warcinfo))
+}
+
+/// Default worker count for the concurrent CDX-guided record fetch+extract, when
+/// `--concurrency` isn't given. Remote fetches are round-trip-latency-bound, so
+/// more workers than cores hides that latency; local fetch is cheap and the work
+/// is CPU-bound text extraction, so the core count is the sweet spot.
+fn default_concurrency(remote: bool) -> usize {
+    if remote {
+        16
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    }
 }
 
 /// Transform one WARC record into an indexable [`RawRecord`], or `None` if it is
@@ -1122,8 +1192,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let search = Mutex::new(SearchIndex::open(tmp.path()).unwrap());
         let stats = if stream {
-            let file = std::fs::File::open(&f).unwrap();
-            index_wacz_streaming(file, "cid", "cname", "coll", &search, fixture_name, None).unwrap()
+            let fetch = crate::http_range::FileFetch::open(&f).unwrap();
+            index_wacz_streaming(
+                fetch,
+                "cid",
+                "cname",
+                "coll",
+                &search,
+                fixture_name,
+                4,
+                None,
+            )
+            .unwrap()
         } else {
             index_wacz(&f, "cid", "cname", "coll", &search).unwrap()
         };
@@ -1157,11 +1237,20 @@ mod tests {
         let f = fixture("simple.wacz");
         let tmp = TempDir::new().unwrap();
         let search = Mutex::new(SearchIndex::open(tmp.path()).unwrap());
-        let file = std::fs::File::open(&f).unwrap();
-        let err = index_wacz_streaming(file, "cid", "cname", "coll", &search, "simple.wacz", None)
-            .unwrap_err()
-            .to_string()
-            .to_lowercase();
+        let fetch = crate::http_range::FileFetch::open(&f).unwrap();
+        let err = index_wacz_streaming(
+            fetch,
+            "cid",
+            "cname",
+            "coll",
+            &search,
+            "simple.wacz",
+            4,
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .to_lowercase();
         assert!(
             err.contains("stored") || err.contains("compress"),
             "unexpected error: {err}"
@@ -1279,6 +1368,7 @@ mod tests {
             None,
             Some("My Project"),
             false,
+            None,
             None,
         )
         .unwrap();

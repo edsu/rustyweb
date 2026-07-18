@@ -200,12 +200,13 @@ a remote host doesn't support range requests, or if the WACZ stores its WARCs
 compressed (the WACZ spec says the `archive/` WARCs *should* be stored
 uncompressed so they can be read by range; a few tools don't).
 
-Streaming a large remote WACZ makes one HTTP range request per page record, so it
-can take a while. `index` shows a progress bar - a spinner while it reads the
-CDX, then a bar with the throughput and an ETA once it knows how many pages
-there are - so you can see it working. Add `-v`/`--verbose` for detailed logs
-instead of the bar; when output isn't a terminal (piping to a file or CI) it
-prints plain log lines and no bar.
+Streaming a large remote WACZ makes one HTTP range request per page record. Those
+requests are latency-bound and independent, so rustyweb fetches them concurrently
+(16 at a time by default for remote WACZs; tune with `--concurrency <N>`). `index`
+shows a progress bar - a spinner while it reads the CDX, then a bar with the
+throughput and an ETA once it knows how many records there are - so you can see it
+working. Add `-v`/`--verbose` for detailed logs instead of the bar; when output
+isn't a terminal (piping to a file or CI) it prints plain log lines and no bar.
 
 ### How indexing reads a WACZ
 
@@ -255,7 +256,7 @@ offers "browse by year" and "top sites" entry points into search.
 ## Command line
 
 ```
-rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [-v|--verbose] <PATH|URL>...
+rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
 rustyweb reindex         [--home <DIR>]
 rustyweb serve           [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set  [--home <DIR>] <COLLECTION> <WACZ_ID>...
@@ -287,8 +288,10 @@ derived siblings under it.
   durable local copy instead of streaming it in place. To index many at once, pass
   a newline-delimited list of files/URLs with `--from-file <FILE>` (or `-f -` to
   read from stdin); blank lines and `#` comments are ignored, and it combines with
-  any positional args. Indexing shows a progress bar on an interactive terminal;
-  `-v`/`--verbose` replaces it with debug logs.
+  any positional args. `--concurrency <N>` sets how many records are fetched at
+  once during CDX-guided (streaming) indexing (default: 16 for remote URLs, CPU
+  count for local files). Indexing shows a progress bar on an interactive
+  terminal; `-v`/`--verbose` replaces it with debug logs.
 - **`collection`** - `collection list` shows collections and their members;
   `collection set <COLLECTION> <WACZ_ID>...` moves WACZs into a collection.
 - **`reindex`** - rebuild the search index from the WACZs already in the
