@@ -107,7 +107,9 @@ pub fn index_location(
     if let Some(p) = progress {
         p.phase("committing");
     }
+    let commit_start = std::time::Instant::now();
     search.into_inner().unwrap().commit()?;
+    info!(commit_ms = commit_start.elapsed().as_millis() as u64, "committed index");
     manifest.save()?;
     // Report per-WACZ page counts only now that the index is actually built and
     // committed - not while it's still being written (or if the commit failed).
@@ -694,6 +696,7 @@ fn index_merged(
     search: &Mutex<SearchIndex>,
     label: &str,
 ) -> Result<CrawlStats> {
+    let build_start = std::time::Instant::now();
     let mut pages: HashMap<String, MergedPage> = HashMap::new();
     {
         for raw in raws {
@@ -796,7 +799,12 @@ fn index_merged(
         }
     }
 
-    info!(pages = count, wacz = %label, "indexed pages from WACZ");
+    info!(
+        pages = count,
+        build_ms = build_start.elapsed().as_millis() as u64,
+        wacz = %label,
+        "indexed pages from WACZ"
+    );
     Ok(CrawlStats {
         pages: count,
         earliest_capture: earliest,
@@ -846,6 +854,7 @@ fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
     if let Some(p) = progress {
         p.phase("reading index");
     }
+    let read_start = std::time::Instant::now();
     let mut zip = zip::ZipArchive::new(reader).context("opening WACZ ZIP")?;
     wacz::ensure_warcs_stored(&mut zip)?;
     let cdx = wacz::cdx_records(&mut zip)?;
@@ -880,6 +889,11 @@ fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
             p.set_records(done);
         }
     }
+    info!(
+        records = done,
+        read_ms = read_start.elapsed().as_millis() as u64,
+        "read page records via CDX"
+    );
     // Records read. The merge + Tantivy indexing that follows has no per-record
     // total, so drop the determinate bar back to a spinner - otherwise it sits at
     // 100% with a decaying rate/ETA during the slow tail (very visible for a local
