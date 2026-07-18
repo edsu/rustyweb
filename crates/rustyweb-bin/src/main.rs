@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -97,6 +98,11 @@ enum Commands {
         /// streaming it. No effect on local sources.
         #[arg(long, conflicts_with = "stream")]
         download: bool,
+
+        /// Verbose logging (debug level). Replaces the progress bar with detailed
+        /// per-record logs.
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Start the replay web server.
     Serve {
@@ -191,11 +197,124 @@ fn parse_source_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// An indexing progress indicator (indicatif). A fresh bar is created per WACZ so
+/// it's only on screen while that WACZ is being worked on — the setup phase shows
+/// an indeterminate spinner (labelled with the current activity, e.g.
+/// "downloading" / "reading index"), then it flips to a determinate bar once the
+/// record total is known. Between WACZs there's no bar, so library log lines
+/// print cleanly instead of colliding with it.
+struct BarProgress {
+    // Interior mutability: the `IndexProgress` methods take `&self`, but the bar
+    // is (re)created per WACZ. `None` between WACZs.
+    inner: std::sync::Mutex<Option<Active>>,
+}
+
+/// The live bar plus the short WACZ label (kept so `phase`/`set_total` can
+/// recompose the message).
+struct Active {
+    pb: indicatif::ProgressBar,
+    label: String,
+}
+
+impl BarProgress {
+    fn new() -> Self {
+        Self { inner: std::sync::Mutex::new(None) }
+    }
+
+    /// Clear any active bar (safety net for the error path, where `finish` on the
+    /// library side may not run).
+    fn clear(&self) {
+        if let Some(a) = self.inner.lock().unwrap().take() {
+            a.pb.finish_and_clear();
+        }
+    }
+}
+
+/// The determinate style, once we know the record total. {per_sec} + {eta} answer
+/// "how long will this take?" — indicatif derives both from a moving window of
+/// recent progress, so they track the current streaming rate rather than a naive
+/// lifetime average.
+fn bar_style() -> indicatif::ProgressStyle {
+    indicatif::ProgressStyle::with_template(
+        "{spinner:.green} {msg} [{bar:30.cyan/blue}] {pos}/{len} pages \
+         ({per_sec}, {elapsed} elapsed, eta {eta})",
+    )
+    .unwrap()
+    .progress_chars("=>-")
+}
+
+/// The trailing path/URL segment, for a compact bar label.
+fn short_label(label: &str) -> String {
+    label
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(label)
+        .to_string()
+}
+
+impl rustyweb_lib::index::IndexProgress for BarProgress {
+    fn begin(&self, label: &str) {
+        // Indeterminate spinner: the record total isn't known until the CDX is
+        // read. steady_tick animates it during the blocking network setup. The
+        // verb is filled in by `phase`; until then just show the label.
+        let pb = indicatif::ProgressBar::new_spinner();
+        pb.set_style(
+            indicatif::ProgressStyle::with_template("{spinner:.green} {msg} ({elapsed})").unwrap(),
+        );
+        let label = short_label(label);
+        pb.set_message(label.clone());
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        *self.inner.lock().unwrap() = Some(Active { pb, label });
+    }
+    fn phase(&self, phase: &str) {
+        if let Some(a) = &*self.inner.lock().unwrap() {
+            a.pb.set_message(format!("{} — {phase}…", a.label));
+        }
+    }
+    fn set_total(&self, total: u64) {
+        if let Some(a) = &*self.inner.lock().unwrap() {
+            a.pb.set_length(total);
+            a.pb.set_position(0);
+            a.pb.set_style(bar_style());
+            a.pb.set_message(a.label.clone());
+        }
+    }
+    fn set_records(&self, done: u64) {
+        if let Some(a) = &*self.inner.lock().unwrap() {
+            a.pb.set_position(done);
+        }
+    }
+    fn finish(&self) {
+        if let Some(a) = self.inner.lock().unwrap().take() {
+            a.pb.finish_and_clear();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Progress bar vs. logs (for `index`):
+    //  - `-v`         -> debug logs, no bar.
+    //  - interactive  -> the bar carries progress, so hush INFO (it would collide
+    //                    with and duplicate the bar); keep WARN/ERROR.
+    //  - non-TTY      -> no bar (piping/CI), so keep INFO so logs aren't lost.
+    // RUST_LOG overrides the level in all cases.
+    let verbose = matches!(&cli.command, Commands::Index { verbose: true, .. });
+    let is_index = matches!(&cli.command, Commands::Index { .. });
+    let show_bar = is_index && !verbose && std::io::stderr().is_terminal();
+    let default_level = if verbose {
+        "debug"
+    } else if show_bar {
+        "warn"
+    } else {
+        "info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
         .with_ansi(true)
         // Logs go to stderr so stdout can carry data (and be silenced during
@@ -204,10 +323,9 @@ async fn main() -> Result<()> {
         .event_format(ColorLineFormat::default())
         .init();
 
-    let cli = Cli::parse();
-
     match cli.command {
-        Commands::Index { paths, from_file, home, name, collection, stream, download } => {
+        // `verbose` is read up front (to set the log level / bar); ignore here.
+        Commands::Index { paths, from_file, home, name, collection, stream, download, verbose: _ } => {
             // Sources come from the positional args plus, optionally, a
             // newline-delimited list from a file or stdin.
             let mut locations = paths;
@@ -234,8 +352,16 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(2);
             }
+            // A progress bar makes a slow streaming index (each remote page
+            // record is a separate HTTP range request) visible. Shown only on an
+            // interactive stderr and not under -v (see `show_bar` above).
+            let bar = show_bar.then(BarProgress::new);
+            let progress = bar.as_ref().map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
+
             let total = locations.len();
             for (i, location) in locations.iter().enumerate() {
+                // No bar is active between WACZs (each begins/finishes its own),
+                // so this logs cleanly without colliding with the bar.
                 tracing::info!(
                     source = %location,
                     progress = format!("{}/{}", i + 1, total),
@@ -253,9 +379,17 @@ async fn main() -> Result<()> {
                     collection.as_deref(),
                     stream,
                     download,
+                    progress,
                 );
                 drop(quiet);
-                result?;
+                if let Err(e) = result {
+                    // Clear any spinner/bar left up by an aborted WACZ before the
+                    // error propagates.
+                    if let Some(b) = &bar {
+                        b.clear();
+                    }
+                    return Err(e);
+                }
             }
             tracing::info!("indexing complete");
         }

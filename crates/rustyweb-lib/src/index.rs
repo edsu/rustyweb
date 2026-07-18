@@ -19,10 +19,36 @@ pub fn archive_dir(home: &Path) -> PathBuf {
     home.join("archive")
 }
 
+/// Progress sink for indexing, implemented by the binary (e.g. with a progress
+/// bar). The library stays UI- and dependency-free: it only reports counts.
+/// Streaming a remote WACZ can be slow (each page record is a separate HTTP
+/// range request, and reading the CDX up front takes a moment), so this makes
+/// both the setup and the per-record work visible.
+///
+/// Lifecycle per WACZ: `begin` once → optionally `set_total` then `set_records*`
+/// (streaming path, where a record count is known) → `finish` once.
+pub trait IndexProgress: Sync {
+    /// Work on a WACZ has begun. The record total isn't known yet (the ZIP
+    /// directory and CDX must be read first), so this is the cue for an
+    /// indeterminate spinner. `label` is the WACZ URL or path.
+    fn begin(&self, label: &str);
+    /// Describe the current setup activity (e.g. "downloading", "reading index"),
+    /// so the spinner reflects what's actually happening before the record total
+    /// is known.
+    fn phase(&self, phase: &str);
+    /// The CDX has been read: `total` page records will be streamed. Cue to
+    /// switch the spinner to a determinate bar.
+    fn set_total(&self, total: u64);
+    /// `done` of the current WACZ's page records have been fetched.
+    fn set_records(&self, done: u64);
+    /// Work on the current WACZ finished (clear the spinner/bar).
+    fn finish(&self);
+}
+
 /// Index a local WACZ file (which must live under `<home>/archive`) under the
 /// given home dir. Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
-    index_location(&path.to_string_lossy(), home, name, None, false, false)
+    index_location(&path.to_string_lossy(), home, name, None, false, false, None)
 }
 
 /// Index a WACZ from a location into the home directory's `index/`. The location
@@ -49,6 +75,8 @@ pub fn index_location(
     // Download a remote WACZ into <home>/archive and index it as a local file
     // instead of streaming.
     download: bool,
+    // Optional progress sink for streaming indexes (the binary renders a bar).
+    progress: Option<&dyn IndexProgress>,
 ) -> Result<()> {
     // Validate the argument first (a bad path errors before we touch the index).
     let sources = resolve_sources(location, home)?;
@@ -69,7 +97,7 @@ pub fn index_location(
 
     for source in &sources {
         let c = group.as_ref().map(|(id, n)| (id.as_str(), n.as_str()));
-        index_one(source, home, &mut manifest, &search, name, c, stream, download)?;
+        index_one(source, home, &mut manifest, &search, name, c, stream, download, progress)?;
     }
 
     search.into_inner().unwrap().commit()?;
@@ -152,6 +180,7 @@ pub fn reindex(home: &Path) -> Result<()> {
             Some((collection_id, collection_name)),
             false,
             false,
+            None,
         )
         .with_context(|| {
             format!(
@@ -262,7 +291,17 @@ fn index_one(
     // Download a remote WACZ into <home>/archive and index it as a local file
     // (durable copy, whole-file fixity, offline replay) instead of streaming.
     download: bool,
+    // Optional progress sink for streaming indexes.
+    progress: Option<&dyn IndexProgress>,
 ) -> Result<()> {
+    // Show an indeterminate spinner from the very start: the setup work (probing
+    // the host, downloading, reading the ZIP directory and CDX) happens before
+    // any record total is known, and can take many seconds on a large remote
+    // WACZ. The streaming path later calls `set_total` to switch to a bar.
+    if let Some(p) = progress {
+        p.begin(&source.location());
+    }
+
     // Resolve how the WACZ is read (`.3` mode logic):
     //  - A local File source: read in place.
     //  - A remote URL + --download: fetch into <home>/archive and adopt as a
@@ -273,6 +312,9 @@ fn index_one(
     let effective_source: Source = match source {
         Source::Url(u) if download => {
             info!(url = %u, "downloading remote WACZ into archive");
+            if let Some(p) = progress {
+                p.phase("downloading");
+            }
             Source::File(download_into_archive(u, home)?)
         }
         _ => source.clone(),
@@ -290,6 +332,9 @@ fn index_one(
                 (Some(u.clone()), None)
             } else {
                 info!(url = %u, "remote WACZ can't be streamed (no range support or compressed WARCs); downloading to index");
+                if let Some(p) = progress {
+                    p.phase("downloading");
+                }
                 let tmp = download_to_temp(u).with_context(|| format!("downloading {u}"))?;
                 let p = tmp.path().to_path_buf();
                 _tmp = Some(tmp);
@@ -333,13 +378,13 @@ fn index_one(
         Some(u) => {
             info!(url = %u, "streaming remote WACZ index (no download)");
             let reader = crate::http_range::open_remote(u)?;
-            index_wacz_streaming(reader, &id, &display_name, &collection_id, search, u)?
+            index_wacz_streaming(reader, &id, &display_name, &collection_id, search, u, progress)?
         }
         None if stream_local => {
             let p = local.as_ref().unwrap();
             let file = std::fs::File::open(p)
                 .with_context(|| format!("opening {} for streaming index", p.display()))?;
-            index_wacz_streaming(file, &id, &display_name, &collection_id, search, &p.display().to_string())?
+            index_wacz_streaming(file, &id, &display_name, &collection_id, search, &p.display().to_string(), progress)?
         }
         None => index_wacz(local.as_ref().unwrap(), &id, &display_name, &collection_id, search)?,
     };
@@ -396,6 +441,9 @@ fn index_one(
         capture_end: stats.latest_capture,
     });
 
+    if let Some(p) = progress {
+        p.finish();
+    }
     Ok(())
 }
 
@@ -590,8 +638,9 @@ fn index_wacz_streaming<R: std::io::Read + std::io::Seek>(
     collection: &str,
     search: &Mutex<SearchIndex>,
     label: &str,
+    progress: Option<&dyn IndexProgress>,
 ) -> Result<CrawlStats> {
-    let (raws, warcinfo) = collect_page_records_via_cdx(reader)?;
+    let (raws, warcinfo) = collect_page_records_via_cdx(reader, progress)?;
     index_merged(raws, warcinfo, collection_id, collection_name, collection, search, label)
 }
 
@@ -753,8 +802,12 @@ fn collect_page_records(warc_path: &Path) -> Result<(Vec<RawRecord>, Option<Warc
 /// indexes exactly what the CDX lists (authoritative for Browsertrix WACZs).
 fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
     reader: R,
+    progress: Option<&dyn IndexProgress>,
 ) -> Result<(Vec<RawRecord>, Option<Warcinfo>)> {
     use crate::wacz;
+    if let Some(p) = progress {
+        p.phase("reading index");
+    }
     let mut zip = zip::ZipArchive::new(reader).context("opening WACZ ZIP")?;
     wacz::ensure_warcs_stored(&mut zip)?;
     let cdx = wacz::cdx_records(&mut zip)?;
@@ -762,21 +815,31 @@ fn collect_page_records_via_cdx<R: std::io::Read + std::io::Seek>(
     let warcinfo = wacz::find_warcinfo_streaming(&mut zip)?;
     let mut reader = zip.into_inner();
 
+    // Records that can become a page; skip media/pseudo-records. Counting up
+    // front gives the progress bar a total (each fetch is an HTTP range request),
+    // which switches the setup spinner over to a determinate bar.
+    let wanted = |c: &crate::wacz::CdxjRecord| {
+        c.length != 0
+            && (c.url.starts_with("urn:text:") || c.mime.contains("html") || c.mime.contains("pdf"))
+    };
+    let total = cdx.iter().filter(|c| wanted(c)).count() as u64;
+    if let Some(p) = progress {
+        p.set_total(total);
+    }
+
     let mut out = Vec::new();
-    for c in &cdx {
-        // Only fetch records that can become a page; skip media/pseudo-records.
-        let wanted =
-            c.url.starts_with("urn:text:") || c.mime.contains("html") || c.mime.contains("pdf");
-        if !wanted || c.length == 0 {
-            continue;
-        }
+    let mut done: u64 = 0;
+    for c in cdx.iter().filter(|c| wanted(c)) {
         let base = c.filename.rsplit('/').next().unwrap_or(&c.filename);
-        let Some(&start) = starts.get(base) else {
-            continue;
-        };
-        match wacz::record_at(&mut reader, start + c.offset, c.length) {
-            Ok(records) => out.extend(records.iter().filter_map(record_to_raw)),
-            Err(e) => tracing::warn!(url = %c.url, "skipping unreadable CDX record: {e:#}"),
+        if let Some(&start) = starts.get(base) {
+            match wacz::record_at(&mut reader, start + c.offset, c.length) {
+                Ok(records) => out.extend(records.iter().filter_map(record_to_raw)),
+                Err(e) => tracing::warn!(url = %c.url, "skipping unreadable CDX record: {e:#}"),
+            }
+        }
+        done += 1;
+        if let Some(p) = progress {
+            p.set_records(done);
         }
     }
     Ok((out, warcinfo))
@@ -915,7 +978,7 @@ mod tests {
         let search = Mutex::new(SearchIndex::open(tmp.path()).unwrap());
         let stats = if stream {
             let file = std::fs::File::open(&f).unwrap();
-            index_wacz_streaming(file, "cid", "cname", "coll", &search, fixture_name).unwrap()
+            index_wacz_streaming(file, "cid", "cname", "coll", &search, fixture_name, None).unwrap()
         } else {
             index_wacz(&f, "cid", "cname", "coll", &search).unwrap()
         };
@@ -939,7 +1002,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let search = Mutex::new(SearchIndex::open(tmp.path()).unwrap());
         let file = std::fs::File::open(&f).unwrap();
-        let err = index_wacz_streaming(file, "cid", "cname", "coll", &search, "simple.wacz")
+        let err = index_wacz_streaming(file, "cid", "cname", "coll", &search, "simple.wacz", None)
             .unwrap_err()
             .to_string()
             .to_lowercase();
@@ -1043,7 +1106,7 @@ mod tests {
         let dest = archive.join("simple.wacz");
         std::fs::copy(fixture("simple.wacz"), &dest).unwrap();
 
-        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project"), false, false).unwrap();
+        index_location(&dest.to_string_lossy(), tmp.path(), None, Some("My Project"), false, false, None).unwrap();
 
         let m = crate::collections::Manifest::open(&tmp.path().join("index")).unwrap();
         assert!(

@@ -15,3 +15,4 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 url = { workspace = true }
 gag = { workspace = true }
+indicatif = { workspace = true }

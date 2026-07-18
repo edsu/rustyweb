@@ -27,6 +27,8 @@ zip = "2"
 # URL / HTML
 url = "2"
 scraper = "0.27"
+# CLI progress bars (indexing).
+indicatif = "0.17"
 # Registrable-domain (public suffix list) for the cross-subdomain site: facet.
 psl = "2"
 # Pure-Rust language detection (fallback when a page has no <html lang>).
