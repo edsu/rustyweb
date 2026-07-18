@@ -41,7 +41,14 @@ pub struct RangeReader<F: RangeFetch> {
 impl<F: RangeFetch> RangeReader<F> {
     pub fn new(fetch: F) -> Self {
         let tail_start = fetch.total_len().saturating_sub(TAIL_CACHE);
-        Self { fetch, pos: 0, buf: Vec::new(), buf_start: 0, tail: None, tail_start }
+        Self {
+            fetch,
+            pos: 0,
+            buf: Vec::new(),
+            buf_start: 0,
+            tail: None,
+            tail_start,
+        }
     }
 
     pub fn total_len(&self) -> u64 {
@@ -105,7 +112,10 @@ impl<F: RangeFetch> Seek for RangeReader<F> {
         };
         let np = base + delta;
         if np < 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek before start"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
         }
         self.pos = np as u64;
         Ok(self.pos)
@@ -144,7 +154,11 @@ impl HttpFetch {
             .map(str::trim)
             .and_then(|n| n.parse::<u64>().ok())
             .with_context(|| format!("no total length in Content-Range from {url}"))?;
-        Ok(Self { agent, url: url.to_string(), len })
+        Ok(Self {
+            agent,
+            url: url.to_string(),
+            len,
+        })
     }
 }
 
@@ -209,10 +223,20 @@ mod tests {
         let mut rr = RangeReader::new(MemFetch(data.clone()));
         let mut cur = std::io::Cursor::new(data.clone());
 
-        for &(pos, n) in &[(0u64, 10usize), (4990, 50), (1234, 300), (0, 5000), (2500, 2500)] {
+        for &(pos, n) in &[
+            (0u64, 10usize),
+            (4990, 50),
+            (1234, 300),
+            (0, 5000),
+            (2500, 2500),
+        ] {
             rr.seek(SeekFrom::Start(pos)).unwrap();
             cur.seek(SeekFrom::Start(pos)).unwrap();
-            assert_eq!(read_n(&mut rr, n), read_n(&mut cur, n), "at pos {pos} len {n}");
+            assert_eq!(
+                read_n(&mut rr, n),
+                read_n(&mut cur, n),
+                "at pos {pos} len {n}"
+            );
         }
 
         // SeekFrom::End and Current.
@@ -243,12 +267,16 @@ mod tests {
         for &(pos, len) in &[
             (0u64, 1000usize),
             (500_000, 4096),
-            (n as u64 - 50, 50),          // tail
+            (n as u64 - 50, 50),           // tail
             (n as u64 - 300_000, 200_000), // spans body into tail
         ] {
             rr.seek(SeekFrom::Start(pos)).unwrap();
             cur.seek(SeekFrom::Start(pos)).unwrap();
-            assert_eq!(read_n(&mut rr, len), read_n(&mut cur, len), "pos {pos} len {len}");
+            assert_eq!(
+                read_n(&mut rr, len),
+                read_n(&mut cur, len),
+                "pos {pos} len {len}"
+            );
         }
     }
 
@@ -273,7 +301,10 @@ mod tests {
         // local header (body), alternating. Each region must be fetched once.
         let n = (TAIL_CACHE + 4_000_000) as usize;
         let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let mut rr = RangeReader::new(CountingFetch { data: vec![9u8; n], count: count.clone() });
+        let mut rr = RangeReader::new(CountingFetch {
+            data: vec![9u8; n],
+            count: count.clone(),
+        });
         for _ in 0..20 {
             rr.seek(SeekFrom::End(-100)).unwrap();
             read_n(&mut rr, 40); // "central directory" read (tail)

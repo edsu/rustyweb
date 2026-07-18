@@ -16,7 +16,7 @@ pub struct WarcRecord {
     pub digest: String,
     pub payload: Vec<u8>, // HTTP response body (headers stripped for response records)
     pub http_headers: Vec<(String, String)>, // original HTTP response headers (response records only)
-    pub offset: u64,       // compressed byte offset in .warc.gz; file offset in .warc
+    pub offset: u64, // compressed byte offset in .warc.gz; file offset in .warc
     pub record_length: u64, // compressed member size for .warc.gz
 }
 
@@ -108,7 +108,11 @@ pub fn parse_warc_fields(bytes: &[u8]) -> Vec<(String, String)> {
 /// indexing, which gunzips a single record slice located via the CDX offset and
 /// parses it without touching the rest of the WARC. `offset`/`record_length`
 /// are informational (carried onto each record for provenance).
-pub(crate) fn parse_warc_records(data: &[u8], offset: u64, record_length: u64) -> Vec<Result<WarcRecord>> {
+pub(crate) fn parse_warc_records(
+    data: &[u8],
+    offset: u64,
+    record_length: u64,
+) -> Vec<Result<WarcRecord>> {
     let mut out = Vec::new();
     parse_all_warc_records_from(data, offset, record_length, &mut out);
     out
@@ -133,8 +137,8 @@ pub fn iter_records(path: &Path) -> Result<impl Iterator<Item = Result<WarcRecor
 /// Some WACZ files name their WARC entries `.warc.gz` but store plain WARC data.
 fn is_gzip(path: &Path) -> Result<bool> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut magic = [0u8; 2];
     match file.read_exact(&mut magic) {
         Ok(_) => Ok(magic == [0x1f, 0x8b]),
@@ -147,8 +151,7 @@ fn is_gzip(path: &Path) -> Result<bool> {
 fn collect_records_gz(path: &Path) -> Result<Vec<Result<WarcRecord>>> {
     use std::io::Seek;
 
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     // Use bufread::GzDecoder so we can call into_inner() to recover the
     // BufReader after each member.  read::GzDecoder wraps an extra BufReader
     // internally and over-reads, losing the start of the next member.
@@ -231,12 +234,10 @@ fn parse_all_warc_records_from(
     }
 }
 
-
 // ── plain (uncompressed) ──────────────────────────────────────────────────────
 
 fn collect_records_plain(path: &Path) -> Result<Vec<Result<WarcRecord>>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
 
     let mut counting = CountingBufReader::new(BufReader::new(file));
     let mut records: Vec<Result<WarcRecord>> = Vec::new();
@@ -286,7 +287,10 @@ fn read_one_warc_bytes<R: BufRead>(r: &mut R) -> Result<Vec<u8>> {
         return Err(anyhow!("unexpected EOF"));
     }
     if !first.trim_end().starts_with("WARC/") {
-        return Err(anyhow!("expected WARC/ version line, got: {}", first.trim_end()));
+        return Err(anyhow!(
+            "expected WARC/ version line, got: {}",
+            first.trim_end()
+        ));
     }
     buf.extend_from_slice(first.as_bytes());
 
@@ -396,7 +400,8 @@ fn parse_one_warc_record<R: BufRead>(
     let mut trailing = [0u8; 4];
     let _ = r.read_exact(&mut trailing);
 
-    let (http_status, http_headers, content_type, payload) = if warc_type.eq_ignore_ascii_case("response")
+    let (http_status, http_headers, content_type, payload) = if warc_type
+        .eq_ignore_ascii_case("response")
         && content_type_warc
             .to_ascii_lowercase()
             .contains("application/http")
@@ -425,15 +430,14 @@ fn parse_one_warc_record<R: BufRead>(
 /// Convert an ISO 8601 WARC date (`2006-01-02T15:04:05Z`) to a 14-digit
 /// CDX timestamp (`20060102150405`).
 fn iso_to_14digit(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_digit())
-        .take(14)
-        .collect()
+    s.chars().filter(|c| c.is_ascii_digit()).take(14).collect()
 }
 
+/// Parsed parts of an HTTP/1.x response: `(status, all_headers, content-type, body)`.
+type HttpResponseParts = (Option<u16>, Vec<(String, String)>, String, Vec<u8>);
+
 /// Parse raw HTTP/1.x response bytes.
-/// Returns `(status, all_headers, content-type, body)`.
-fn parse_http_response(bytes: &[u8]) -> (Option<u16>, Vec<(String, String)>, String, Vec<u8>) {
+fn parse_http_response(bytes: &[u8]) -> HttpResponseParts {
     let sep_crnl = b"\r\n\r\n";
     let sep_nl = b"\n\n";
 
@@ -526,9 +530,16 @@ mod tests {
 
     #[test]
     fn parse_warc_fields_splits_key_value_lines() {
-        let block = b"software: Browsertrix-Crawler 1.13.0\nformat: WARC File Format 1.1\n\nrobots: obey\n";
+        let block =
+            b"software: Browsertrix-Crawler 1.13.0\nformat: WARC File Format 1.1\n\nrobots: obey\n";
         let fields = parse_warc_fields(block);
-        assert_eq!(fields[0], ("software".to_string(), "Browsertrix-Crawler 1.13.0".to_string()));
+        assert_eq!(
+            fields[0],
+            (
+                "software".to_string(),
+                "Browsertrix-Crawler 1.13.0".to_string()
+            )
+        );
         assert!(fields.iter().any(|(k, v)| k == "robots" && v == "obey"));
         // Blank lines are skipped.
         assert!(fields.iter().all(|(k, _)| !k.is_empty()));
@@ -537,11 +548,20 @@ mod tests {
     #[test]
     fn warcinfo_from_fields_maps_known_keys() {
         let fields = vec![
-            ("software".to_string(), "Browsertrix-Crawler 1.13.0".to_string()),
+            (
+                "software".to_string(),
+                "Browsertrix-Crawler 1.13.0".to_string(),
+            ),
             ("operator".to_string(), "crawls@example.org".to_string()),
-            ("http-header-user-agent".to_string(), "Mozilla/5.0 (compatible)".to_string()),
+            (
+                "http-header-user-agent".to_string(),
+                "Mozilla/5.0 (compatible)".to_string(),
+            ),
             ("isPartOf".to_string(), "my-collection".to_string()),
-            ("conformsTo".to_string(), "https://iipc.github.io/warc-specifications/".to_string()),
+            (
+                "conformsTo".to_string(),
+                "https://iipc.github.io/warc-specifications/".to_string(),
+            ),
             ("robots".to_string(), "ignore".to_string()),
             ("hostname".to_string(), "crawler-01".to_string()),
             ("format".to_string(), "WARC File Format 1.1".to_string()), // unrecognized -> ignored
@@ -551,7 +571,10 @@ mod tests {
         assert_eq!(info.operator.as_deref(), Some("crawls@example.org"));
         assert_eq!(info.user_agent.as_deref(), Some("Mozilla/5.0 (compatible)"));
         assert_eq!(info.is_part_of.as_deref(), Some("my-collection"));
-        assert_eq!(info.conforms_to.as_deref(), Some("https://iipc.github.io/warc-specifications/"));
+        assert_eq!(
+            info.conforms_to.as_deref(),
+            Some("https://iipc.github.io/warc-specifications/")
+        );
         assert_eq!(info.robots.as_deref(), Some("ignore"));
         assert_eq!(info.hostname.as_deref(), Some("crawler-01"));
         assert!(!info.is_empty());
@@ -574,7 +597,10 @@ mod tests {
             offset: 0,
             record_length: 0,
         };
-        assert_eq!(Warcinfo::from_record(&rec).unwrap().software.as_deref(), Some("wget/1.21"));
+        assert_eq!(
+            Warcinfo::from_record(&rec).unwrap().software.as_deref(),
+            Some("wget/1.21")
+        );
 
         // Any other record type yields None.
         rec.warc_type = "response".to_string();
@@ -605,14 +631,21 @@ mod tests {
             .collect::<Result<Vec<_>>>()
             .unwrap();
 
-        assert!(records.iter().any(|r| r.warc_type.eq_ignore_ascii_case("request")));
-        assert!(records.iter().any(|r| r.warc_type.eq_ignore_ascii_case("response")));
+        assert!(records
+            .iter()
+            .any(|r| r.warc_type.eq_ignore_ascii_case("request")));
+        assert!(records
+            .iter()
+            .any(|r| r.warc_type.eq_ignore_ascii_case("response")));
 
         let resp = records
             .iter()
             .find(|r| r.warc_type.eq_ignore_ascii_case("response"))
             .unwrap();
-        assert!(resp.concurrent_to.is_some(), "response should have WARC-Concurrent-To");
+        assert!(
+            resp.concurrent_to.is_some(),
+            "response should have WARC-Concurrent-To"
+        );
     }
 
     #[test]

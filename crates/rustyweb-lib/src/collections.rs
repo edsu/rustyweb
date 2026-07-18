@@ -119,7 +119,11 @@ pub struct Wacz {
     /// `Browsertrix-Crawler 1.13.0`, `py-wacz 0.4.6`). We do not try to label
     /// which entry crawled vs packaged - the formats don't distinguish - so this
     /// is just the set of tools involved, joined for display at the UI level.
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "string_or_seq")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "string_or_seq"
+    )]
     pub software: Vec<String>,
     /// Contact for the operator who ran the crawl.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,7 +219,11 @@ impl Manifest {
                         curator: None,
                     });
                 }
-                return Ok(Self { index_dir: index_dir.to_path_buf(), collections, waczs });
+                return Ok(Self {
+                    index_dir: index_dir.to_path_buf(),
+                    collections,
+                    waczs,
+                });
             }
             // Otherwise collections.json already holds groups (waczs.json just missing).
             return Ok(Self {
@@ -318,7 +326,9 @@ impl Manifest {
 
     /// The WACZ members of a collection.
     pub fn members_of<'a>(&'a self, collection_id: &'a str) -> impl Iterator<Item = &'a Wacz> {
-        self.waczs.iter().filter(move |w| w.collection == collection_id)
+        self.waczs
+            .iter()
+            .filter(move |w| w.collection == collection_id)
     }
 }
 
@@ -446,7 +456,10 @@ mod tests {
         let file = Source::File(PathBuf::from("/data/a.wacz"));
         assert_eq!(serde_json::to_string(&file).unwrap(), "\"/data/a.wacz\"");
         let url = Source::Url("https://ex.org/a.wacz".to_string());
-        assert_eq!(serde_json::to_string(&url).unwrap(), "\"https://ex.org/a.wacz\"");
+        assert_eq!(
+            serde_json::to_string(&url).unwrap(),
+            "\"https://ex.org/a.wacz\""
+        );
         // Round-trips back to the right variant.
         let back: Source = serde_json::from_str("\"https://ex.org/a.wacz\"").unwrap();
         assert_eq!(back, url);
@@ -463,7 +476,10 @@ mod tests {
         let listy: Wacz = serde_json::from_str(
             r#"{"id":"a","source":"archive/x.wacz","name":"x","date_indexed":"t","file_size":1,"sha256":"h","software":["Heritrix/3.4.0","py-wacz 0.4.6"]}"#,
         ).unwrap();
-        assert_eq!(listy.software, vec!["Heritrix/3.4.0".to_string(), "py-wacz 0.4.6".to_string()]);
+        assert_eq!(
+            listy.software,
+            vec!["Heritrix/3.4.0".to_string(), "py-wacz 0.4.6".to_string()]
+        );
 
         // Absent -> empty, and empty is not serialized back out.
         let none: Wacz = serde_json::from_str(
@@ -481,7 +497,10 @@ mod tests {
         std::fs::write(tmp.path().join("collections.json"), legacy).unwrap();
         let m = Manifest::open(tmp.path()).unwrap();
         assert_eq!(m.waczs.len(), 1);
-        assert_eq!(m.waczs[0].source, Source::File(PathBuf::from("/data/old.wacz")));
+        assert_eq!(
+            m.waczs[0].source,
+            Source::File(PathBuf::from("/data/old.wacz"))
+        );
         // Migration synthesizes a singleton collection per legacy WACZ.
         assert_eq!(m.collections.len(), 1);
     }
@@ -539,7 +558,10 @@ mod tests {
         let m2 = Manifest::open(tmp.path()).unwrap();
         assert_eq!(m2.waczs.len(), 1);
         assert_eq!(m2.waczs[0].id, "abc12345");
-        assert_eq!(m2.waczs[0].description.as_deref(), Some("A test collection"));
+        assert_eq!(
+            m2.waczs[0].description.as_deref(),
+            Some("A test collection")
+        );
     }
 
     #[test]
@@ -570,13 +592,23 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut m = Manifest::open(tmp.path()).unwrap();
 
-        let id = m.set_collection("Bay Area Transit", Some("desc".into()), None, "2026-01-01T00:00:00Z");
+        let id = m.set_collection(
+            "Bay Area Transit",
+            Some("desc".into()),
+            None,
+            "2026-01-01T00:00:00Z",
+        );
         assert_eq!(id, "bay-area-transit");
         assert_eq!(m.collections.len(), 1);
         assert_eq!(m.collections[0].description.as_deref(), Some("desc"));
 
         // Re-setting updates fields but keeps the original created timestamp.
-        m.set_collection("Bay Area Transit", Some("new".into()), Some("Ed".into()), "2026-02-02T00:00:00Z");
+        m.set_collection(
+            "Bay Area Transit",
+            Some("new".into()),
+            Some("Ed".into()),
+            "2026-02-02T00:00:00Z",
+        );
         assert_eq!(m.collections.len(), 1);
         assert_eq!(m.collections[0].description.as_deref(), Some("new"));
         assert_eq!(m.collections[0].curator.as_deref(), Some("Ed"));

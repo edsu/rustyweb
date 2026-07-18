@@ -386,10 +386,18 @@ pub struct MetaRow {
 
 impl MetaRow {
     pub fn new(label: &str, value: impl Into<String>) -> Self {
-        MetaRow { label: label.to_string(), value: value.into(), mono: false }
+        MetaRow {
+            label: label.to_string(),
+            value: value.into(),
+            mono: false,
+        }
     }
     pub fn mono(label: &str, value: impl Into<String>) -> Self {
-        MetaRow { label: label.to_string(), value: value.into(), mono: true }
+        MetaRow {
+            label: label.to_string(),
+            value: value.into(),
+            mono: true,
+        }
     }
 }
 

@@ -6,8 +6,8 @@ use tantivy::aggregation::{AggContextParams, AggregationCollector};
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::schema::{
-    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED, STRING,
-    TEXT,
+    IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED,
+    STRING, TEXT,
 };
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexWriter, TantivyDocument, Term};
@@ -78,14 +78,20 @@ impl SearchIndex {
     pub fn open(index_dir: &Path) -> Result<Self> {
         let index = Self::open_index(index_dir)?;
         let writer = index.writer(50_000_000)?;
-        Ok(Self { index, writer: Some(writer) })
+        Ok(Self {
+            index,
+            writer: Some(writer),
+        })
     }
 
     /// Open the index read-only (searching). Does not create a writer, so it
     /// does not take the write lock; indexing can proceed concurrently.
     pub fn open_read_only(index_dir: &Path) -> Result<Self> {
         let index = Self::open_index(index_dir)?;
-        Ok(Self { index, writer: None })
+        Ok(Self {
+            index,
+            writer: None,
+        })
     }
 
     fn open_index(index_dir: &Path) -> Result<Index> {
@@ -126,7 +132,8 @@ impl SearchIndex {
     /// `index_collection()`, then `commit()` - the fresh documents survive.
     pub fn delete_collection(&mut self, collection_id: &str) {
         let field = self.index.schema().get_field(FIELD_COLLECTION_ID).unwrap();
-        self.writer_mut().delete_term(Term::from_field_text(field, collection_id));
+        self.writer_mut()
+            .delete_term(Term::from_field_text(field, collection_id));
     }
 
     /// Index a single page from an archive. Fields not set on the [`Page`]
@@ -135,14 +142,23 @@ impl SearchIndex {
         let schema = self.index.schema();
         let mut doc = TantivyDocument::default();
         doc.add_text(schema.get_field(FIELD_DOC_TYPE).unwrap(), "page");
-        doc.add_text(schema.get_field(FIELD_COLLECTION_ID).unwrap(), page.collection_id);
-        doc.add_text(schema.get_field(FIELD_COLLECTION_NAME).unwrap(), page.collection_name);
+        doc.add_text(
+            schema.get_field(FIELD_COLLECTION_ID).unwrap(),
+            page.collection_id,
+        );
+        doc.add_text(
+            schema.get_field(FIELD_COLLECTION_NAME).unwrap(),
+            page.collection_name,
+        );
         doc.add_text(schema.get_field(FIELD_COLLECTION).unwrap(), page.collection);
         doc.add_text(schema.get_field(FIELD_URL).unwrap(), page.url);
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), page.timestamp);
         doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), page.title);
         doc.add_text(schema.get_field(FIELD_BODY).unwrap(), page.body);
-        doc.add_text(schema.get_field(FIELD_DESCRIPTION).unwrap(), page.description);
+        doc.add_text(
+            schema.get_field(FIELD_DESCRIPTION).unwrap(),
+            page.description,
+        );
         doc.add_text(schema.get_field(FIELD_HEADINGS).unwrap(), page.headings);
         doc.add_text(schema.get_field(FIELD_KEYWORDS).unwrap(), page.keywords);
         doc.add_text(schema.get_field(FIELD_AUTHOR).unwrap(), page.author);
@@ -150,7 +166,10 @@ impl SearchIndex {
         // URL's words tokenized so they're searchable as ordinary terms.
         doc.add_text(schema.get_field(FIELD_DOMAIN).unwrap(), domain_of(page.url));
         doc.add_text(schema.get_field(FIELD_SITE).unwrap(), site_of(page.url));
-        doc.add_text(schema.get_field(FIELD_URL_TOKENS).unwrap(), url_search_text(page.url));
+        doc.add_text(
+            schema.get_field(FIELD_URL_TOKENS).unwrap(),
+            url_search_text(page.url),
+        );
         // Numeric year/month for range filtering and the timeline; omitted when
         // there's no usable date.
         if let Some(year) = year_of(page.timestamp) {
@@ -190,8 +209,14 @@ impl SearchIndex {
         let schema = self.index.schema();
         let mut doc = TantivyDocument::default();
         doc.add_text(schema.get_field(FIELD_DOC_TYPE).unwrap(), "collection");
-        doc.add_text(schema.get_field(FIELD_COLLECTION_ID).unwrap(), collection_id);
-        doc.add_text(schema.get_field(FIELD_COLLECTION_NAME).unwrap(), collection_name);
+        doc.add_text(
+            schema.get_field(FIELD_COLLECTION_ID).unwrap(),
+            collection_id,
+        );
+        doc.add_text(
+            schema.get_field(FIELD_COLLECTION_NAME).unwrap(),
+            collection_name,
+        );
         doc.add_text(schema.get_field(FIELD_COLLECTION).unwrap(), collection);
         doc.add_text(schema.get_field(FIELD_URL).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), "");
@@ -270,7 +295,15 @@ impl SearchIndex {
         // are also reachable by explicit `field:` syntax.
         let mut query_parser = QueryParser::for_index(
             &self.index,
-            vec![title_f, headings_f, body_f, description_f, keywords_f, author_f, url_tokens_f],
+            vec![
+                title_f,
+                headings_f,
+                body_f,
+                description_f,
+                keywords_f,
+                author_f,
+                url_tokens_f,
+            ],
         );
         // Require all terms by default (`climate change` means both), which
         // matches what people expect from a search box more than OR does.
@@ -287,7 +320,8 @@ impl SearchIndex {
         // grouping), the total capture count, and the facet counts (a terms
         // aggregation per dimension over the fast fields).
         let top_collector = TopDocs::with_limit(CANDIDATE_CAP).order_by_score();
-        let agg_collector = AggregationCollector::from_aggs(facet_aggregations(), AggContextParams::default());
+        let agg_collector =
+            AggregationCollector::from_aggs(facet_aggregations(), AggContextParams::default());
         let (candidates, total_captures, agg_results) =
             searcher.search(&query, &(top_collector, Count, agg_collector))?;
 
@@ -313,7 +347,10 @@ impl SearchIndex {
                 }
                 by_url.insert(url, groups.len());
             }
-            groups.push(Group { addr: *addr, captures: 1 });
+            groups.push(Group {
+                addr: *addr,
+                captures: 1,
+            });
         }
         let total_hits = groups.len();
         let capped = total_captures > CANDIDATE_CAP;
@@ -480,7 +517,10 @@ const EXTRA_FILTERS: [(&str, &str); 4] = [
 /// dimension or one of the extra filter fields. The single source of truth the
 /// server uses to recognize active filters, so the two can't drift.
 pub fn is_filter_field(field: &str) -> bool {
-    FACET_DIMENSIONS.iter().chain(EXTRA_FILTERS.iter()).any(|(f, _)| *f == field)
+    FACET_DIMENSIONS
+        .iter()
+        .chain(EXTRA_FILTERS.iter())
+        .any(|(f, _)| *f == field)
 }
 
 /// The human label for a filterable field (for active-filter chips), sharing
@@ -528,7 +568,10 @@ fn facet_aggregations() -> Aggregations {
 /// Extract the month buckets from the aggregation results as a timeline sorted
 /// oldest-first. Terms aggregations sort by count, so we re-sort chronologically.
 fn timeline_from_aggregations(value: &serde_json::Value) -> Vec<TimelineBucket> {
-    let Some(buckets) = value.get(FIELD_MONTH).and_then(|d| d.get("buckets")).and_then(|b| b.as_array())
+    let Some(buckets) = value
+        .get(FIELD_MONTH)
+        .and_then(|d| d.get("buckets"))
+        .and_then(|b| b.as_array())
     else {
         return Vec::new();
     };
@@ -553,7 +596,10 @@ fn timeline_from_aggregations(value: &serde_json::Value) -> Vec<TimelineBucket> 
 fn facets_from_aggregations(value: &serde_json::Value) -> Vec<FacetGroup> {
     let mut groups = Vec::new();
     for (field, label) in FACET_DIMENSIONS {
-        let Some(buckets) = value.get(field).and_then(|d| d.get("buckets")).and_then(|b| b.as_array())
+        let Some(buckets) = value
+            .get(field)
+            .and_then(|d| d.get("buckets"))
+            .and_then(|b| b.as_array())
         else {
             continue;
         };
@@ -691,19 +737,71 @@ fn detect_lang(body: &str) -> Option<String> {
 /// than a bucket that won't unify).
 fn lang3_to_lang1(code3: &str) -> Option<&'static str> {
     Some(match code3 {
-        "eng" => "en", "spa" => "es", "por" => "pt", "fra" => "fr", "deu" => "de",
-        "ita" => "it", "nld" => "nl", "rus" => "ru", "ukr" => "uk", "bel" => "be",
-        "bul" => "bg", "ces" => "cs", "pol" => "pl", "hrv" => "hr", "srp" => "sr",
-        "mkd" => "mk", "slv" => "sl", "ron" => "ro", "ell" => "el", "dan" => "da",
-        "swe" => "sv", "nob" => "nb", "fin" => "fi", "hun" => "hu", "est" => "et",
-        "lit" => "lt", "lav" => "lv", "tur" => "tr", "aze" => "az", "uzb" => "uz",
-        "tuk" => "tk", "cat" => "ca", "epo" => "eo", "cmn" => "zh", "jpn" => "ja",
-        "kor" => "ko", "vie" => "vi", "tha" => "th", "ind" => "id", "tgl" => "tl",
-        "jav" => "jv", "mya" => "my", "khm" => "km", "ara" => "ar", "heb" => "he",
-        "yid" => "yi", "pes" => "fa", "urd" => "ur", "hin" => "hi", "ben" => "bn",
-        "guj" => "gu", "pan" => "pa", "mar" => "mr", "kan" => "kn", "tam" => "ta",
-        "tel" => "te", "mal" => "ml", "ori" => "or", "nep" => "ne", "sin" => "si",
-        "kat" => "ka", "hye" => "hy", "amh" => "am", "zul" => "zu", "aka" => "ak",
+        "eng" => "en",
+        "spa" => "es",
+        "por" => "pt",
+        "fra" => "fr",
+        "deu" => "de",
+        "ita" => "it",
+        "nld" => "nl",
+        "rus" => "ru",
+        "ukr" => "uk",
+        "bel" => "be",
+        "bul" => "bg",
+        "ces" => "cs",
+        "pol" => "pl",
+        "hrv" => "hr",
+        "srp" => "sr",
+        "mkd" => "mk",
+        "slv" => "sl",
+        "ron" => "ro",
+        "ell" => "el",
+        "dan" => "da",
+        "swe" => "sv",
+        "nob" => "nb",
+        "fin" => "fi",
+        "hun" => "hu",
+        "est" => "et",
+        "lit" => "lt",
+        "lav" => "lv",
+        "tur" => "tr",
+        "aze" => "az",
+        "uzb" => "uz",
+        "tuk" => "tk",
+        "cat" => "ca",
+        "epo" => "eo",
+        "cmn" => "zh",
+        "jpn" => "ja",
+        "kor" => "ko",
+        "vie" => "vi",
+        "tha" => "th",
+        "ind" => "id",
+        "tgl" => "tl",
+        "jav" => "jv",
+        "mya" => "my",
+        "khm" => "km",
+        "ara" => "ar",
+        "heb" => "he",
+        "yid" => "yi",
+        "pes" => "fa",
+        "urd" => "ur",
+        "hin" => "hi",
+        "ben" => "bn",
+        "guj" => "gu",
+        "pan" => "pa",
+        "mar" => "mr",
+        "kan" => "kn",
+        "tam" => "ta",
+        "tel" => "te",
+        "mal" => "ml",
+        "ori" => "or",
+        "nep" => "ne",
+        "sin" => "si",
+        "kat" => "ka",
+        "hye" => "hy",
+        "amh" => "am",
+        "zul" => "zu",
+        "aka" => "ak",
         _ => return None,
     })
 }
@@ -889,13 +987,34 @@ mod tests {
     use tempfile::TempDir;
 
     /// Build a page with the common fields; unset fields default to empty.
-    fn page<'a>(url: &'a str, title: &'a str, body: &'a str, cid: &'a str, cname: &'a str) -> Page<'a> {
-        Page { url, title, body, collection_id: cid, collection_name: cname, ..Default::default() }
+    fn page<'a>(
+        url: &'a str,
+        title: &'a str,
+        body: &'a str,
+        cid: &'a str,
+        cname: &'a str,
+    ) -> Page<'a> {
+        Page {
+            url,
+            title,
+            body,
+            collection_id: cid,
+            collection_name: cname,
+            ..Default::default()
+        }
     }
 
     /// A page with a given URL and timestamp; fixed title/body for date tests.
     fn page_ts<'a>(url: &'a str, ts: &'a str) -> Page<'a> {
-        Page { url, timestamp: ts, title: "T", body: "shared content", collection_id: "c1", collection_name: "C1", ..Default::default() }
+        Page {
+            url,
+            timestamp: ts,
+            title: "T",
+            body: "shared content",
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -904,7 +1023,11 @@ mod tests {
         let t = extract_html_text(html);
         assert_eq!(t.title, "Hello World");
         assert!(t.body.contains("Some text"), "body: {}", t.body);
-        assert!(!t.body.contains("var x"), "should exclude script content: {}", t.body);
+        assert!(
+            !t.body.contains("var x"),
+            "should exclude script content: {}",
+            t.body
+        );
     }
 
     #[test]
@@ -915,8 +1038,16 @@ mod tests {
             <body><h1>Main Heading</h1><h2>Sub Heading</h2><p>Body.</p></body></html>"#;
         let t = extract_html_text(html);
         assert_eq!(t.description, "A concise summary");
-        assert!(t.headings.contains("Main Heading"), "headings: {}", t.headings);
-        assert!(t.headings.contains("Sub Heading"), "headings: {}", t.headings);
+        assert!(
+            t.headings.contains("Main Heading"),
+            "headings: {}",
+            t.headings
+        );
+        assert!(
+            t.headings.contains("Sub Heading"),
+            "headings: {}",
+            t.headings
+        );
     }
 
     #[test]
@@ -944,15 +1075,33 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
         idx.index_page(&Page {
-            url: "https://ex.com/a", title: "Plain", body: "ordinary body",
-            keywords: "marmots rodentia", author: "Ada Lovelace",
-            collection_id: "c1", collection_name: "C1", ..Default::default()
-        }).unwrap();
+            url: "https://ex.com/a",
+            title: "Plain",
+            body: "ordinary body",
+            keywords: "marmots rodentia",
+            author: "Ada Lovelace",
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        })
+        .unwrap();
         idx.commit().unwrap();
 
-        assert_eq!(idx.search("rodentia", 10).unwrap().len(), 1, "keywords searchable");
-        assert_eq!(idx.search("Lovelace", 10).unwrap().len(), 1, "author searchable by bare word");
-        assert_eq!(idx.search("author:Lovelace", 10).unwrap().len(), 1, "author: field query");
+        assert_eq!(
+            idx.search("rodentia", 10).unwrap().len(),
+            1,
+            "keywords searchable"
+        );
+        assert_eq!(
+            idx.search("Lovelace", 10).unwrap().len(),
+            1,
+            "author searchable by bare word"
+        );
+        assert_eq!(
+            idx.search("author:Lovelace", 10).unwrap().len(),
+            1,
+            "author: field query"
+        );
     }
 
     #[test]
@@ -989,7 +1138,8 @@ mod tests {
         // A body well over DETECT_SAMPLE_BYTES with multibyte chars (é, à) right
         // around the cut point must not panic on a mid-UTF-8 slice, and still
         // detect the dominant language.
-        let sentence = "Le renard brun rapide sauté par-dessus le chien paresseux à côté de la rivière. ";
+        let sentence =
+            "Le renard brun rapide sauté par-dessus le chien paresseux à côté de la rivière. ";
         let long = sentence.repeat(80); // > 2 KB, many multi-byte chars
         assert!(long.len() > DETECT_SAMPLE_BYTES);
         assert_eq!(detect_lang(&long).as_deref(), Some("fr"));
@@ -1003,22 +1153,40 @@ mod tests {
                       le soleil se couche derrière les collines lointaines ce soir la.";
         // Declared lang wins even when the body is another language.
         idx.index_page(&Page {
-            url: "https://ex.com/declared", title: "T", body: french, lang: "en-GB",
-            collection_id: "c1", collection_name: "C1", ..Default::default()
-        }).unwrap();
+            url: "https://ex.com/declared",
+            title: "T",
+            body: french,
+            lang: "en-GB",
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        })
+        .unwrap();
         // No declared lang -> detected from body.
         idx.index_page(&Page {
-            url: "https://ex.com/detected", title: "T", body: french, lang: "",
-            collection_id: "c1", collection_name: "C1", ..Default::default()
-        }).unwrap();
+            url: "https://ex.com/detected",
+            title: "T",
+            body: french,
+            lang: "",
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        })
+        .unwrap();
         idx.commit().unwrap();
 
         let en = idx.search("lang:en", 10).unwrap();
         assert_eq!(en.len(), 1);
-        assert_eq!(en[0].url, "https://ex.com/declared", "declared en-GB wins over the body");
+        assert_eq!(
+            en[0].url, "https://ex.com/declared",
+            "declared en-GB wins over the body"
+        );
         let fr = idx.search("lang:fr", 10).unwrap();
         assert_eq!(fr.len(), 1);
-        assert_eq!(fr[0].url, "https://ex.com/detected", "empty lang detected as fr from body");
+        assert_eq!(
+            fr[0].url, "https://ex.com/detected",
+            "empty lang detected as fr from body"
+        );
     }
 
     #[test]
@@ -1034,13 +1202,27 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
         idx.index_page(&Page {
-            url: "https://ex.com/page", title: "Doc", body: "shared", media_type: "html",
-            lang: "en-US", collection_id: "c1", collection_name: "C1", ..Default::default()
-        }).unwrap();
+            url: "https://ex.com/page",
+            title: "Doc",
+            body: "shared",
+            media_type: "html",
+            lang: "en-US",
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        })
+        .unwrap();
         idx.index_page(&Page {
-            url: "https://ex.com/file.pdf", title: "Report", body: "shared", media_type: "pdf",
-            lang: "", collection_id: "c1", collection_name: "C1", ..Default::default()
-        }).unwrap();
+            url: "https://ex.com/file.pdf",
+            title: "Report",
+            body: "shared",
+            media_type: "pdf",
+            lang: "",
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        })
+        .unwrap();
         idx.commit().unwrap();
 
         let r = idx.search("type:pdf", 10).unwrap();
@@ -1068,7 +1250,8 @@ mod tests {
             "This is some interesting content about Rust programming",
             "abc12345",
             "My Collection",
-        )).unwrap();
+        ))
+        .unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("Rust programming", 10).unwrap();
@@ -1091,12 +1274,24 @@ mod tests {
             collection_id: "c1",
             collection_name: "C1",
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         idx.commit().unwrap();
 
-        assert_eq!(idx.search("marmots", 10).unwrap().len(), 1, "description searchable");
-        assert_eq!(idx.search("rodents", 10).unwrap().len(), 1, "headings searchable");
-        assert_eq!(idx.search("a", 10).unwrap()[0].description, "a treatise on marmots");
+        assert_eq!(
+            idx.search("marmots", 10).unwrap().len(),
+            1,
+            "description searchable"
+        );
+        assert_eq!(
+            idx.search("rodents", 10).unwrap().len(),
+            1,
+            "headings searchable"
+        );
+        assert_eq!(
+            idx.search("a", 10).unwrap()[0].description,
+            "a treatise on marmots"
+        );
     }
 
     #[test]
@@ -1109,7 +1304,8 @@ mod tests {
             "My Archive",
             "my-archive",
             "A collection about digital preservation and web archiving",
-        ).unwrap();
+        )
+        .unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("digital preservation", 10).unwrap();
@@ -1129,12 +1325,17 @@ mod tests {
             "The quick brown fox jumps over the lazy dog near the riverbank",
             "abc12345",
             "Test",
-        )).unwrap();
+        ))
+        .unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("fox", 10).unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].snippet.contains("fox"), "snippet should contain matched term: {}", results[0].snippet);
+        assert!(
+            results[0].snippet.contains("fox"),
+            "snippet should contain matched term: {}",
+            results[0].snippet
+        );
     }
 
     #[test]
@@ -1151,7 +1352,10 @@ mod tests {
         let result = SearchIndex::open(tmp.path());
         assert!(result.is_err(), "opening a mismatched schema should error");
         let msg = result.err().unwrap().to_string();
-        assert!(msg.contains("reindex"), "error should suggest reindex: {msg}");
+        assert!(
+            msg.contains("reindex"),
+            "error should suggest reindex: {msg}"
+        );
     }
 
     #[test]
@@ -1169,13 +1373,27 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
         idx.index_page(&Page {
-            url: "https://ex.com/ok", title: "OK", body: "shared", status: Some(200),
-            modified_year: Some(2015), collection_id: "c1", collection_name: "C1", ..Default::default()
-        }).unwrap();
+            url: "https://ex.com/ok",
+            title: "OK",
+            body: "shared",
+            status: Some(200),
+            modified_year: Some(2015),
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        })
+        .unwrap();
         idx.index_page(&Page {
-            url: "https://ex.com/gone", title: "Gone", body: "shared", status: Some(404),
-            modified_year: Some(2020), collection_id: "c1", collection_name: "C1", ..Default::default()
-        }).unwrap();
+            url: "https://ex.com/gone",
+            title: "Gone",
+            body: "shared",
+            status: Some(404),
+            modified_year: Some(2020),
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        })
+        .unwrap();
         idx.commit().unwrap();
 
         let r = idx.search("status:200", 10).unwrap();
@@ -1209,9 +1427,24 @@ mod tests {
     fn site_filter_spans_subdomains_while_domain_is_exact() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        idx.index_page(&page("https://www.example.com/a", "A", "shared", "c1", "C1")).unwrap();
-        idx.index_page(&page("https://blog.example.com/b", "B", "shared", "c1", "C1")).unwrap();
-        idx.index_page(&page("https://other.org/c", "C", "shared", "c1", "C1")).unwrap();
+        idx.index_page(&page(
+            "https://www.example.com/a",
+            "A",
+            "shared",
+            "c1",
+            "C1",
+        ))
+        .unwrap();
+        idx.index_page(&page(
+            "https://blog.example.com/b",
+            "B",
+            "shared",
+            "c1",
+            "C1",
+        ))
+        .unwrap();
+        idx.index_page(&page("https://other.org/c", "C", "shared", "c1", "C1"))
+            .unwrap();
         idx.commit().unwrap();
 
         // site: matches the whole registrable domain across subdomains.
@@ -1249,7 +1482,8 @@ mod tests {
             "unrelated body text",
             "abc12345",
             "Test",
-        )).unwrap();
+        ))
+        .unwrap();
         idx.commit().unwrap();
 
         // "hydrator" appears only in the URL, but url words are searchable.
@@ -1263,8 +1497,22 @@ mod tests {
     fn domain_filter_restricts_to_exact_host() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        idx.index_page(&page("https://example.com/one", "One", "shared word", "c1", "C1")).unwrap();
-        idx.index_page(&page("https://other.org/two", "Two", "shared word", "c1", "C1")).unwrap();
+        idx.index_page(&page(
+            "https://example.com/one",
+            "One",
+            "shared word",
+            "c1",
+            "C1",
+        ))
+        .unwrap();
+        idx.index_page(&page(
+            "https://other.org/two",
+            "Two",
+            "shared word",
+            "c1",
+            "C1",
+        ))
+        .unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("domain:example.com", 10).unwrap();
@@ -1282,13 +1530,25 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
         idx.index_page(&Page {
-            url: "https://a.com/1", title: "A", body: "shared",
-            collection_id: "w1", collection_name: "W1", collection: "demo", ..Default::default()
-        }).unwrap();
+            url: "https://a.com/1",
+            title: "A",
+            body: "shared",
+            collection_id: "w1",
+            collection_name: "W1",
+            collection: "demo",
+            ..Default::default()
+        })
+        .unwrap();
         idx.index_page(&Page {
-            url: "https://b.com/1", title: "B", body: "shared",
-            collection_id: "w2", collection_name: "W2", collection: "other", ..Default::default()
-        }).unwrap();
+            url: "https://b.com/1",
+            title: "B",
+            body: "shared",
+            collection_id: "w2",
+            collection_name: "W2",
+            collection: "other",
+            ..Default::default()
+        })
+        .unwrap();
         idx.commit().unwrap();
 
         let r = idx.search("collection:demo", 10).unwrap();
@@ -1305,8 +1565,10 @@ mod tests {
     fn multi_word_queries_require_all_terms() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        idx.index_page(&page("https://ex.com/a", "A", "alpha beta", "c1", "C1")).unwrap();
-        idx.index_page(&page("https://ex.com/b", "B", "alpha gamma", "c1", "C1")).unwrap();
+        idx.index_page(&page("https://ex.com/a", "A", "alpha beta", "c1", "C1"))
+            .unwrap();
+        idx.index_page(&page("https://ex.com/b", "B", "alpha gamma", "c1", "C1"))
+            .unwrap();
         idx.commit().unwrap();
 
         // AND-by-default: only the page containing BOTH words matches.
@@ -1324,13 +1586,30 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
         // The term is in page 1's title and page 2's body only.
-        idx.index_page(&page("https://ex.com/title-hit", "kangaroo", "filler text", "c1", "C1")).unwrap();
-        idx.index_page(&page("https://ex.com/body-hit", "filler", "kangaroo text", "c1", "C1")).unwrap();
+        idx.index_page(&page(
+            "https://ex.com/title-hit",
+            "kangaroo",
+            "filler text",
+            "c1",
+            "C1",
+        ))
+        .unwrap();
+        idx.index_page(&page(
+            "https://ex.com/body-hit",
+            "filler",
+            "kangaroo text",
+            "c1",
+            "C1",
+        ))
+        .unwrap();
         idx.commit().unwrap();
 
         let results = idx.search("kangaroo", 10).unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].url, "https://ex.com/title-hit", "title match should rank first");
+        assert_eq!(
+            results[0].url, "https://ex.com/title-hit",
+            "title match should rank first"
+        );
     }
 
     #[test]
@@ -1346,9 +1625,12 @@ mod tests {
     fn year_filter_exact_and_range() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        idx.index_page(&page_ts("https://ex.com/2019", "20190101000000")).unwrap();
-        idx.index_page(&page_ts("https://ex.com/2021", "20210101000000")).unwrap();
-        idx.index_page(&page_ts("https://ex.com/2023", "20230101000000")).unwrap();
+        idx.index_page(&page_ts("https://ex.com/2019", "20190101000000"))
+            .unwrap();
+        idx.index_page(&page_ts("https://ex.com/2021", "20210101000000"))
+            .unwrap();
+        idx.index_page(&page_ts("https://ex.com/2023", "20230101000000"))
+            .unwrap();
         idx.commit().unwrap();
 
         // Exact year.
@@ -1371,7 +1653,12 @@ mod tests {
         resp.facets
             .iter()
             .find(|g| g.field == field)
-            .map(|g| g.buckets.iter().map(|b| (b.value.clone(), b.count)).collect())
+            .map(|g| {
+                g.buckets
+                    .iter()
+                    .map(|b| (b.value.clone(), b.count))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1382,20 +1669,44 @@ mod tests {
         // Three "shared" pages: two on example.com (2021 html), one on other.org
         // (2023 pdf), spread across two collections.
         idx.index_page(&Page {
-            url: "https://example.com/a", title: "A", body: "shared", timestamp: "20210101000000",
-            media_type: "html", lang: "en-US", collection: "demo", collection_id: "w1", collection_name: "W1",
+            url: "https://example.com/a",
+            title: "A",
+            body: "shared",
+            timestamp: "20210101000000",
+            media_type: "html",
+            lang: "en-US",
+            collection: "demo",
+            collection_id: "w1",
+            collection_name: "W1",
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         idx.index_page(&Page {
-            url: "https://example.com/b", title: "B", body: "shared", timestamp: "20210601000000",
-            media_type: "html", lang: "en", collection: "demo", collection_id: "w1", collection_name: "W1",
+            url: "https://example.com/b",
+            title: "B",
+            body: "shared",
+            timestamp: "20210601000000",
+            media_type: "html",
+            lang: "en",
+            collection: "demo",
+            collection_id: "w1",
+            collection_name: "W1",
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         idx.index_page(&Page {
-            url: "https://other.org/c", title: "C", body: "shared", timestamp: "20230101000000",
-            media_type: "pdf", lang: "fr", collection: "news", collection_id: "w2", collection_name: "W2",
+            url: "https://other.org/c",
+            title: "C",
+            body: "shared",
+            timestamp: "20230101000000",
+            media_type: "pdf",
+            lang: "fr",
+            collection: "news",
+            collection_id: "w2",
+            collection_name: "W2",
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         idx.commit().unwrap();
 
         let resp = idx.search_faceted("shared", 10, 0).unwrap();
@@ -1419,10 +1730,15 @@ mod tests {
         assert_eq!(colls.get("news"), Some(&1));
 
         // Narrowing the query narrows the facet counts to the matching subset.
-        let resp = idx.search_faceted("shared domain:example.com", 10, 0).unwrap();
+        let resp = idx
+            .search_faceted("shared domain:example.com", 10, 0)
+            .unwrap();
         assert_eq!(resp.total_hits, 2);
         assert_eq!(facet_map(&resp, FIELD_YEAR).get("2021"), Some(&2));
-        assert!(facet_map(&resp, FIELD_YEAR).get("2023").is_none(), "2023 filtered out");
+        assert!(
+            !facet_map(&resp, FIELD_YEAR).contains_key("2023"),
+            "2023 filtered out"
+        );
     }
 
     #[test]
@@ -1432,23 +1748,45 @@ mod tests {
         // The same URL captured three times (different crawls), plus a distinct URL.
         for ts in ["20210101000000", "20220101000000", "20230101000000"] {
             idx.index_page(&Page {
-                url: "https://ex.com/a", title: "A", body: "shared",
-                timestamp: ts, collection_id: "c1", collection_name: "C1", ..Default::default()
-            }).unwrap();
+                url: "https://ex.com/a",
+                title: "A",
+                body: "shared",
+                timestamp: ts,
+                collection_id: "c1",
+                collection_name: "C1",
+                ..Default::default()
+            })
+            .unwrap();
         }
         idx.index_page(&Page {
-            url: "https://ex.com/b", title: "B", body: "shared",
-            collection_id: "c1", collection_name: "C1", ..Default::default()
-        }).unwrap();
+            url: "https://ex.com/b",
+            title: "B",
+            body: "shared",
+            collection_id: "c1",
+            collection_name: "C1",
+            ..Default::default()
+        })
+        .unwrap();
         idx.commit().unwrap();
 
         let resp = idx.search_faceted("shared", 10, 0).unwrap();
         // Two distinct results, not four captures.
         assert_eq!(resp.total_hits, 2);
         assert!(!resp.capped);
-        let a = resp.results.iter().find(|r| r.url == "https://ex.com/a").unwrap();
-        assert_eq!(a.capture_count, 3, "three captures of /a collapse into one result");
-        let b = resp.results.iter().find(|r| r.url == "https://ex.com/b").unwrap();
+        let a = resp
+            .results
+            .iter()
+            .find(|r| r.url == "https://ex.com/a")
+            .unwrap();
+        assert_eq!(
+            a.capture_count, 3,
+            "three captures of /a collapse into one result"
+        );
+        let b = resp
+            .results
+            .iter()
+            .find(|r| r.url == "https://ex.com/b")
+            .unwrap();
         assert_eq!(b.capture_count, 1);
     }
 
@@ -1494,14 +1832,22 @@ mod tests {
         for i in 0..25 {
             let url = format!("https://ex.com/{i:02}");
             idx.index_page(&Page {
-                url: &url, title: "T", body: "shared", collection_id: "c1", collection_name: "C1",
+                url: &url,
+                title: "T",
+                body: "shared",
+                collection_id: "c1",
+                collection_name: "C1",
                 ..Default::default()
-            }).unwrap();
+            })
+            .unwrap();
         }
         idx.commit().unwrap();
 
         let p1 = idx.search_faceted("shared", 20, 0).unwrap();
-        assert_eq!(p1.total_hits, 25, "total counts all matches, not just the page");
+        assert_eq!(
+            p1.total_hits, 25,
+            "total counts all matches, not just the page"
+        );
         assert_eq!(p1.results.len(), 20, "first page is full");
 
         let p2 = idx.search_faceted("shared", 20, 20).unwrap();
@@ -1510,14 +1856,18 @@ mod tests {
 
         // No overlap between the two pages.
         let urls1: std::collections::HashSet<_> = p1.results.iter().map(|r| &r.url).collect();
-        assert!(p2.results.iter().all(|r| !urls1.contains(&r.url)), "pages must not overlap");
+        assert!(
+            p2.results.iter().all(|r| !urls1.contains(&r.url)),
+            "pages must not overlap"
+        );
     }
 
     #[test]
     fn malformed_query_does_not_error() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
-        idx.index_page(&page("https://ex.com/a", "A", "hello world", "c1", "C1")).unwrap();
+        idx.index_page(&page("https://ex.com/a", "A", "hello world", "c1", "C1"))
+            .unwrap();
         idx.commit().unwrap();
 
         // An unbalanced quote would be a parse error; lenient parsing must not
