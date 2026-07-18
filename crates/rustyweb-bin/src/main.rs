@@ -330,10 +330,18 @@ async fn main() -> Result<()> {
     } else {
         "info"
     };
+    // Default filter: our level, but silence pdf-extract/lopdf, which log noisy
+    // per-glyph warnings ("unknown glyph name ...") through the tracing-log bridge
+    // during PDF text extraction. We already handle PDF outcomes ourselves, so
+    // these are pure noise (and stomp the progress bar). RUST_LOG overrides the
+    // whole thing if you want to see them.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(default_level)
+            .add_directive("pdf_extract=off".parse().unwrap())
+            .add_directive("lopdf=off".parse().unwrap())
+    });
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level)),
-        )
+        .with_env_filter(env_filter)
         .with_ansi(true)
         // Logs go to stderr so stdout can carry data (and be silenced during
         // indexing to hide third-party PDF extraction noise).
