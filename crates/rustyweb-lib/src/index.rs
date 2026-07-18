@@ -386,7 +386,16 @@ fn index_one(
                 .with_context(|| format!("opening {} for streaming index", p.display()))?;
             index_wacz_streaming(file, &id, &display_name, &collection_id, search, &p.display().to_string(), progress)?
         }
-        None => index_wacz(local.as_ref().unwrap(), &id, &display_name, &collection_id, search)?,
+        None => {
+            // The scan path has no cheap up-front record total, so it stays on
+            // the spinner (no determinate bar). Relabel it "indexing" so the
+            // spinner is accurate for the scan phase - after a `--download` it
+            // was still showing "downloading" while it scanned.
+            if let Some(p) = progress {
+                p.phase("indexing");
+            }
+            index_wacz(local.as_ref().unwrap(), &id, &display_name, &collection_id, search)?
+        }
     };
 
     // Index the WACZ's metadata as a searchable document, tagged with its collection.
