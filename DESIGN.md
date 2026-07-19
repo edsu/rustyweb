@@ -59,7 +59,7 @@ rustyweb/
 
 ```
 rustyweb index          [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
-rustyweb reindex        [--home <DIR>]
+rustyweb reindex        [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve          [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set [--home <DIR>] <COLLECTION> <WACZ_ID>...
 rustyweb collection list[--home <DIR>]
@@ -73,8 +73,8 @@ index + the JSON manifest, see *Collection Management*). Keeping them together
 makes a home folder portable - move it to another disk or machine and it still
 resolves.
 
-- `index`: indexes one or more `.wacz` files or `http(s)://` URLs - at least one argument is required. **CDX-guided extraction is the default** for every WACZ (local or remote), reading only the records the CDX lists; a remote URL is read over HTTP range requests with no download, a local file straight from disk (see *Indexing Pipeline*). It falls back to a full WARC scan only when a WACZ can't be CDX-guided (deflated WARCs, or no readable CDX). `--download` fetches a remote WACZ into `<home>/archive` for a durable local copy instead of streaming it in place. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text`, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each local WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. `--from-file <FILE>` (or `-f -` for stdin) reads a newline-delimited list of files/URLs, ignoring blank lines and `#` comments, and combines with any positional args. Progress is shown as a bar on an interactive terminal; `-v`/`--verbose` replaces it with `DEBUG` logs (see *Indexing Pipeline → Progress reporting*). (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
-- `reindex`: rebuild the full-text index from the sources already recorded in the manifest, preserving collection membership and metadata. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. It is *resilient*: a source that can't be indexed - a missing local file, or a remote source still failing after the retry budget - is skipped with a warning rather than aborting the whole rebuild, so one bad source can't torch a long reindex over many. The skipped source's manifest entry is preserved, the mostly-rebuilt index is still committed (usable), and if anything was skipped the command exits non-zero with a summary count - so a partial rebuild is visible to a human *and* to cron/CI, and re-running once the cause is fixed picks the skipped sources back up. This is the intended way to migrate the index after a schema change (see below).
+- `index`: indexes one or more `.wacz` files or `http(s)://` URLs - at least one argument is required. **CDX-guided extraction is the default** for every WACZ (local or remote), reading only the records the CDX lists; a remote URL is read over HTTP range requests with no download, a local file straight from disk (see *Indexing Pipeline*). It falls back to a full WARC scan only when a WACZ can't be CDX-guided (deflated WARCs, or no readable CDX). `--download` fetches a remote WACZ into `<home>/archive` for a durable local copy instead of streaming it in place. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text` or `pages/*.jsonl` text, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each local WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. `--from-file <FILE>` (or `-f -` for stdin) reads a newline-delimited list of files/URLs, ignoring blank lines and `#` comments, and combines with any positional args. Progress is shown as a bar on an interactive terminal; `-v`/`--verbose` replaces it with `DEBUG` logs (see *Indexing Pipeline → Progress reporting*). (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
+- `reindex`: rebuild the full-text index from the sources already recorded in the manifest, preserving collection membership and metadata. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. It is *resilient*: a source that can't be indexed - a missing local file, or a remote source still failing after the retry budget - is skipped with a warning rather than aborting the whole rebuild, so one bad source can't torch a long reindex over many. The skipped source's manifest entry is preserved, the mostly-rebuilt index is still committed (usable), and if anything was skipped the command exits non-zero with a summary count - so a partial rebuild is visible to a human *and* to cron/CI, and re-running once the cause is fixed picks the skipped sources back up. Like `index`, it takes `--concurrency <N>` (records fetched at once per source) and shows the same per-WACZ progress bar on an interactive terminal (`-v`/`--verbose` swaps it for `DEBUG` logs) - welcome here since a full reindex re-streams every source. This is the intended way to migrate the index after a schema change (see below).
 - `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
 - `collection set` / `collection list`: reassign WACZs to a collection (by WACZ id) / list collections and their members. Metadata like description and curator is edited in `collections.json` directly.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
@@ -378,10 +378,13 @@ Input WACZ
        ├── Read datapackage.json ──► WaczMetadata (title, description, crawl date, seed pages)
        │    └── Index as collection document in Tantivy
        │    └── Write to collections.json
-       └── Iterate archive/*.warc(.gz) members, collecting per record:
-            ├── HTML response        ──► title (<title>) + scraped body text
-            ├── urn:text: resource   ──► fully rendered (post-JS) page text
-            └── application/pdf resp ──► extracted PDF text (title from filename)
+       ├── Iterate archive/*.warc(.gz) members, collecting per record:
+       │    ├── HTML response        ──► title (<title>) + scraped body text
+       │    ├── urn:text: resource   ──► fully rendered (post-JS) page text
+       │    └── application/pdf resp ──► extracted PDF text (title from filename)
+       └── Read pages/pages.jsonl + pages/extraPages.jsonl `text` field
+            └── fully rendered page text (where a crawl stores it here
+                instead of as urn:text: records) + a fallback title
                  │
                  └── Merge into one document per URL (body prefers rendered
                      text, then PDF text, then scraped HTML; title from HTML)
@@ -391,6 +394,13 @@ Input WACZ
 
 Records are collected across all inner WARCs before merging, because a page's
 rendered `urn:text` often lives in a different WARC than its HTML response.
+Rendered text is *also* read from `pages/pages.jsonl` and `pages/extraPages.jsonl`
+(Browsertrix's `text` field): many crawls - including this era of SUCHO WACZs -
+store the fully rendered, post-JS page text only there, not as `urn:text:` WARC
+records. Without it, JS-rendered content is visible in replay but unsearchable.
+The jsonl text is merged into the same per-URL document (interchangeable with
+`urn:text:`), so it enriches the existing HTML-response document rather than
+adding a duplicate.
 Collapsing to one document per URL deduplicates repeat captures *within a WACZ*;
 repeat captures of the same URL *across* WACZs stay as separate documents and are
 grouped at query time instead (see *Faceted, temporal discovery*).
@@ -408,7 +418,10 @@ index:
   source) - **the default**: read the WACZ's CDX, then fetch *only* the page
   records (HTML/PDF responses and `urn:text:` rendered text) at
   `data_start + offset` for the length the CDX gives. Media (images/JS/CSS/JSON)
-  and pseudo-records (pageinfo, thumbnail) are never read. The byte source is
+  and pseudo-records (pageinfo, thumbnail) are never read. It also reads the
+  `pages/*.jsonl` `text` once during setup (cheap, alongside the CDX), folding it
+  in as rendered text - so crawls that store rendered text only in the pages files
+  are fully searchable even though the CDX never points at it. The byte source is
   pluggable (`http_range.rs`): a local `FileFetch`, or an `HttpFetch` issuing HTTP
   range requests for a remote WACZ - so a remote WACZ is indexed **without
   downloading it**, fetching only the central directory, the CDX, and the page

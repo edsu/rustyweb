@@ -129,6 +129,70 @@ pub(crate) fn read_datapackage_from<R: std::io::Read + std::io::Seek>(
     Ok(meta)
 }
 
+/// One page's extracted text from a WACZ's `pages/*.jsonl` files.
+///
+/// Browsertrix records the fully rendered (post-JS) page text here - in
+/// `pages/pages.jsonl` (seed pages) and `pages/extraPages.jsonl` (pages found
+/// while crawling) - as a `text` field. Older crawls store the rendered text
+/// *only* here (not as `urn:text:` WARC records), so indexing must read it or
+/// JS-rendered content is unsearchable even though it shows up in replay.
+#[derive(Debug)]
+pub(crate) struct PageText {
+    pub url: String,
+    pub ts: String,
+    pub title: Option<String>,
+    pub text: String,
+}
+
+/// Read extracted page text from a WACZ's `pages/pages.jsonl` and
+/// `pages/extraPages.jsonl`. Each file's header line ({format,id,title}) carries
+/// no url/text and is skipped naturally, so we don't depend on a fixed header
+/// row. Entries without a URL or with empty text are dropped; missing files are
+/// not an error.
+pub(crate) fn read_page_texts<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Vec<PageText> {
+    #[derive(Deserialize)]
+    struct Entry {
+        url: Option<String>,
+        title: Option<String>,
+        ts: Option<String>,
+        text: Option<String>,
+    }
+    let mut out = Vec::new();
+    for name in ["pages/pages.jsonl", "pages/extraPages.jsonl"] {
+        let Ok(mut entry) = zip.by_name(name) else {
+            continue;
+        };
+        let mut buf = String::new();
+        if entry.read_to_string(&mut buf).is_err() {
+            continue;
+        }
+        for line in buf.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(e) = serde_json::from_str::<Entry>(line) {
+                let (Some(url), Some(text)) = (e.url, e.text) else {
+                    continue;
+                };
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                out.push(PageText {
+                    url,
+                    ts: e.ts.unwrap_or_default(),
+                    title: clean(e.title),
+                    text,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Trim a metadata string and drop it if empty.
 fn clean(s: Option<String>) -> Option<String> {
     s.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
@@ -554,6 +618,46 @@ mod tests {
         let recs = cdx_records(&mut zip).unwrap();
         assert_eq!(recs.len(), 1, "a plain .cdxj index must be recognized");
         assert_eq!(recs[0].url, "https://example.com/");
+    }
+
+    #[test]
+    fn read_page_texts_reads_pages_and_extra_pages() {
+        use std::io::Write;
+        // pages.jsonl (seed pages) + extraPages.jsonl (discovered pages). Header
+        // lines, entries without text, and whitespace-only text are all skipped.
+        let pages = "{\"format\":\"json-pages-1.0\",\"id\":\"pages\",\"title\":\"All Pages\"}\n\
+             {\"id\":\"p1\",\"url\":\"https://ex.com/\",\"title\":\"Home\",\"ts\":\"2022-01-01T00:00:00Z\",\"text\":\"seed body Петиція\"}\n\
+             {\"id\":\"p2\",\"url\":\"https://ex.com/no-text\",\"title\":\"NoText\"}\n";
+        let extra = "{\"format\":\"json-pages-1.0\",\"id\":\"extraPages\",\"title\":\"Extra\"}\n\
+             {\"id\":\"e1\",\"url\":\"https://ex.com/two\",\"ts\":\"2022-01-02T00:00:00Z\",\"text\":\"  discovered text  \"}\n\
+             {\"id\":\"e2\",\"url\":\"https://ex.com/blank\",\"text\":\"   \"}\n";
+        let mut buf = Vec::new();
+        {
+            let opt = zip::write::SimpleFileOptions::default();
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("pages/pages.jsonl", opt).unwrap();
+            zw.write_all(pages.as_bytes()).unwrap();
+            zw.start_file("pages/extraPages.jsonl", opt).unwrap();
+            zw.write_all(extra.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+        let texts = read_page_texts(&mut zip);
+        assert_eq!(
+            texts.len(),
+            2,
+            "only entries with non-empty text: {texts:?}"
+        );
+        let home = texts.iter().find(|p| p.url == "https://ex.com/").unwrap();
+        assert!(home.text.contains("Петиція"), "reads text incl. Cyrillic");
+        assert_eq!(home.title.as_deref(), Some("Home"));
+        let two = texts
+            .iter()
+            .find(|p| p.url == "https://ex.com/two")
+            .unwrap();
+        assert_eq!(two.text, "discovered text", "text is trimmed");
+        assert_eq!(two.ts, "2022-01-02T00:00:00Z");
+        assert!(two.title.is_none(), "absent title stays None");
     }
 
     #[test]

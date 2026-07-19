@@ -218,7 +218,10 @@ terminal (piping to a file or CI) it prints plain log lines and no bar.
 
 By default rustyweb reads a WACZ through its internal **CDX index**, fetching only
 the records that become pages (HTML, PDFs, and Browsertrix's rendered `urn:text`)
-and skipping images, video, JS, and CSS. This works the same way for local and
+and skipping images, video, JS, and CSS. It also reads the fully rendered page
+text from `pages/pages.jsonl` and `pages/extraPages.jsonl` — many crawls store the
+post-JS text only there, so this keeps JS-rendered content searchable, not just
+visible in replay. This works the same way for local and
 remote WACZs - the only difference is *how* the bytes are read: a remote WACZ over
 HTTP range requests (no download), a local WACZ straight from the file.
 
@@ -263,7 +266,7 @@ offers "browse by year" and "top sites" entry points into search.
 
 ```
 rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
-rustyweb reindex         [--home <DIR>]
+rustyweb reindex         [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve           [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set  [--home <DIR>] <COLLECTION> <WACZ_ID>...
 rustyweb collection list [--home <DIR>]
@@ -283,8 +286,9 @@ derived siblings under it.
   WACZ must live under `<home>/archive`; rustyweb indexes it in place rather than
   copying it, and a path outside the archive folder (or a directory) is an error.
   Index several with a shell glob: `rustyweb index archive/*.wacz`. Extracts
-  searchable text from each page (HTML, Browsertrix's rendered `urn:text` records,
-  and PDFs), reads `datapackage.json` for collection metadata, and records
+  searchable text from each page (HTML, Browsertrix's rendered `urn:text` records
+  or `pages/*.jsonl` text, and PDFs), reads `datapackage.json` for collection
+  metadata, and records
   everything in the manifest under `<home>/index/`, including the SHA-256 of each
   local WACZ. Local WACZ paths are stored relative to home so the folder is
   portable. The WACZ name comes from `--name` if given, otherwise the WACZ's
@@ -308,9 +312,11 @@ derived siblings under it.
   indexed (a missing local file, or a remote source still failing after retries)
   is skipped with a warning rather than aborting the rebuild; the mostly-rebuilt
   index is still usable, and if anything was skipped the command exits non-zero
-  with a summary count so you (or cron/CI) know to re-run it once fixed. (If you try
-  to `index` or `serve` against an index built by an older version, rustyweb tells
-  you to run this.)
+  with a summary count so you (or cron/CI) know to re-run it once fixed. Takes
+  `--concurrency <N>` and shows the same progress bar as `index` (a full reindex
+  re-streams every source, so it can take a while); `-v`/`--verbose` swaps the bar
+  for debug logs. (If you try to `index` or `serve` against an index built by an
+  older version, rustyweb tells you to run this.)
 - **`serve`** - opens the index read-only and starts the HTTP server (so you can
   `index` while it runs). Defaults to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and
