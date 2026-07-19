@@ -159,7 +159,7 @@ pub fn home(cards: &[CollectionCard], browse: &HomeBrowse) -> Markup {
                     div.card-header {
                         a.card-title href=(format!("/collection/{}", c.id)) { (c.name) }
                         span.status.muted {
-                            (c.count) " WACZ" @if c.count != 1 { "s" }
+                            (c.count) " crawl" @if c.count != 1 { "s" }
                         }
                     }
                     @if let Some(d) = &c.description {
@@ -416,7 +416,7 @@ fn meta_table(rows: &[MetaRow]) -> Markup {
 
 // ── Collection detail ────────────────────────────────────────────────────────
 
-/// A member WACZ as shown in a collection's list.
+/// A member crawl (WACZ) as shown in a collection's list.
 pub struct MemberItem {
     pub id: String,
     pub name: String,
@@ -425,7 +425,7 @@ pub struct MemberItem {
     pub provenance: Option<String>,
 }
 
-/// The collection detail page: metadata table plus its list of member WACZs.
+/// The collection detail page: metadata table plus its list of member crawls.
 pub fn collection(
     name: &str,
     description: Option<&str>,
@@ -437,14 +437,14 @@ pub fn collection(
         h1 { (name) }
         @if let Some(d) = description { p.desc { (d) } }
         (meta_table(meta))
-        h2 { "WACZs" }
+        h2 { "Crawls" }
         @if members.is_empty() {
-            p.muted { "No WACZs in this collection." }
+            p.muted { "No crawls in this collection." }
         } @else {
             ul.pages {
                 @for m in members {
                     li {
-                        a href=(format!("/wacz/{}", m.id)) { (m.name) }
+                        a href=(format!("/crawl/{}", m.id)) { (m.name) }
                         " "
                         @if m.present { span.ok { "✓" } } @else { span.missing { "✗" } }
                         @if let Some(p) = &m.provenance { div.prov { (p) } }
@@ -456,19 +456,19 @@ pub fn collection(
     layout(&format!("{name} - rustyweb"), body)
 }
 
-// ── WACZ detail ────────────────────────────────────────────────────────────
+// ── Crawl detail ─────────────────────────────────────────────────────────────
 
-/// A seed page listed on a WACZ detail page.
+/// A seed page listed on a crawl detail page.
 pub struct PageItem {
     pub href: String,
     pub title: String,
     pub url: String,
 }
 
-/// All the data the WACZ detail page renders. The handler resolves links,
+/// All the data the crawl detail page renders. The handler resolves links,
 /// formats sizes/dates, and gathers provenance/file rows; the view lays them out.
-pub struct WaczPage {
-    /// `(collection_id, collection_name)` breadcrumb, if the WACZ has one.
+pub struct CrawlPage {
+    /// `(collection_id, collection_name)` breadcrumb, if the crawl has one.
     pub crumb: Option<(String, String)>,
     pub name: String,
     pub description: Option<String>,
@@ -484,8 +484,8 @@ pub struct WaczPage {
     pub pages: Vec<PageItem>,
 }
 
-/// The WACZ detail page: provenance panel, file metadata, and seed-page list.
-pub fn wacz(p: &WaczPage) -> Markup {
+/// The crawl detail page: provenance panel, file metadata, and seed-page list.
+pub fn crawl(p: &CrawlPage) -> Markup {
     let body = html! {
         (top_bar(None))
         @if let Some((id, cname)) = &p.crumb {
@@ -517,7 +517,7 @@ pub fn wacz(p: &WaczPage) -> Markup {
 
         h2 { "Pages" }
         @if p.pages.is_empty() {
-            p.muted { "No pages are listed in this WACZ." }
+            p.muted { "No pages are listed in this crawl." }
         } @else {
             ul.pages {
                 @for pg in &p.pages {

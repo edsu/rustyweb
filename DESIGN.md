@@ -88,8 +88,8 @@ resolves.
 |---|---|
 | `GET /` | Homepage: search box, browse-by-facet entry points, and the collection overview |
 | `GET /search?q=...&page=N` | Server-rendered results with a facet sidebar, month timeline, snippets, and pagination |
-| `GET /collection/{id}` | Collection detail: metadata + member WACZs |
-| `GET /wacz/{id}` | WACZ detail: provenance panel, file metadata, seed pages |
+| `GET /collection/{id}` | Collection detail: metadata + member crawls |
+| `GET /crawl/{id}` | Crawl detail: provenance panel, file metadata, seed pages (a crawl is one WACZ) |
 | `GET /api/search?q=...` | Full-text search → JSON (results, `total`, `capped`, `facets`) |
 | `GET /files/{id}` | Stream a registered WACZ file with byte-range support |
 | `GET /assets/*` | Embedded site assets (the shared `app.css` stylesheet) |
@@ -268,6 +268,16 @@ works. This model serves both audiences: an **individual** self-hosting WACZs ma
 or browsertrix-crawler gets context with no hosted-service dependency; an **institution**
 (e.g. TBs of WARC behind pywb) can reorganize crawls into navigable, provenance-bearing
 collections. It is also the structural fix for the "long list" problem.
+
+**Vocabulary (UI vs. data model).** WACZ is a *packaging format* - a technical container -
+which most users don't think in terms of; they think in **crawls**. So the web UI presents
+each WACZ member as a "crawl" (the `/crawl/{id}` detail page, the "Crawls" count on
+collections). "WACZ" is kept only where the file/format is genuinely what's meant - the
+`index`/`reindex` CLI, `/files/{id}` byte-range serving, replay source, and fixity. The
+data model (`Wacz`, `waczs.json`, `wacz_by_id`) stays WACZ-named, since there it *is* the
+file; the rename is a presentation-layer relabel. (A WACZ is 1:1 with a crawl today; if the
+Browsertrix importer later distinguishes crawls from uploads, the label can follow the
+item's actual type.)
 
 ### Provenance
 

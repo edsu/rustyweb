@@ -428,7 +428,7 @@ async fn homepage_card_links_to_collection_page() {
 }
 
 #[tokio::test]
-async fn wacz_page_shows_metadata_and_pages() {
+async fn crawl_page_shows_metadata_and_pages() {
     let tmp = make_index(&["a.wacz"]);
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
     let id = manifest.waczs[0].id.clone();
@@ -436,7 +436,7 @@ async fn wacz_page_shows_metadata_and_pages() {
 
     let resp = app
         .oneshot(
-            Request::get(format!("/wacz/{id}"))
+            Request::get(format!("/crawl/{id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -450,7 +450,7 @@ async fn wacz_page_shows_metadata_and_pages() {
     assert!(html.contains("Replay"), "should have a replay button");
     assert!(html.contains("Pages"), "should have a pages section");
     // a.wacz's seed page (title "2Tone: The Sound of Britain").
-    assert!(html.contains("2Tone"), "should list the WACZ's pages");
+    assert!(html.contains("2Tone"), "should list the crawl's pages");
 }
 
 #[tokio::test]
@@ -475,12 +475,12 @@ async fn collection_page_lists_members() {
     let html = String::from_utf8(body.to_vec()).unwrap();
 
     assert!(
-        html.contains("WACZs"),
+        html.contains("Crawls"),
         "collection page should have a members section"
     );
     assert!(
-        html.contains(&format!("/wacz/{wacz_id}")),
-        "collection page should link to its member WACZ"
+        html.contains(&format!("/crawl/{wacz_id}")),
+        "collection page should link to its member crawl"
     );
 }
 
@@ -627,11 +627,11 @@ async fn index_from_http_url_and_link_directly() {
         assert!(!idx.search("example", 10).unwrap().is_empty());
     }
 
-    // The WACZ page links wabac directly at the remote URL, not through /files/{id}.
+    // The crawl page links wabac directly at the remote URL, not through /files/{id}.
     let app2 = rustyweb_lib::server::router(tmp.path()).unwrap();
     let resp = app2
         .oneshot(
-            Request::get(format!("/wacz/{}", col.id))
+            Request::get(format!("/crawl/{}", col.id))
                 .body(Body::empty())
                 .unwrap(),
         )
