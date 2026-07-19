@@ -218,7 +218,10 @@ terminal (piping to a file or CI) it prints plain log lines and no bar.
 
 By default rustyweb reads a WACZ through its internal **CDX index**, fetching only
 the records that become pages (HTML, PDFs, and Browsertrix's rendered `urn:text`)
-and skipping images, video, JS, and CSS. This works the same way for local and
+and skipping images, video, JS, and CSS. It also reads the fully rendered page
+text from `pages/pages.jsonl` and `pages/extraPages.jsonl` — many crawls store the
+post-JS text only there, so this keeps JS-rendered content searchable, not just
+visible in replay. This works the same way for local and
 remote WACZs - the only difference is *how* the bytes are read: a remote WACZ over
 HTTP range requests (no download), a local WACZ straight from the file.
 
@@ -283,8 +286,9 @@ derived siblings under it.
   WACZ must live under `<home>/archive`; rustyweb indexes it in place rather than
   copying it, and a path outside the archive folder (or a directory) is an error.
   Index several with a shell glob: `rustyweb index archive/*.wacz`. Extracts
-  searchable text from each page (HTML, Browsertrix's rendered `urn:text` records,
-  and PDFs), reads `datapackage.json` for collection metadata, and records
+  searchable text from each page (HTML, Browsertrix's rendered `urn:text` records
+  or `pages/*.jsonl` text, and PDFs), reads `datapackage.json` for collection
+  metadata, and records
   everything in the manifest under `<home>/index/`, including the SHA-256 of each
   local WACZ. Local WACZ paths are stored relative to home so the folder is
   portable. The WACZ name comes from `--name` if given, otherwise the WACZ's

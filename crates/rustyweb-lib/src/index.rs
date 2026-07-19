@@ -671,12 +671,15 @@ enum RawRecord {
         /// Year from the HTTP `Last-Modified` header, if present.
         modified_year: Option<u64>,
     },
-    /// A `urn:text:` resource record: Browsertrix's fully rendered (post-JS)
-    /// page text. Richer than scraped HTML, especially for SPAs.
+    /// Fully rendered (post-JS) page text - Browsertrix's `urn:text:` resource
+    /// record, or the `text` field from `pages/*.jsonl`. Richer than scraped
+    /// HTML, especially for SPAs. `title` is set only for the pages.jsonl source
+    /// (used as a fallback when the HTML capture has no title).
     Text {
         url: String,
         timestamp: String,
         text: String,
+        title: Option<String>,
     },
 }
 
@@ -745,6 +748,22 @@ fn index_wacz(
             warcinfo = wi;
         }
         raws.extend(r);
+    }
+    // Fold in pages.jsonl/extraPages.jsonl extracted text (see the streaming
+    // path); some crawls store rendered text only there, not in the WARCs.
+    if let Ok(file) = std::fs::File::open(wacz_path) {
+        if let Ok(mut zip) = zip::ZipArchive::new(file) {
+            raws.extend(
+                crate::wacz::read_page_texts(&mut zip)
+                    .into_iter()
+                    .map(|pt| RawRecord::Text {
+                        url: pt.url,
+                        timestamp: pt.ts,
+                        text: pt.text,
+                        title: pt.title,
+                    }),
+            );
+        }
     }
     index_merged(
         raws,
@@ -856,6 +875,7 @@ fn index_merged(
                     url,
                     timestamp,
                     text,
+                    title,
                 } => {
                     let e = pages.entry(url).or_default();
                     if e.timestamp.is_empty() {
@@ -864,6 +884,13 @@ fn index_merged(
                     e.rendered_text = Some(text);
                     // Rendered text always comes from an HTML page.
                     e.media_type.get_or_insert_with(|| "html".to_string());
+                    // A pages.jsonl title fills in only when the HTML capture
+                    // gave none - the scraped HTML <title> wins when present.
+                    if let Some(t) = title {
+                        if !t.is_empty() {
+                            e.title.get_or_insert(t);
+                        }
+                    }
                 }
             }
         }
@@ -986,6 +1013,10 @@ where
     let cdx = wacz::cdx_records(&mut zip)?;
     let starts = wacz::warc_data_starts(&mut zip)?;
     let warcinfo = wacz::find_warcinfo_streaming(&mut zip)?;
+    // Extracted page text from pages.jsonl/extraPages.jsonl (read once, while the
+    // ZIP is open). Some crawls store rendered text only here - not as urn:text:
+    // WARC records the CDX points at - so without this that text is unsearchable.
+    let page_texts = wacz::read_page_texts(&mut zip);
     drop(zip);
 
     // Records that can become a page; skip media/pseudo-records. The count is the
@@ -1012,7 +1043,7 @@ where
         .num_threads(concurrency)
         .build()
         .context("building record-fetch thread pool")?;
-    let out: Vec<RawRecord> = pool.install(|| {
+    let mut out: Vec<RawRecord> = pool.install(|| {
         wanted
             .par_iter()
             .flat_map_iter(|c| {
@@ -1043,8 +1074,20 @@ where
             .collect()
     });
 
+    // Fold in the pages.jsonl/extraPages.jsonl text as rendered-text records;
+    // index_merged merges them into the matching page docs by URL (most already
+    // exist from their HTML response, so this enriches rather than duplicates).
+    let page_text_count = page_texts.len();
+    out.extend(page_texts.into_iter().map(|pt| RawRecord::Text {
+        url: pt.url,
+        timestamp: pt.ts,
+        text: pt.text,
+        title: pt.title,
+    }));
+
     debug!(
         records = wanted.len(),
+        page_texts = page_text_count,
         read_ms = read_start.elapsed().as_millis() as u64,
         concurrency,
         "read page records via CDX"
@@ -1108,6 +1151,7 @@ fn record_to_raw(record: &WarcRecord) -> Option<RawRecord> {
             url: real_url.to_string(),
             timestamp: record.timestamp.clone(),
             text,
+            title: None,
         });
     }
 
@@ -1553,6 +1597,97 @@ mod tests {
             manifest.waczs.len(),
             2,
             "skipped source's manifest entry should be preserved"
+        );
+    }
+
+    #[test]
+    fn pages_jsonl_text_is_indexed_when_absent_from_html() {
+        use std::io::Write;
+        // A crawl whose rendered text lives ONLY in pages.jsonl (older
+        // Browsertrix/SUCHO WACZs write it there, not as urn:text: records): the
+        // HTML body lacks the term, but the pages.jsonl `text` field has it. It
+        // must still be searchable, via the default CDX-guided path.
+        let term = "zqxsentinel"; // unique token, present only in pages.jsonl text
+        let url = "https://ex.com/";
+
+        // One WARC response record whose HTML does NOT contain the term.
+        let http = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+             <html><head><title>Home Page</title></head><body>nothing useful</body></html>";
+        let mut warc = format!(
+            "WARC/1.0\r\nWARC-Type: response\r\nWARC-Target-URI: {url}\r\n\
+             WARC-Date: 2022-01-01T00:00:00Z\r\n\
+             Content-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
+            http.len()
+        )
+        .into_bytes();
+        warc.extend_from_slice(http);
+        warc.extend_from_slice(b"\r\n\r\n");
+        let gz = |b: &[u8]| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+        let warc_gz = gz(&warc); // single gzip member => offset 0 in data.warc.gz
+
+        // CDX pointing at that record (whole member).
+        let cdx_line = format!(
+            "com,ex)/ 20220101000000 {{\"url\":\"{url}\",\"mime\":\"text/html\",\
+             \"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":0,\"length\":{}}}\n",
+            warc_gz.len()
+        );
+        let cdx_gz = gz(cdx_line.as_bytes());
+
+        // pages.jsonl: header + a page whose `text` carries the term (+Cyrillic).
+        let pages = format!(
+            "{{\"format\":\"json-pages-1.0\",\"id\":\"pages\",\"title\":\"All Pages\"}}\n\
+             {{\"id\":\"p1\",\"url\":\"{url}\",\"title\":\"Home Page\",\
+             \"ts\":\"2022-01-01T00:00:00Z\",\"text\":\"Петиція {term}\"}}\n"
+        );
+
+        // Assemble the WACZ. The WARC must be Stored so it takes the CDX-guided path.
+        let mut wacz = Vec::new();
+        {
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let opt = zip::write::SimpleFileOptions::default();
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut wacz));
+            zw.start_file("archive/data.warc.gz", stored).unwrap();
+            zw.write_all(&warc_gz).unwrap();
+            zw.start_file("indexes/index.cdx.gz", opt).unwrap();
+            zw.write_all(&cdx_gz).unwrap();
+            zw.start_file("pages/pages.jsonl", opt).unwrap();
+            zw.write_all(pages.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let path = archive.join("crawl.wacz");
+        std::fs::write(&path, &wacz).unwrap();
+        assert!(
+            local_warcs_streamable(&path).unwrap(),
+            "stored WARC should take the CDX-guided path"
+        );
+        index_path(&path, tmp.path(), None).unwrap();
+
+        let idx =
+            crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path())
+                .unwrap();
+        assert!(
+            idx.search(term, 10)
+                .unwrap()
+                .iter()
+                .any(|r| r.doc_type == "page" && r.url == url),
+            "text from pages.jsonl must be searchable (term absent from the HTML)"
+        );
+        assert!(
+            !idx.search("Петиція", 10).unwrap().is_empty(),
+            "Cyrillic rendered text from pages.jsonl must be searchable"
+        );
+        assert!(
+            !idx.search("Home Page", 10).unwrap().is_empty(),
+            "the HTML <title> is still indexed"
         );
     }
 
