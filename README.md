@@ -266,7 +266,7 @@ offers "browse by year" and "top sites" entry points into search.
 
 ```
 rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
-rustyweb reindex         [--home <DIR>]
+rustyweb reindex         [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve           [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set  [--home <DIR>] <COLLECTION> <WACZ_ID>...
 rustyweb collection list [--home <DIR>]
@@ -312,9 +312,11 @@ derived siblings under it.
   indexed (a missing local file, or a remote source still failing after retries)
   is skipped with a warning rather than aborting the rebuild; the mostly-rebuilt
   index is still usable, and if anything was skipped the command exits non-zero
-  with a summary count so you (or cron/CI) know to re-run it once fixed. (If you try
-  to `index` or `serve` against an index built by an older version, rustyweb tells
-  you to run this.)
+  with a summary count so you (or cron/CI) know to re-run it once fixed. Takes
+  `--concurrency <N>` and shows the same progress bar as `index` (a full reindex
+  re-streams every source, so it can take a while); `-v`/`--verbose` swaps the bar
+  for debug logs. (If you try to `index` or `serve` against an index built by an
+  older version, rustyweb tells you to run this.)
 - **`serve`** - opens the index read-only and starts the HTTP server (so you can
   `index` while it runs). Defaults to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and

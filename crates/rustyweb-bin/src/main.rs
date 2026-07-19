@@ -115,6 +115,18 @@ enum Commands {
         /// rustyweb home directory (holds archive/ and index/).
         #[arg(long, default_value = ".")]
         home: PathBuf,
+
+        /// Number of records to fetch concurrently while re-streaming each
+        /// source. Default: 4 for remote URLs (gentle on the host; raise it,
+        /// e.g. 16, for object stores like S3), CPU count for local files.
+        /// Capped at 64 per host as a proactive politeness ceiling.
+        #[arg(long, value_name = "N")]
+        concurrency: Option<usize>,
+
+        /// Verbose logging (debug level). Replaces the progress bar with detailed
+        /// per-record logs.
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Search indexed WACZ files for CDX records matching a URL.
     SearchUrl {
@@ -327,9 +339,16 @@ async fn main() -> Result<()> {
     //                    with and duplicate the bar); keep WARN/ERROR.
     //  - non-TTY      -> no bar (piping/CI), so keep INFO so logs aren't lost.
     // RUST_LOG overrides the level in all cases.
-    let verbose = matches!(&cli.command, Commands::Index { verbose: true, .. });
-    let is_index = matches!(&cli.command, Commands::Index { .. });
-    let show_bar = is_index && !verbose && std::io::stderr().is_terminal();
+    let verbose = matches!(
+        &cli.command,
+        Commands::Index { verbose: true, .. } | Commands::Reindex { verbose: true, .. }
+    );
+    // Both `index` and `reindex` stream records and show the progress bar.
+    let shows_progress = matches!(
+        &cli.command,
+        Commands::Index { .. } | Commands::Reindex { .. }
+    );
+    let show_bar = shows_progress && !verbose && std::io::stderr().is_terminal();
     let default_level = if verbose {
         "debug"
     } else if show_bar {
@@ -484,14 +503,29 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Reindex { home } => {
+        Commands::Reindex {
+            home,
+            concurrency,
+            verbose: _,
+        } => {
+            // A full reindex re-streams every source, so the progress bar is even
+            // more welcome here than for `index`. Same gating (interactive, not -v).
+            let bar = show_bar.then(BarProgress::new);
+            let progress = bar
+                .as_ref()
+                .map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
             // Like `index`, silence stdout to hide third-party PDF extraction
             // noise; our logs are on stderr.
             let quiet = gag::Gag::stdout().ok();
-            let result = rustyweb_lib::index::reindex(&home);
+            let result = rustyweb_lib::index::reindex(&home, concurrency, progress);
             drop(quiet);
+            if result.is_err() {
+                // Clear any spinner/bar left up before the error propagates.
+                if let Some(b) = &bar {
+                    b.clear();
+                }
+            }
             result?;
-            tracing::info!("reindex complete");
         }
 
         Commands::SearchUrl { url, home } => {

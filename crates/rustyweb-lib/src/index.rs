@@ -148,7 +148,14 @@ pub fn index_location(
 /// recreates the Tantivy index from scratch, so a schema change is picked up.
 /// Local files that have gone missing are skipped with a warning rather than
 /// aborting the whole run.
-pub fn reindex(home: &Path) -> Result<()> {
+pub fn reindex(
+    home: &Path,
+    // Concurrent record fetches per source for CDX-guided streaming; `None` picks
+    // a per-source default (see `default_concurrency`).
+    concurrency: Option<usize>,
+    // Optional progress sink; drives the same per-WACZ bar as `index`.
+    progress: Option<&dyn IndexProgress>,
+) -> Result<()> {
     let index_dir = index_dir(home);
     let mut manifest = Manifest::open(&index_dir)?;
     if manifest.waczs.is_empty() {
@@ -189,6 +196,7 @@ pub fn reindex(home: &Path) -> Result<()> {
     let total = targets.len();
     let mut done = 0usize;
     let mut skipped = 0usize;
+    let mut summaries: Vec<(String, u64)> = Vec::new();
     for (source, name, collection_id, collection_name) in &targets {
         // Skip local files that no longer exist rather than failing the run;
         // their manifest entry is preserved (see `rustyweb verify`).
@@ -220,10 +228,13 @@ pub fn reindex(home: &Path) -> Result<()> {
             Some(name),
             Some((collection_id, collection_name)),
             false,
-            None,
-            None,
+            concurrency,
+            progress,
         ) {
-            Ok(_) => done += 1,
+            Ok(outcome) => {
+                summaries.push(outcome);
+                done += 1;
+            }
             Err(e) => {
                 tracing::warn!(
                     source = %source.location(),
@@ -238,6 +249,14 @@ pub fn reindex(home: &Path) -> Result<()> {
     // committed and saved, so it's usable even if some sources were skipped.
     search.into_inner().unwrap().commit()?;
     manifest.save()?;
+    // Report per-WACZ page counts (and clear the bar) now that the index is
+    // committed - mirrors `index_location`.
+    if let Some(p) = progress {
+        for (name, pages) in &summaries {
+            p.wacz_indexed(name, *pages);
+        }
+        p.finish();
+    }
     if skipped > 0 {
         // Usable but incomplete: return an error so the process exits non-zero and
         // cron/CI notices, while leaving the mostly-rebuilt index in place.
@@ -1524,7 +1543,7 @@ mod tests {
         let full_text = tmp.path().join("index").join("full_text");
         std::fs::remove_dir_all(&full_text).unwrap();
 
-        reindex(tmp.path()).unwrap();
+        reindex(tmp.path(), None, None).unwrap();
 
         // The manifest (and the custom name) is preserved...
         let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
@@ -1543,7 +1562,7 @@ mod tests {
     fn reindex_with_no_collections_is_ok() {
         let tmp = TempDir::new().unwrap();
         // No collections.json yet: reindex should be a no-op, not an error.
-        reindex(tmp.path()).unwrap();
+        reindex(tmp.path(), None, None).unwrap();
     }
 
     #[test]
@@ -1573,7 +1592,7 @@ mod tests {
 
         // Rebuild from the manifest: the run completes over the good source but
         // reports a non-zero exit (an error) because one source was skipped.
-        let err = reindex(tmp.path())
+        let err = reindex(tmp.path(), None, None)
             .expect_err("a skipped source should surface as a non-zero exit, not abort mid-run");
         let msg = format!("{err:#}");
         assert!(
