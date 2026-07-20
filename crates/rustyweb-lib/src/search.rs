@@ -933,6 +933,10 @@ pub struct HtmlText {
     pub author: String,
     /// The `<html lang>` attribute value, if present (e.g. `en`, `en-US`).
     pub lang: String,
+    /// The page's social-preview image URL: `<meta property=og:image>`, falling
+    /// back to `twitter:image`. Used as the crawl's representative thumbnail. May
+    /// be relative (resolved against the page URL by the caller).
+    pub og_image: String,
 }
 
 /// Extract title, body text, description, and headings from raw HTML bytes,
@@ -955,6 +959,12 @@ pub fn extract_html_text(html: &[u8]) -> HtmlText {
     // Description: prefer <meta name="description">, fall back to og:description.
     let description = meta_content(&doc, "meta[name=description]")
         .or_else(|| meta_content(&doc, "meta[property=\"og:description\"]"))
+        .unwrap_or_default();
+
+    // Social-preview image: prefer og:image, fall back to twitter:image. This is
+    // the crawl's representative thumbnail source.
+    let og_image = meta_content(&doc, "meta[property=\"og:image\"]")
+        .or_else(|| meta_content(&doc, "meta[name=\"twitter:image\"]"))
         .unwrap_or_default();
 
     // Keywords and author from <meta> tags (author falls back to article:author).
@@ -1015,6 +1025,7 @@ pub fn extract_html_text(html: &[u8]) -> HtmlText {
         keywords,
         author,
         lang,
+        og_image,
     }
 }
 

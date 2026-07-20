@@ -47,6 +47,7 @@ rustyweb/
 │   │       ├── collections.rs - Collection manifest (collections.json)
 │   │       ├── warc.rs      - WARC record iteration and HTML extraction
 │   │       ├── wacz.rs      - WACZ ZIP handling, datapackage.json, CDX reader
+│   │       ├── thumbnail.rs - Representative-image thumbnails (og:image → cached JPEG)
 │   │       └── http_range.rs - Read+Seek over HTTP range requests (remote streaming)
 │   └── rustyweb-bin/        (thin CLI entry point)
 │       └── src/main.rs      - Clap CLI, subcommand dispatch, tokio::main
@@ -91,6 +92,7 @@ resolves.
 | `GET /collection/{id}` | Collection detail: metadata, a scoped facet overview, and member crawls |
 | `GET /crawl/{id}` | Crawl detail: provenance, file metadata, a scoped facet overview, and seed pages (a crawl is one WACZ) |
 | `GET /api/search?q=...` | Full-text search → JSON (results, `total`, `capped`, `facets`) |
+| `GET /thumb/{id}` | A crawl's cached representative-image thumbnail (small JPEG); 404 when it has none |
 | `GET /files/{id}` | Stream a registered WACZ file with byte-range support |
 | `GET /assets/*` | Embedded site assets (the shared `app.css` stylesheet) |
 | `GET /replay/viewer` | Viewer shell (reads `?source=&url=&ts=&name=&collection=` params) |
@@ -508,6 +510,22 @@ proactive backstop the resolved worker count is clamped to a per-host ceiling
 unbounded number of range requests in flight against a single host. The agent
 is built with `http_status_as_error(false)` so `4xx`/`5xx` come back as
 inspectable responses (status + `Retry-After`) rather than opaque errors.
+
+### Representative-image thumbnails
+
+To make the UI visual, each crawl gets a small representative image on its card
+and detail pages. The source is the crawl's **main-page `og:image`** (the site's
+own social-preview image; `twitter:image` as a fallback) - not a Browsertrix
+screenshot, which this era of crawls (e.g. SUCHO) doesn't capture. After indexing
+a CDX-streamable WACZ, `thumbnail::generate` (best-effort): reads the main page's
+HTML from the WACZ, extracts `og:image`, resolves it against the page URL, looks
+that captured image up in the CDX, range-fetches it, decodes + downscales it (the
+`image` crate; longest edge 400px), and writes `<home>/index/thumbs/<crawl_id>.jpg`.
+Any failure - no main page, no `og:image`, an image that isn't captured or won't
+decode - just means no thumbnail. The server serves it at `GET /thumb/{id}`; when
+a crawl has none, the UI falls back to a **CSS-only placeholder** (a gradient
+tinted by a hash of the name - no image bytes). Thumbnails are generated at index
+time, so populating them needs a (re)index.
 
 ### Progress reporting
 

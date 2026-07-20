@@ -91,6 +91,29 @@ pub struct CollectionCard {
     pub count: usize,
     pub description: Option<String>,
     pub date_range: Option<String>,
+    /// `/thumb/{id}` for a representative member crawl, if any has one.
+    pub thumb: Option<String>,
+}
+
+/// A card/detail representative image. Shows the cached thumbnail if present,
+/// otherwise a CSS placeholder tinted by a hash of `seed` (so cards vary a bit).
+fn thumb_area(thumb: Option<&str>, seed: &str) -> Markup {
+    html! {
+        @match thumb {
+            Some(src) => div.thumb { img src=(src) alt="" loading="lazy"; },
+            None => div.thumb.placeholder style=(placeholder_style(seed)) {},
+        }
+    }
+}
+
+/// A deterministic gradient for a placeholder, its hue derived from `seed` so
+/// each collection/crawl gets a stable, distinct tint.
+fn placeholder_style(seed: &str) -> String {
+    let hue = seed
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32))
+        % 360;
+    format!("background:linear-gradient(135deg,hsl({hue},45%,72%),hsl({hue},38%,55%))")
 }
 
 /// A single browse entry point on the homepage: a label, its count, and the
@@ -186,6 +209,9 @@ pub fn home(cards: &[CollectionCard], browse: &HomeBrowse) -> Markup {
         div.cards {
             @for c in cards {
                 div.card {
+                    a.card-thumb href=(format!("/collection/{}", c.id)) {
+                        (thumb_area(c.thumb.as_deref(), &c.name))
+                    }
                     div.card-header {
                         a.card-title href=(format!("/collection/{}", c.id)) { (c.name) }
                         span.status.muted {
@@ -459,12 +485,14 @@ pub struct MemberItem {
 pub fn collection(
     name: &str,
     description: Option<&str>,
+    thumb: Option<&str>,
     meta: &[MetaRow],
     facets: &[FacetSection],
     members: &[MemberItem],
 ) -> Markup {
     let body = html! {
         (top_bar(None))
+        div.detail-thumb { (thumb_area(thumb, name)) }
         h1 { (name) }
         @if let Some(d) = description { p.desc { (d) } }
         (meta_table(meta))
@@ -504,6 +532,8 @@ pub struct CrawlPage {
     pub crumb: Option<(String, String)>,
     pub name: String,
     pub description: Option<String>,
+    /// `/thumb/{id}` for this crawl's representative image, if it has one.
+    pub thumb: Option<String>,
     pub replay_href: String,
     pub provenance: Vec<MetaRow>,
     pub source: String,
@@ -525,6 +555,7 @@ pub fn crawl(p: &CrawlPage) -> Markup {
         @if let Some((id, cname)) = &p.crumb {
             div.crumb { "in " a href=(format!("/collection/{}", id)) { (cname) } }
         }
+        div.detail-thumb { (thumb_area(p.thumb.as_deref(), &p.name)) }
         h1 { (p.name) }
         @if let Some(d) = &p.description { p.desc { (d) } }
         a.replay-btn href=(p.replay_href) { "Replay →" }
