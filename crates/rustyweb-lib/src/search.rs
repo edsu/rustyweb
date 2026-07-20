@@ -885,7 +885,7 @@ fn domain_of(url: &str) -> String {
 /// correctly (`www.example.co.uk` -> `example.co.uk`, `a.github.io` ->
 /// `a.github.io` since `github.io` is a private suffix). Empty when there's no
 /// host or no registrable domain (e.g. a bare public suffix, `urn:`).
-fn site_of(url: &str) -> String {
+pub(crate) fn site_of(url: &str) -> String {
     url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))

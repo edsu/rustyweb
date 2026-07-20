@@ -263,8 +263,10 @@ result marked "captured N times", and results are paginated. The homepage also
 offers "browse by year" and "top sites" entry points into search.
 
 Crawls carry a representative image, cached as a small thumbnail at index time.
-It's taken from the crawl's home-page `og:image`, or — when the page declares
-none — the largest content image the page embeds (skipping icons/sprites).
+It's taken from the crawl's home-page `og:image`; failing that, the largest
+content image the page embeds; and failing *that* — for JS-rendered sites whose
+saved HTML lists no images — the largest captured image on the crawl's own
+domain (skipping icons/sprites and full-res originals).
 Homepage collection cards and the crawl detail page show one; the collection
 detail page shows a grid of its member crawls, each with its own image —
 conveying that a collection spans multiple crawls of multiple sites. Crawls

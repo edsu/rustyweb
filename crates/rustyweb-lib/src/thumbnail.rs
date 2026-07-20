@@ -21,9 +21,13 @@ use crate::wacz::{self, CdxjRecord};
 
 /// Longest edge of a cached thumbnail, in pixels. Small: these are card images.
 const THUMB_MAX_EDGE: u32 = 400;
-/// Ignore embedded images smaller than this (icons, sprites, tracking pixels)
-/// when falling back to "the largest image on the page".
+/// Ignore images smaller than this (icons, sprites, tracking pixels) when
+/// auto-selecting.
 const MIN_IMAGE_BYTES: u64 = 5_000;
+/// And larger than this: full-res originals are wasteful to fetch + decode for a
+/// 400px thumbnail, and plenty of usable images sit below it. A curator can still
+/// pin a bigger one with `crawl set --image`.
+const MAX_IMAGE_BYTES: u64 = 3_000_000;
 
 /// Path of a crawl's cached thumbnail.
 fn thumb_file(thumbs_dir: &Path, crawl_id: &str) -> PathBuf {
@@ -109,19 +113,43 @@ where
         }
     }
 
-    // 2. Fallback: the largest captured content image the page embeds (byte size
-    //    is a cheap proxy for "real image" vs icon/sprite/tracking pixel).
+    // Useful size window (byte size is a cheap proxy for "real content image"):
+    // above icons/sprites, below full-res originals.
+    let in_window = |rec: &CdxjRecord| (MIN_IMAGE_BYTES..=MAX_IMAGE_BYTES).contains(&rec.length);
+
+    // 2. The largest in-window image the page embeds (works when the site isn't
+    //    JS-rendered, so the saved HTML actually lists its images).
     let mut best: Option<&CdxjRecord> = None;
     for src in embedded.iter().take(120) {
         let Some(abs) = resolve(main_page_url, src) else {
             continue;
         };
         if let Some(rec) = find_image_record(&cdx, &abs) {
-            if rec.length >= MIN_IMAGE_BYTES && best.is_none_or(|b| rec.length > b.length) {
+            if in_window(rec) && best.is_none_or(|b| rec.length > b.length) {
                 best = Some(rec);
             }
         }
     }
+
+    // 3. Still nothing? Many sites are JS-rendered, so the *saved* HTML has no
+    //    og:image and no <img> — but the crawl still captured the images. Pick the
+    //    largest in-window raster image on the crawl's own registrable domain
+    //    (via `site_of`), ignoring third-party/CDN/ad images on other domains.
+    if best.is_none() {
+        let site = crate::search::site_of(main_page_url);
+        if !site.is_empty() {
+            for rec in &cdx {
+                if is_raster_image(rec)
+                    && in_window(rec)
+                    && crate::search::site_of(&rec.url) == site
+                    && best.is_none_or(|b| rec.length > b.length)
+                {
+                    best = Some(rec);
+                }
+            }
+        }
+    }
+
     if let Some(rec) = best {
         if let Some(bytes) = fetch_record_bytes(&fetch, &starts, rec)? {
             write_thumbnail(thumbs_dir, crawl_id, &bytes)?;
@@ -174,12 +202,15 @@ fn candidate_images(html: &[u8]) -> (Option<String>, Vec<String>) {
     (og, imgs)
 }
 
-/// First CDX record for `url` that is a decodable (raster) image.
+/// A captured, decodable (raster) image record — the `image` crate can't decode
+/// SVG, so those are excluded.
+fn is_raster_image(rec: &CdxjRecord) -> bool {
+    rec.length != 0 && rec.mime.contains("image") && !rec.mime.contains("svg")
+}
+
+/// First CDX record for `url` that is a raster image.
 fn find_image_record<'a>(cdx: &'a [CdxjRecord], url: &str) -> Option<&'a CdxjRecord> {
-    cdx.iter().find(|c| {
-        c.url == url && c.length != 0 && c.mime.contains("image") && !c.mime.contains("svg")
-        // the image crate can't decode SVG
-    })
+    cdx.iter().find(|c| c.url == url && is_raster_image(c))
 }
 
 /// Fetch and return the HTTP body of a CDX record's capture.
