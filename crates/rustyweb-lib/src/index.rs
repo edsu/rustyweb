@@ -99,10 +99,9 @@ pub fn index_location(
     // Resolve `--collection NAME` to (id, name); `None` => a singleton per WACZ.
     let group = collection.map(|cn| (crate::collections::slugify(cn), cn.to_string()));
 
-    let mut summaries: Vec<(String, u64)> = Vec::new();
     for source in &sources {
         let c = group.as_ref().map(|(id, n)| (id.as_str(), n.as_str()));
-        summaries.push(index_one(
+        let (wacz_name, pages) = index_one(
             source,
             home,
             &mut manifest,
@@ -112,7 +111,14 @@ pub fn index_location(
             download,
             concurrency,
             progress,
-        )?);
+        )?;
+        // Print the per-WACZ summary as this one finishes, so the next WACZ's bar
+        // doesn't erase the record of it (the line persists above the new bar).
+        // Emitted before the shared final commit; a commit failure below still
+        // surfaces as an error.
+        if let Some(p) = progress {
+            p.wacz_indexed(&wacz_name, pages);
+        }
     }
 
     // The Tantivy commit (segment flush) is the slow tail, especially after fast
@@ -127,12 +133,7 @@ pub fn index_location(
         "committed index"
     );
     manifest.save()?;
-    // Report per-WACZ page counts only now that the index is actually built and
-    // committed - not while it's still being written (or if the commit failed).
     if let Some(p) = progress {
-        for (name, pages) in &summaries {
-            p.wacz_indexed(name, *pages);
-        }
         p.finish();
     }
 
@@ -196,7 +197,6 @@ pub fn reindex(
     let total = targets.len();
     let mut done = 0usize;
     let mut skipped = 0usize;
-    let mut summaries: Vec<(String, u64)> = Vec::new();
     for (source, name, collection_id, collection_name) in &targets {
         // Skip local files that no longer exist rather than failing the run;
         // their manifest entry is preserved (see `rustyweb verify`).
@@ -231,9 +231,14 @@ pub fn reindex(
             concurrency,
             progress,
         ) {
-            Ok(outcome) => {
-                summaries.push(outcome);
+            Ok((wacz_name, pages)) => {
                 done += 1;
+                // Print the per-WACZ summary as each one finishes, so the next
+                // WACZ's progress bar doesn't erase the record of it (the line
+                // persists above the new bar).
+                if let Some(p) = progress {
+                    p.wacz_indexed(&wacz_name, pages);
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -249,12 +254,7 @@ pub fn reindex(
     // committed and saved, so it's usable even if some sources were skipped.
     search.into_inner().unwrap().commit()?;
     manifest.save()?;
-    // Report per-WACZ page counts (and clear the bar) now that the index is
-    // committed - mirrors `index_location`.
     if let Some(p) = progress {
-        for (name, pages) in &summaries {
-            p.wacz_indexed(name, *pages);
-        }
         p.finish();
     }
     if skipped > 0 {
@@ -737,9 +737,9 @@ struct CrawlStats {
 /// text and falls back to scraped HTML; the title comes from the HTML.
 fn index_wacz(
     wacz_path: &Path,
-    // WACZ id/name (tagged on each page as collection_id/collection_name).
-    collection_id: &str,
-    collection_name: &str,
+    // WACZ id/name (tagged on each page as crawl_id/crawl_name).
+    crawl_id: &str,
+    crawl_name: &str,
     // Curated collection id (slug) the WACZ belongs to.
     collection: &str,
     search: &Mutex<SearchIndex>,
@@ -787,8 +787,8 @@ fn index_wacz(
     index_merged(
         raws,
         warcinfo,
-        collection_id,
-        collection_name,
+        crawl_id,
+        crawl_name,
         collection,
         search,
         &wacz_path.display().to_string(),
@@ -802,8 +802,8 @@ fn index_wacz(
 #[allow(clippy::too_many_arguments)]
 fn index_wacz_streaming<F>(
     fetch: F,
-    collection_id: &str,
-    collection_name: &str,
+    crawl_id: &str,
+    crawl_name: &str,
     collection: &str,
     search: &Mutex<SearchIndex>,
     label: &str,
@@ -815,13 +815,7 @@ where
 {
     let (raws, warcinfo) = collect_page_records_via_cdx(fetch, concurrency, progress)?;
     index_merged(
-        raws,
-        warcinfo,
-        collection_id,
-        collection_name,
-        collection,
-        search,
-        label,
+        raws, warcinfo, crawl_id, crawl_name, collection, search, label,
     )
 }
 
@@ -831,8 +825,8 @@ where
 fn index_merged(
     raws: Vec<RawRecord>,
     warcinfo: Option<Warcinfo>,
-    collection_id: &str,
-    collection_name: &str,
+    crawl_id: &str,
+    crawl_name: &str,
     collection: &str,
     search: &Mutex<SearchIndex>,
     label: &str,
@@ -947,8 +941,8 @@ fn index_merged(
                 lang: &lang,
                 status: m.status,
                 modified_year: m.modified_year,
-                collection_id,
-                collection_name,
+                crawl_id,
+                crawl_name,
                 collection,
             })?;
             count += 1;
@@ -1737,7 +1731,7 @@ mod tests {
                 .unwrap();
         let results = idx.search("example", 10).unwrap();
         assert!(!results.is_empty(), "should find HTML content from WACZ");
-        assert_eq!(results[0].collection_name, "simple");
+        assert_eq!(results[0].crawl_name, "simple");
     }
 
     #[test]

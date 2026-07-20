@@ -288,7 +288,7 @@ async fn search_page(
             let is_collection = r.doc_type == "collection";
             let title = if r.title.is_empty() {
                 if is_collection {
-                    r.collection_name.clone()
+                    r.crawl_name.clone()
                 } else {
                     r.url.clone()
                 }
@@ -304,8 +304,8 @@ async fn search_page(
                 .unwrap_or(&r.collection)
                 .to_string();
             let coll_href = url_encode(&r.collection);
-            let name_enc = url_encode(&r.collection_name);
-            let source_enc = url_encode(&source_for(&r.collection_id));
+            let name_enc = url_encode(&r.crawl_name);
+            let source_enc = url_encode(&source_for(&r.crawl_id));
             // Carry the collection breadcrumb (name + id) into the replay viewer.
             let coll_q = format!(
                 "&collection={}&collection_id={coll_href}",
@@ -370,12 +370,27 @@ async fn search_page(
     // to page 1.
     let filters = active_filters(&q);
     let search_href = |new_q: &str| format!("/search?q={}", url_encode(new_q));
+    // The `crawl:` filter's value is an opaque WACZ id (from a crawl-page facet
+    // link); show the crawl's name in the chip instead. Other filters show their
+    // value as-is. The removal token still uses the raw id.
+    let manifest = Manifest::open(&state.index_dir).ok();
     let active: Vec<views::ActiveFilter> = filters
         .iter()
-        .map(|(f, v)| views::ActiveFilter {
-            label: crate::search::filter_label(f).to_string(),
-            value: v.clone(),
-            remove_href: search_href(&query_without_filter(&q, f, v)),
+        .map(|(f, v)| {
+            let display = if f == "crawl" {
+                manifest
+                    .as_ref()
+                    .and_then(|m| m.wacz_by_id(v))
+                    .map(|w| w.name.clone())
+                    .unwrap_or_else(|| v.clone())
+            } else {
+                v.clone()
+            };
+            views::ActiveFilter {
+                label: crate::search::filter_label(f).to_string(),
+                value: display,
+                remove_href: search_href(&query_without_filter(&q, f, v)),
+            }
         })
         .collect();
     let groups: Vec<views::FacetGroupView> = response
@@ -638,6 +653,13 @@ async fn crawl_page(
             .unwrap_or(&c.date_indexed)
             .to_string(),
         present: c.is_present(&state.home),
+        facets: scoped_facet_sections(
+            &state
+                .search
+                .facet_overview_scoped(crate::search::FacetScope::Crawl(&id))
+                .unwrap_or_default(),
+            &format!("crawl:{id}"),
+        ),
         pages,
     };
 
@@ -770,8 +792,8 @@ async fn search_api(
                     "domain": r.domain,
                     "timestamp": r.timestamp,
                     "title": r.title,
-                    "collection_id": r.collection_id,
-                    "collection_name": r.collection_name,
+                    "crawl_id": r.crawl_id,
+                    "crawl_name": r.crawl_name,
                     "collection": r.collection,
                     "snippet": r.snippet,
                     "capture_count": r.capture_count,
