@@ -56,7 +56,7 @@ pub fn router(home: &Path) -> Result<Router> {
         .route("/", get(homepage))
         .route("/search", get(search_page))
         .route("/collection/{id}", get(collection_page))
-        .route("/wacz/{id}", get(wacz_page))
+        .route("/crawl/{id}", get(crawl_page))
         .route("/files/{id}", get(serve_file))
         .route("/replay/viewer", get(replay_viewer))
         .route("/api/search", get(search_api))
@@ -462,7 +462,7 @@ async fn collection_page(
     if let Some(cur) = &c.curator {
         meta.push(views::MetaRow::new("Curator", cur.clone()));
     }
-    meta.push(views::MetaRow::new("WACZs", members.len().to_string()));
+    meta.push(views::MetaRow::new("Crawls", members.len().to_string()));
     meta.push(views::MetaRow::new("Size", human_size(total_size)));
     if !software.is_empty() {
         meta.push(views::MetaRow::new("Software", software.join(", ")));
@@ -486,7 +486,7 @@ async fn collection_page(
     views::collection(&c.name, c.description.as_deref(), &meta, &member_items).into_response()
 }
 
-async fn wacz_page(
+async fn crawl_page(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
@@ -495,7 +495,7 @@ async fn wacz_page(
         Err(e) => return error_response(e).into_response(),
     };
     let Some(c) = manifest.wacz_by_id(&id) else {
-        return (StatusCode::NOT_FOUND, "WACZ not found").into_response();
+        return (StatusCode::NOT_FOUND, "Crawl not found").into_response();
     };
 
     let source_enc = url_encode(&viewer_source(c));
@@ -537,7 +537,7 @@ async fn wacz_page(
         })
         .collect();
 
-    // Provenance panel: how this WACZ was produced. Only rows with data show.
+    // Provenance panel: how this crawl was produced. Only rows with data show.
     let mut provenance = Vec::new();
     if !c.software.is_empty() {
         provenance.push(views::MetaRow::new("Software", c.software.join(", ")));
@@ -558,7 +558,7 @@ async fn wacz_page(
         provenance.push(views::MetaRow::new("Capture dates", range));
     }
 
-    let page = views::WaczPage {
+    let page = views::CrawlPage {
         crumb,
         name: c.name.clone(),
         description: c.description.clone(),
@@ -581,7 +581,7 @@ async fn wacz_page(
         pages,
     };
 
-    views::wacz(&page).into_response()
+    views::crawl(&page).into_response()
 }
 
 /// Format a byte count as a short human-readable size.
