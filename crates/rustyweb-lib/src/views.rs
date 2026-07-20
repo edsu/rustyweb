@@ -513,6 +513,8 @@ pub struct CrawlPage {
     pub crawled: Option<String>,
     pub indexed: String,
     pub present: bool,
+    /// Scoped facet overview of what this crawl captured (sites/years/types/…).
+    pub facets: Vec<FacetSection>,
     pub pages: Vec<PageItem>,
 }
 
@@ -546,6 +548,8 @@ pub fn crawl(p: &CrawlPage) -> Markup {
                 }
             }
         }
+
+        (facet_browse(&p.facets))
 
         h2 { "Pages" }
         @if p.pages.is_empty() {

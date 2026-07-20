@@ -89,7 +89,7 @@ resolves.
 | `GET /` | Homepage: search box, browse-by-facet entry points, and the collection overview |
 | `GET /search?q=...&page=N` | Server-rendered results with a facet sidebar, month timeline, snippets, and pagination |
 | `GET /collection/{id}` | Collection detail: metadata, a scoped facet overview, and member crawls |
-| `GET /crawl/{id}` | Crawl detail: provenance panel, file metadata, seed pages (a crawl is one WACZ) |
+| `GET /crawl/{id}` | Crawl detail: provenance, file metadata, a scoped facet overview, and seed pages (a crawl is one WACZ) |
 | `GET /api/search?q=...` | Full-text search → JSON (results, `total`, `capped`, `facets`) |
 | `GET /files/{id}` | Stream a registered WACZ file with byte-range support |
 | `GET /assets/*` | Embedded site assets (the shared `app.css` stylesheet) |
@@ -138,8 +138,10 @@ discovery* below). `SearchIndex::search` is a thin wrapper returning just the hi
 `SearchIndex::facet_overview()` runs only the aggregation over a match-all query (the
 homepage browse entry points); `facet_overview_scoped(FacetScope)` does the same restricted
 to one collection (`collection`) or crawl (`collection_id`) — this backs the **scoped facet
-overview on the collection detail page**, where each value (top sites, years, types,
-languages) links into a search already scoped to that collection.
+overview on the collection and crawl detail pages**, where each value (top sites, years,
+types, languages) links into a search already scoped to that collection or crawl. The
+crawl-scoped links use a `collection_id:<id>` filter; since that id is opaque, the search
+page resolves it to the crawl's name for the active-filter chip.
 
 Queries go through Tantivy's `QueryParser`, configured in `search_faceted`:
 

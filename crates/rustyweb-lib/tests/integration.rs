@@ -519,6 +519,37 @@ async fn collection_page_shows_scoped_facets() {
 }
 
 #[tokio::test]
+async fn crawl_page_shows_scoped_facets() {
+    // The crawl detail page carries the same scoped facet overview as a
+    // collection, scoped to the single crawl (`collection_id:<id>`).
+    let tmp = make_index(&["a.wacz"]);
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let id = manifest.waczs[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/crawl/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(
+        html.contains("Top sites") || html.contains("By year"),
+        "crawl page should show a scoped facet overview"
+    );
+    assert!(
+        html.contains(&format!("collection_id%3A{id}")),
+        "crawl facet links should scope the search to this crawl"
+    );
+}
+
+#[tokio::test]
 async fn collection_page_unknown_id_404() {
     let tmp = TempDir::new().unwrap();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
