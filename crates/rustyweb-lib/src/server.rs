@@ -500,6 +500,7 @@ async fn collection_page(
             name: w.name.clone(),
             present: w.is_present(&state.home),
             provenance: provenance_summary(w),
+            thumb: thumb_href(&state.index_dir, &w.id),
         })
         .collect();
 
@@ -511,15 +512,9 @@ async fn collection_page(
         .unwrap_or_default();
     let facets = scoped_facet_sections(&overview, &format!("collection:{id}"));
 
-    // Representative image: the first member crawl that has a cached thumbnail.
-    let thumb = members
-        .iter()
-        .find_map(|w| thumb_href(&state.index_dir, &w.id));
-
     views::collection(
         &c.name,
         c.description.as_deref(),
-        thumb.as_deref(),
         &meta,
         &facets,
         &member_items,

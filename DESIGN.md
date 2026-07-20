@@ -522,10 +522,13 @@ HTML from the WACZ, extracts `og:image`, resolves it against the page URL, looks
 that captured image up in the CDX, range-fetches it, decodes + downscales it (the
 `image` crate; longest edge 400px), and writes `<home>/index/thumbs/<crawl_id>.jpg`.
 Any failure - no main page, no `og:image`, an image that isn't captured or won't
-decode - just means no thumbnail. The server serves it at `GET /thumb/{id}`; when
-a crawl has none, the UI falls back to a **CSS-only placeholder** (a gradient
-tinted by a hash of the name - no image bytes). Thumbnails are generated at index
-time, so populating them needs a (re)index.
+decode - just means no thumbnail. The server serves it at `GET /thumb/{id}`. The homepage collection card and the
+crawl detail page each show one image; the **collection detail page shows a grid
+of its member crawls**, each with its own thumbnail, so the page conveys that a
+collection spans multiple crawls of multiple sites. When a crawl has no image the
+UI falls back to a **CSS-only placeholder** (a gradient tinted by a hash of the
+name - no image bytes). Thumbnails are generated at index time, so populating
+them needs a (re)index.
 
 ### Progress reporting
 

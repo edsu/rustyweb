@@ -262,9 +262,11 @@ filter to that month. Repeat captures of the same URL collapse into a single
 result marked "captured N times", and results are paginated. The homepage also
 offers "browse by year" and "top sites" entry points into search.
 
-Collection cards and the collection/crawl detail pages show a representative
-image, taken from the crawl's home-page `og:image` (cached as a small thumbnail
-at index time). Crawls without one fall back to a simple CSS placeholder.
+Crawls carry a representative image, taken from the crawl's home-page `og:image`
+(cached as a small thumbnail at index time). Homepage collection cards and the
+crawl detail page show one; the collection detail page shows a grid of its member
+crawls, each with its own image — conveying that a collection spans multiple
+crawls of multiple sites. Crawls without an image fall back to a CSS placeholder.
 
 ## Command line
 

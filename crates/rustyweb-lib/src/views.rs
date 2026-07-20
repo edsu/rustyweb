@@ -472,27 +472,30 @@ fn meta_table(rows: &[MetaRow]) -> Markup {
 
 // ── Collection detail ────────────────────────────────────────────────────────
 
-/// A member crawl (WACZ) as shown in a collection's list.
+/// A member crawl (WACZ) as shown in a collection's grid.
 pub struct MemberItem {
     pub id: String,
     pub name: String,
     pub present: bool,
     /// One-line provenance summary (plain text), if any is known.
     pub provenance: Option<String>,
+    /// `/thumb/{id}` for this crawl's representative image, if it has one.
+    pub thumb: Option<String>,
 }
 
-/// The collection detail page: metadata table plus its list of member crawls.
+/// The collection detail page: metadata + facets, then a grid of the member
+/// crawls, each with its own representative image (a collection spans multiple
+/// crawls of multiple sites, so the grid conveys that breadth better than one
+/// hero image would).
 pub fn collection(
     name: &str,
     description: Option<&str>,
-    thumb: Option<&str>,
     meta: &[MetaRow],
     facets: &[FacetSection],
     members: &[MemberItem],
 ) -> Markup {
     let body = html! {
         (top_bar(None))
-        div.detail-thumb { (thumb_area(thumb, name)) }
         h1 { (name) }
         @if let Some(d) = description { p.desc { (d) } }
         (meta_table(meta))
@@ -501,12 +504,20 @@ pub fn collection(
         @if members.is_empty() {
             p.muted { "No crawls in this collection." }
         } @else {
-            ul.pages {
+            div.cards {
                 @for m in members {
-                    li {
-                        a href=(format!("/crawl/{}", m.id)) { (m.name) }
-                        " "
-                        @if m.present { span.ok { "✓" } } @else { span.missing { "✗" } }
+                    div.card {
+                        a.card-thumb href=(format!("/crawl/{}", m.id)) {
+                            (thumb_area(m.thumb.as_deref(), &m.name))
+                        }
+                        div.card-header {
+                            a.card-title href=(format!("/crawl/{}", m.id)) { (m.name) }
+                            @if m.present {
+                                span.status.ok { "✓" }
+                            } @else {
+                                span.status.missing { "✗" }
+                            }
+                        }
                         @if let Some(p) = &m.provenance { div.prov { (p) } }
                     }
                 }
