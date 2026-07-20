@@ -57,6 +57,7 @@ pub fn router(home: &Path) -> Result<Router> {
         .route("/search", get(search_page))
         .route("/collection/{id}", get(collection_page))
         .route("/crawl/{id}", get(crawl_page))
+        .route("/thumb/{id}", get(thumb_handler))
         .route("/files/{id}", get(serve_file))
         .route("/replay/viewer", get(replay_viewer))
         .route("/api/search", get(search_api))
@@ -136,6 +137,10 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 // Capture date range (temporal span is meaningful at the
                 // collection level; per-tool software lives on the WACZ page).
                 date_range: members_capture_range(&members),
+                // Representative image: the first member crawl that has one.
+                thumb: members
+                    .iter()
+                    .find_map(|w| thumb_href(&state.index_dir, &w.id)),
             }
         })
         .collect();
@@ -495,6 +500,7 @@ async fn collection_page(
             name: w.name.clone(),
             present: w.is_present(&state.home),
             provenance: provenance_summary(w),
+            thumb: thumb_href(&state.index_dir, &w.id),
         })
         .collect();
 
@@ -637,6 +643,7 @@ async fn crawl_page(
         crumb,
         name: c.name.clone(),
         description: c.description.clone(),
+        thumb: thumb_href(&state.index_dir, &id),
         replay_href,
         provenance,
         source: c.source.location(),
@@ -836,6 +843,43 @@ async fn asset_handler(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     serve_embedded_asset(SiteAssets::get(&path), &path, &headers)
+}
+
+/// The path to a crawl's cached thumbnail, if one was generated at index time.
+fn thumb_path(index_dir: &Path, crawl_id: &str) -> PathBuf {
+    index_dir.join("thumbs").join(format!("{crawl_id}.jpg"))
+}
+
+/// The `/thumb/{id}` href for a crawl, or `None` if it has no cached thumbnail
+/// (the UI then shows a CSS placeholder). `id` is a crawl id.
+fn thumb_href(index_dir: &Path, crawl_id: &str) -> Option<String> {
+    thumb_path(index_dir, crawl_id)
+        .exists()
+        .then(|| format!("/thumb/{crawl_id}"))
+}
+
+/// Serve a crawl's cached representative thumbnail (a small JPEG under
+/// `<home>/index/thumbs`). 404 when the crawl has none.
+async fn thumb_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // Crawl ids are hex hashes; reject anything else so the id can't escape the
+    // thumbs directory.
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match std::fs::read(thumb_path(&state.index_dir, &id)) {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "image/jpeg"),
+                (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Serve an embedded ReplayWebPage asset with an ETag derived from its content

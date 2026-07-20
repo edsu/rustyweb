@@ -289,6 +289,23 @@ pub fn set_collection(
     Ok(id)
 }
 
+/// Pin a curator-supplied local image as a crawl's representative thumbnail.
+/// Downscales + caches it and marks it pinned, so a later (re)index won't
+/// overwrite the choice. Manifest-only side effect (no reindex).
+pub fn set_crawl_thumbnail(home: &Path, crawl_id: &str, image_file: &Path) -> Result<()> {
+    let index_dir = index_dir(home);
+    let manifest = Manifest::open(&index_dir)?;
+    if manifest.wacz_by_id(crawl_id).is_none() {
+        anyhow::bail!(
+            "no crawl with id \"{crawl_id}\" - it's the id in the crawl's page URL (/crawl/<id>)"
+        );
+    }
+    crate::thumbnail::set_manual(&index_dir.join("thumbs"), crawl_id, image_file)
+        .with_context(|| format!("setting thumbnail for crawl {crawl_id}"))?;
+    info!(crawl = %crawl_id, image = %image_file.display(), "pinned crawl thumbnail");
+    Ok(())
+}
+
 /// Turn one `index` argument into a source to index. An `http(s)://` URL yields
 /// a URL source. Otherwise the argument must be a `.wacz` file that already lives
 /// under `<home>/archive` - rustyweb keeps local archives there so the home
@@ -454,12 +471,19 @@ fn index_one(
             "capping fetch concurrency to the per-host ceiling"
         );
     }
+    // The crawl's representative-image source: the declared main page, else the
+    // first seed page. Used after indexing to cache a thumbnail (best-effort).
+    let main_page_url = meta
+        .main_page_url
+        .clone()
+        .or_else(|| meta.seed_pages.first().map(|s| s.url.clone()));
+    let thumbs_dir = index_dir(home).join("thumbs");
     let stats = match &remote_url {
         Some(u) => {
             info!(url = %u, "streaming remote WACZ index (no download)");
             let fetch = crate::http_range::HttpFetch::open(u)?;
-            index_wacz_streaming(
-                fetch,
+            let stats = index_wacz_streaming(
+                fetch.clone(),
                 &id,
                 &display_name,
                 &collection_id,
@@ -467,7 +491,9 @@ fn index_one(
                 u,
                 workers,
                 progress,
-            )?
+            )?;
+            cache_thumbnail(fetch, &thumbs_dir, &id, main_page_url.as_deref());
+            stats
         }
         None => {
             let p = local.as_ref().unwrap();
@@ -477,8 +503,8 @@ fn index_one(
             if local_warcs_streamable(p).unwrap_or(false) {
                 let fetch = crate::http_range::FileFetch::open(p)
                     .with_context(|| format!("opening {} for CDX-guided index", p.display()))?;
-                index_wacz_streaming(
-                    fetch,
+                let stats = index_wacz_streaming(
+                    fetch.clone(),
                     &id,
                     &display_name,
                     &collection_id,
@@ -486,7 +512,9 @@ fn index_one(
                     &p.display().to_string(),
                     workers,
                     progress,
-                )?
+                )?;
+                cache_thumbnail(fetch, &thumbs_dir, &id, main_page_url.as_deref());
+                stats
             } else {
                 // The scan path has no cheap up-front record total, so it stays on
                 // the spinner (no determinate bar). Label it "scanning" - it reads
@@ -1115,6 +1143,23 @@ where
     Ok((out, warcinfo))
 }
 
+/// Cache a representative thumbnail for a crawl (best-effort). Any failure - no
+/// main page, no `og:image`, or an image we can't fetch/decode - is logged at
+/// debug and ignored; the UI falls back to a CSS placeholder.
+fn cache_thumbnail<F>(fetch: F, thumbs_dir: &Path, crawl_id: &str, main_page_url: Option<&str>)
+where
+    F: crate::http_range::RangeFetch + Clone + Send + Sync,
+{
+    let Some(url) = main_page_url else {
+        return;
+    };
+    match crate::thumbnail::generate(fetch, thumbs_dir, crawl_id, url) {
+        Ok(true) => debug!(crawl_id, "cached representative thumbnail"),
+        Ok(false) => {}
+        Err(e) => debug!(crawl_id, "thumbnail generation failed: {e:#}"),
+    }
+}
+
 /// Per-host ceiling on fetch concurrency. Even when a user asks for more (or the
 /// local core count is very high), we never run more than this many concurrent
 /// range requests against a single WACZ's host — a proactive politeness cap that
@@ -1701,6 +1746,335 @@ mod tests {
         assert!(
             !idx.search("Home Page", 10).unwrap().is_empty(),
             "the HTML <title> is still indexed"
+        );
+    }
+
+    #[test]
+    fn og_image_thumbnail_is_cached() {
+        use std::io::Write;
+        // End-to-end: a crawl whose main page declares an og:image pointing at a
+        // captured PNG should get a downscaled JPEG thumbnail cached under
+        // <home>/index/thumbs.
+        let page_url = "https://ex.com/";
+        let img_url = "https://ex.com/preview.png";
+
+        // The captured og:image (a small PNG).
+        let mut png_buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            24,
+            16,
+            image::Rgb([210, 90, 70]),
+        ))
+        .write_to(&mut png_buf, image::ImageFormat::Png)
+        .unwrap();
+        let png = png_buf.into_inner();
+
+        let html = format!(
+            "<html><head><title>Home</title>\
+             <meta property=\"og:image\" content=\"{img_url}\"></head><body>hi</body></html>"
+        );
+
+        // One WARC response record, gzipped as a single member.
+        let gz_record = |url: &str, ctype: &str, body: &[u8]| {
+            let mut http = format!("HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n\r\n").into_bytes();
+            http.extend_from_slice(body);
+            let mut warc = format!(
+                "WARC/1.0\r\nWARC-Type: response\r\nWARC-Target-URI: {url}\r\n\
+                 WARC-Date: 2022-01-01T00:00:00Z\r\n\
+                 Content-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
+                http.len()
+            )
+            .into_bytes();
+            warc.extend_from_slice(&http);
+            warc.extend_from_slice(b"\r\n\r\n");
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&warc).unwrap();
+            e.finish().unwrap()
+        };
+        let html_member = gz_record(page_url, "text/html", html.as_bytes());
+        let png_member = gz_record(img_url, "image/png", &png);
+        let mut warc_gz = html_member.clone();
+        warc_gz.extend_from_slice(&png_member);
+
+        let gz = |b: &[u8]| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+        // CDX: HTML at offset 0, the PNG right after it.
+        let cdx = format!(
+            "com,ex)/ 20220101000000 {{\"url\":\"{page_url}\",\"mime\":\"text/html\",\
+             \"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":0,\"length\":{}}}\n\
+             com,ex)/preview.png 20220101000000 {{\"url\":\"{img_url}\",\"mime\":\"image/png\",\
+             \"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{},\"length\":{}}}\n",
+            html_member.len(),
+            html_member.len(),
+            png_member.len()
+        );
+        let cdx_gz = gz(cdx.as_bytes());
+        let datapackage = format!("{{\"mainPageUrl\":\"{page_url}\"}}");
+
+        let mut wacz = Vec::new();
+        {
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let opt = zip::write::SimpleFileOptions::default();
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut wacz));
+            zw.start_file("archive/data.warc.gz", stored).unwrap();
+            zw.write_all(&warc_gz).unwrap();
+            zw.start_file("indexes/index.cdx.gz", opt).unwrap();
+            zw.write_all(&cdx_gz).unwrap();
+            zw.start_file("datapackage.json", opt).unwrap();
+            zw.write_all(datapackage.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let path = archive.join("crawl.wacz");
+        std::fs::write(&path, &wacz).unwrap();
+        index_path(&path, tmp.path(), None).unwrap();
+
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let id = &manifest.waczs[0].id;
+        let thumb = tmp
+            .path()
+            .join("index")
+            .join("thumbs")
+            .join(format!("{id}.jpg"));
+        assert!(
+            thumb.exists(),
+            "a crawl with an og:image should get a cached thumbnail"
+        );
+        let decoded = image::load_from_memory(&std::fs::read(&thumb).unwrap()).unwrap();
+        assert!(
+            decoded.width() <= 400 && decoded.height() <= 400,
+            "thumbnail should be downscaled"
+        );
+    }
+
+    #[test]
+    fn thumbnail_falls_back_to_largest_page_image() {
+        use std::io::Write;
+        // The main page has NO og:image but embeds two images (a tiny icon and a
+        // larger hero). The thumbnail should fall back to the largest captured
+        // content image, skipping the sub-threshold icon.
+        let page_url = "https://ex.com/";
+
+        // A "noisy" hero PNG (poor compression → well over the 5 KB floor) and a
+        // tiny icon (under it, so it's skipped).
+        let png = |w: u32, h: u32, noisy: bool| {
+            let mut im = image::RgbImage::new(w, h);
+            // Pseudo-random (incompressible) pixels so the PNG stays large; a solid
+            // fill for the tiny icon so it compresses well below the floor.
+            let mut st: u32 = 0x1234_5678;
+            for (_, _, p) in im.enumerate_pixels_mut() {
+                if noisy {
+                    st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let b = st.to_le_bytes();
+                    *p = image::Rgb([b[0], b[1], b[2]]);
+                } else {
+                    *p = image::Rgb([200, 200, 200]);
+                }
+            }
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(im)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .unwrap();
+            buf.into_inner()
+        };
+        let hero = png(160, 160, true);
+        let icon = png(8, 8, false);
+        assert!(
+            hero.len() >= 5000 && icon.len() < 5000,
+            "test image sizes bracket the floor"
+        );
+
+        let html = "<html><head><title>Home</title></head><body>\
+             <img src=\"icon.png\"><img src=\"hero.png\"></body></html>";
+
+        let gz_record = |url: &str, ctype: &str, body: &[u8]| {
+            let mut http = format!("HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n\r\n").into_bytes();
+            http.extend_from_slice(body);
+            let mut warc = format!(
+                "WARC/1.0\r\nWARC-Type: response\r\nWARC-Target-URI: {url}\r\n\
+                 WARC-Date: 2023-01-01T00:00:00Z\r\n\
+                 Content-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
+                http.len()
+            )
+            .into_bytes();
+            warc.extend_from_slice(&http);
+            warc.extend_from_slice(b"\r\n\r\n");
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&warc).unwrap();
+            e.finish().unwrap()
+        };
+        let m_html = gz_record(page_url, "text/html", html.as_bytes());
+        let m_icon = gz_record("https://ex.com/icon.png", "image/png", &icon);
+        let m_hero = gz_record("https://ex.com/hero.png", "image/png", &hero);
+        let mut warc_gz = m_html.clone();
+        warc_gz.extend_from_slice(&m_icon);
+        warc_gz.extend_from_slice(&m_hero);
+
+        let gz = |b: &[u8]| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+        let (o_html, o_icon) = (0, m_html.len());
+        let o_hero = m_html.len() + m_icon.len();
+        let cdx = format!(
+            "com,ex)/ 20230101000000 {{\"url\":\"{page_url}\",\"mime\":\"text/html\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{o_html},\"length\":{}}}\n\
+             com,ex)/icon.png 20230101000000 {{\"url\":\"https://ex.com/icon.png\",\"mime\":\"image/png\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{o_icon},\"length\":{}}}\n\
+             com,ex)/hero.png 20230101000000 {{\"url\":\"https://ex.com/hero.png\",\"mime\":\"image/png\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{o_hero},\"length\":{}}}\n",
+            m_html.len(), m_icon.len(), m_hero.len()
+        );
+        let cdx_gz = gz(cdx.as_bytes());
+        let datapackage = format!("{{\"mainPageUrl\":\"{page_url}\"}}");
+
+        let mut wacz = Vec::new();
+        {
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let opt = zip::write::SimpleFileOptions::default();
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut wacz));
+            zw.start_file("archive/data.warc.gz", stored).unwrap();
+            zw.write_all(&warc_gz).unwrap();
+            zw.start_file("indexes/index.cdx.gz", opt).unwrap();
+            zw.write_all(&cdx_gz).unwrap();
+            zw.start_file("datapackage.json", opt).unwrap();
+            zw.write_all(datapackage.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let path = archive.join("crawl.wacz");
+        std::fs::write(&path, &wacz).unwrap();
+        index_path(&path, tmp.path(), None).unwrap();
+
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let id = &manifest.waczs[0].id;
+        let thumb = tmp
+            .path()
+            .join("index")
+            .join("thumbs")
+            .join(format!("{id}.jpg"));
+        assert!(
+            thumb.exists(),
+            "with no og:image, a thumbnail should be generated from the largest embedded image"
+        );
+    }
+
+    #[test]
+    fn thumbnail_falls_back_to_largest_on_site_captured_image() {
+        use std::io::Write;
+        // A JS-rendered site: the saved HTML has NO og:image and NO <img>, but the
+        // crawl captured images. The thumbnail should come from the largest
+        // in-window raster image ON THE CRAWL'S OWN DOMAIN — a bigger off-domain
+        // (CDN/ad) image must be ignored.
+        let page_url = "https://ex.com/";
+
+        // Distinct aspect ratios so we can tell which image was chosen: the on-site
+        // one is landscape, the (larger, must-ignore) off-site one is portrait.
+        let png = |w: u32, h: u32| {
+            let mut im = image::RgbImage::new(w, h);
+            let mut st: u32 = 0x9e37_79b9;
+            for (_, _, p) in im.enumerate_pixels_mut() {
+                st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let b = st.to_le_bytes();
+                *p = image::Rgb([b[0], b[1], b[2]]);
+            }
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(im)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .unwrap();
+            buf.into_inner()
+        };
+        let onsite = png(240, 120); // landscape (w > h)
+        let offsite = png(160, 320); // portrait, larger byte size
+        assert!(offsite.len() > onsite.len() && onsite.len() >= 5000);
+
+        let html = "<html><head><title>Home</title></head><body>no images here</body></html>";
+
+        let gz_record = |url: &str, ctype: &str, body: &[u8]| {
+            let mut http = format!("HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n\r\n").into_bytes();
+            http.extend_from_slice(body);
+            let mut warc = format!(
+                "WARC/1.0\r\nWARC-Type: response\r\nWARC-Target-URI: {url}\r\n\
+                 WARC-Date: 2023-01-01T00:00:00Z\r\n\
+                 Content-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
+                http.len()
+            )
+            .into_bytes();
+            warc.extend_from_slice(&http);
+            warc.extend_from_slice(b"\r\n\r\n");
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&warc).unwrap();
+            e.finish().unwrap()
+        };
+        let m_html = gz_record(page_url, "text/html", html.as_bytes());
+        let m_on = gz_record("https://ex.com/photo.jpg", "image/jpeg", &onsite);
+        let m_off = gz_record("https://cdn.other.com/ad.jpg", "image/jpeg", &offsite);
+        let mut warc_gz = m_html.clone();
+        warc_gz.extend_from_slice(&m_on);
+        warc_gz.extend_from_slice(&m_off);
+
+        let gz = |b: &[u8]| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+        let o_on = m_html.len();
+        let o_off = m_html.len() + m_on.len();
+        let cdx = format!(
+            "com,ex)/ 20230101000000 {{\"url\":\"{page_url}\",\"mime\":\"text/html\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":0,\"length\":{}}}\n\
+             com,ex)/photo.jpg 20230101000000 {{\"url\":\"https://ex.com/photo.jpg\",\"mime\":\"image/jpeg\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{o_on},\"length\":{}}}\n\
+             com,other,cdn)/ad.jpg 20230101000000 {{\"url\":\"https://cdn.other.com/ad.jpg\",\"mime\":\"image/jpeg\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{o_off},\"length\":{}}}\n",
+            m_html.len(), m_on.len(), m_off.len()
+        );
+        let cdx_gz = gz(cdx.as_bytes());
+        let datapackage = format!("{{\"mainPageUrl\":\"{page_url}\"}}");
+
+        let mut wacz = Vec::new();
+        {
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let opt = zip::write::SimpleFileOptions::default();
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut wacz));
+            zw.start_file("archive/data.warc.gz", stored).unwrap();
+            zw.write_all(&warc_gz).unwrap();
+            zw.start_file("indexes/index.cdx.gz", opt).unwrap();
+            zw.write_all(&cdx_gz).unwrap();
+            zw.start_file("datapackage.json", opt).unwrap();
+            zw.write_all(datapackage.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let path = archive.join("crawl.wacz");
+        std::fs::write(&path, &wacz).unwrap();
+        index_path(&path, tmp.path(), None).unwrap();
+
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let id = &manifest.waczs[0].id;
+        let thumb = tmp
+            .path()
+            .join("index")
+            .join("thumbs")
+            .join(format!("{id}.jpg"));
+        assert!(
+            thumb.exists(),
+            "a JS-rendered crawl should still get a thumbnail from a captured on-site image"
+        );
+        let decoded = image::load_from_memory(&std::fs::read(&thumb).unwrap()).unwrap();
+        assert!(
+            decoded.width() > decoded.height(),
+            "the on-site landscape image should be chosen, not the larger off-site portrait one"
         );
     }
 

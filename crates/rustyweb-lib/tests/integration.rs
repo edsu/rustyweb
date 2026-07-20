@@ -562,6 +562,40 @@ async fn collection_page_unknown_id_404() {
 }
 
 #[tokio::test]
+async fn thumb_route_unknown_id_404() {
+    let tmp = TempDir::new().unwrap();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    let resp = app
+        .oneshot(Request::get("/thumb/deadbeef").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn collection_card_shows_placeholder_without_image() {
+    // simple.wacz deflates its WARCs (scan path), so no thumbnail is generated —
+    // the card should render the image area as a CSS placeholder, not an <img>.
+    let tmp = make_index(&["simple.wacz"]);
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    let resp = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("card-thumb"),
+        "card should have an image area"
+    );
+    assert!(
+        html.contains("thumb placeholder"),
+        "no thumbnail should fall back to a CSS placeholder"
+    );
+}
+
+#[tokio::test]
 async fn home_directory_is_portable() {
     use rustyweb_lib::collections::{Manifest, Source};
 

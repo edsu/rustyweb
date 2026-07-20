@@ -27,6 +27,9 @@ zip = "8"
 # URL / HTML
 url = "2"
 scraper = "0.27"
+# Thumbnail decode/downscale for representative images (pure Rust; only the
+# formats crawls typically capture for og:image).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 # CLI progress bars (indexing).
 indicatif = "0.18"
 # Registrable-domain (public suffix list) for the cross-subdomain site: facet.

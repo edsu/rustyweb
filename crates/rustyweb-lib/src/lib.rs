@@ -4,6 +4,7 @@ pub mod index;
 pub mod pdf;
 pub mod search;
 pub mod server;
+mod thumbnail;
 pub mod views;
 pub mod wacz;
 pub mod warc;

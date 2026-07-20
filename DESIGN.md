@@ -47,6 +47,7 @@ rustyweb/
 │   │       ├── collections.rs - Collection manifest (collections.json)
 │   │       ├── warc.rs      - WARC record iteration and HTML extraction
 │   │       ├── wacz.rs      - WACZ ZIP handling, datapackage.json, CDX reader
+│   │       ├── thumbnail.rs - Representative-image thumbnails (og:image → cached JPEG)
 │   │       └── http_range.rs - Read+Seek over HTTP range requests (remote streaming)
 │   └── rustyweb-bin/        (thin CLI entry point)
 │       └── src/main.rs      - Clap CLI, subcommand dispatch, tokio::main
@@ -63,6 +64,7 @@ rustyweb reindex        [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve          [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set [--home <DIR>] <COLLECTION> <WACZ_ID>...
 rustyweb collection list[--home <DIR>]
+rustyweb crawl set      [--home <DIR>] <CRAWL_ID> --image <FILE>
 rustyweb search-url     [--home <DIR>] <URL>
 rustyweb verify         [--home <DIR>]
 ```
@@ -91,6 +93,7 @@ resolves.
 | `GET /collection/{id}` | Collection detail: metadata, a scoped facet overview, and member crawls |
 | `GET /crawl/{id}` | Crawl detail: provenance, file metadata, a scoped facet overview, and seed pages (a crawl is one WACZ) |
 | `GET /api/search?q=...` | Full-text search → JSON (results, `total`, `capped`, `facets`) |
+| `GET /thumb/{id}` | A crawl's cached representative-image thumbnail (small JPEG); 404 when it has none |
 | `GET /files/{id}` | Stream a registered WACZ file with byte-range support |
 | `GET /assets/*` | Embedded site assets (the shared `app.css` stylesheet) |
 | `GET /replay/viewer` | Viewer shell (reads `?source=&url=&ts=&name=&collection=` params) |
@@ -508,6 +511,47 @@ proactive backstop the resolved worker count is clamped to a per-host ceiling
 unbounded number of range requests in flight against a single host. The agent
 is built with `http_status_as_error(false)` so `4xx`/`5xx` come back as
 inspectable responses (status + `Retry-After`) rather than opaque errors.
+
+### Representative-image thumbnails
+
+To make the UI visual, each crawl gets a small representative image on its card
+and detail pages, chosen in three tiers (first hit wins):
+
+1. the crawl's **main-page `og:image`** (the site's own social-preview image;
+   `twitter:image` next);
+2. else the **largest content image the main page embeds** (`<img>`/`srcset`,
+   resolved against the page URL);
+3. else the **largest captured image on the crawl's own registrable domain**
+   (`site_of`), read straight from the CDX.
+
+Tiers 2-3 matter because `og:image` is far from universal - cultural-heritage
+crawls (SUCHO) and even some magazines omit it. And tier 3 specifically handles
+**JS-rendered sites**, whose *saved* HTML has no `og:image` and no `<img>` at all
+(the images are injected client-side), yet the crawl still captured them; it
+ignores third-party/CDN/ad images on other domains. All tiers pick by captured
+byte size within a window (`MIN_IMAGE_BYTES` 5 KB .. `MAX_IMAGE_BYTES` 3 MB): the
+floor skips icons/sprites/tracking pixels, the ceiling avoids fetching + decoding
+a full-res original for a 400px thumbnail. (Browsertrix screenshots would be
+another source, but this era of crawls doesn't capture them.)
+
+After indexing a CDX-streamable WACZ, `thumbnail::generate` (best-effort) reads
+the main page's HTML from the WACZ, picks the image per the tiers, range-fetches
+it from the CDX, decodes + downscales it (the `image` crate; longest edge 400px),
+and writes `<home>/index/thumbs/<crawl_id>.jpg`. Any failure - no main page, no
+usable image, an image that isn't captured or won't decode - just means no
+thumbnail (the UI shows a placeholder; a curator can pin one).
+
+A curator can **pin a specific image** with `rustyweb crawl set <id> --image
+<file>` (any local PNG/JPEG/WebP/GIF): it's downscaled, cached, and marked pinned
+via a sidecar `<crawl_id>.pinned` file, so a later (re)index leaves it untouched.
+
+The server serves the thumbnail at `GET /thumb/{id}`. The homepage collection card and the
+crawl detail page each show one image; the **collection detail page shows a grid
+of its member crawls**, each with its own thumbnail, so the page conveys that a
+collection spans multiple crawls of multiple sites. When a crawl has no image the
+UI falls back to a **CSS-only placeholder** (a gradient tinted by a hash of the
+name - no image bytes). Thumbnails are generated at index time, so populating
+them needs a (re)index.
 
 ### Progress reporting
 

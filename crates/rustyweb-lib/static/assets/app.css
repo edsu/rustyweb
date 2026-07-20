@@ -64,10 +64,19 @@ h2 { font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 0.4rem; }
 
 /* Collection cards (homepage) */
 .cards { display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
-.card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.2rem; background: #fafafa; }
+.card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.2rem; background: #fafafa; overflow: hidden; }
 .card-header { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; margin-bottom: 0.5rem; }
 .card-title { font-size: 1.1rem; font-weight: 600; color: #0066cc; text-decoration: none; }
 .card-title:hover { text-decoration: underline; }
+
+/* Representative image (a crawl's og:image thumbnail, else a CSS placeholder). */
+.thumb { aspect-ratio: 16 / 9; overflow: hidden; background: #ececf0; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* Card: the image bleeds to the top/side edges (card clips via overflow:hidden). */
+.card-thumb { display: block; margin: -1rem -1.2rem 0.8rem; }
+/* Detail pages: a modest, capped image with rounded corners. */
+.detail-thumb { max-width: 480px; margin: 0.4rem 0 1.1rem; }
+.detail-thumb .thumb { border-radius: 6px; }
 .desc { color: #444; font-size: 0.9rem; margin: 0.4rem 0; }
 .status { font-size: 0.8rem; white-space: nowrap; }
 

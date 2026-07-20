@@ -148,6 +148,30 @@ enum Commands {
         #[command(subcommand)]
         action: CollectionCmd,
     },
+    /// Manage an individual crawl (WACZ).
+    Crawl {
+        #[command(subcommand)]
+        action: CrawlCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CrawlCmd {
+    /// Set curator-controlled properties of a crawl.
+    Set {
+        /// Crawl id (the 8-char id shown on the crawl page / in `collection list`).
+        id: String,
+
+        /// Pin a representative image for this crawl from a local image file
+        /// (PNG/JPEG/WebP/GIF). Overrides the auto-selected thumbnail and is kept
+        /// across reindexing.
+        #[arg(long, value_name = "FILE")]
+        image: Option<PathBuf>,
+
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -551,6 +575,18 @@ async fn main() -> Result<()> {
             }
             CollectionCmd::List { home } => {
                 run_collection_list(&home)?;
+            }
+        },
+
+        Commands::Crawl { action } => match action {
+            CrawlCmd::Set { id, image, home } => {
+                if let Some(file) = image {
+                    rustyweb_lib::index::set_crawl_thumbnail(&home, &id, &file)?;
+                    println!("pinned thumbnail for crawl {id} from {}", file.display());
+                } else {
+                    eprintln!("nothing to set — pass --image <FILE> to pin a thumbnail");
+                    std::process::exit(2);
+                }
             }
         },
     }
