@@ -262,11 +262,14 @@ filter to that month. Repeat captures of the same URL collapse into a single
 result marked "captured N times", and results are paginated. The homepage also
 offers "browse by year" and "top sites" entry points into search.
 
-Crawls carry a representative image, taken from the crawl's home-page `og:image`
-(cached as a small thumbnail at index time). Homepage collection cards and the
-crawl detail page show one; the collection detail page shows a grid of its member
-crawls, each with its own image — conveying that a collection spans multiple
-crawls of multiple sites. Crawls without an image fall back to a CSS placeholder.
+Crawls carry a representative image, cached as a small thumbnail at index time.
+It's taken from the crawl's home-page `og:image`, or — when the page declares
+none — the largest content image the page embeds (skipping icons/sprites).
+Homepage collection cards and the crawl detail page show one; the collection
+detail page shows a grid of its member crawls, each with its own image —
+conveying that a collection spans multiple crawls of multiple sites. Crawls
+without an image fall back to a CSS placeholder. A curator can pin a specific
+image with `rustyweb crawl set <crawl-id> --image <file>` (kept across reindexing).
 
 ## Command line
 
@@ -276,6 +279,7 @@ rustyweb reindex         [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve           [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set  [--home <DIR>] <COLLECTION> <WACZ_ID>...
 rustyweb collection list [--home <DIR>]
+rustyweb crawl set       [--home <DIR>] <CRAWL_ID> --image <FILE>
 rustyweb search-url      [--home <DIR>] <URL>
 rustyweb verify          [--home <DIR>]
 ```

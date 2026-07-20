@@ -289,6 +289,21 @@ pub fn set_collection(
     Ok(id)
 }
 
+/// Pin a curator-supplied local image as a crawl's representative thumbnail.
+/// Downscales + caches it and marks it pinned, so a later (re)index won't
+/// overwrite the choice. Manifest-only side effect (no reindex).
+pub fn set_crawl_thumbnail(home: &Path, crawl_id: &str, image_file: &Path) -> Result<()> {
+    let index_dir = index_dir(home);
+    let manifest = Manifest::open(&index_dir)?;
+    if manifest.wacz_by_id(crawl_id).is_none() {
+        anyhow::bail!("no crawl with id \"{crawl_id}\" (see `rustyweb collection list`)");
+    }
+    crate::thumbnail::set_manual(&index_dir.join("thumbs"), crawl_id, image_file)
+        .with_context(|| format!("setting thumbnail for crawl {crawl_id}"))?;
+    info!(crawl = %crawl_id, image = %image_file.display(), "pinned crawl thumbnail");
+    Ok(())
+}
+
 /// Turn one `index` argument into a source to index. An `http(s)://` URL yields
 /// a URL source. Otherwise the argument must be a `.wacz` file that already lives
 /// under `<home>/archive` - rustyweb keeps local archives there so the home
@@ -1834,6 +1849,120 @@ mod tests {
         assert!(
             decoded.width() <= 400 && decoded.height() <= 400,
             "thumbnail should be downscaled"
+        );
+    }
+
+    #[test]
+    fn thumbnail_falls_back_to_largest_page_image() {
+        use std::io::Write;
+        // The main page has NO og:image but embeds two images (a tiny icon and a
+        // larger hero). The thumbnail should fall back to the largest captured
+        // content image, skipping the sub-threshold icon.
+        let page_url = "https://ex.com/";
+
+        // A "noisy" hero PNG (poor compression → well over the 5 KB floor) and a
+        // tiny icon (under it, so it's skipped).
+        let png = |w: u32, h: u32, noisy: bool| {
+            let mut im = image::RgbImage::new(w, h);
+            // Pseudo-random (incompressible) pixels so the PNG stays large; a solid
+            // fill for the tiny icon so it compresses well below the floor.
+            let mut st: u32 = 0x1234_5678;
+            for (_, _, p) in im.enumerate_pixels_mut() {
+                if noisy {
+                    st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let b = st.to_le_bytes();
+                    *p = image::Rgb([b[0], b[1], b[2]]);
+                } else {
+                    *p = image::Rgb([200, 200, 200]);
+                }
+            }
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(im)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .unwrap();
+            buf.into_inner()
+        };
+        let hero = png(160, 160, true);
+        let icon = png(8, 8, false);
+        assert!(
+            hero.len() >= 5000 && icon.len() < 5000,
+            "test image sizes bracket the floor"
+        );
+
+        let html = "<html><head><title>Home</title></head><body>\
+             <img src=\"icon.png\"><img src=\"hero.png\"></body></html>";
+
+        let gz_record = |url: &str, ctype: &str, body: &[u8]| {
+            let mut http = format!("HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n\r\n").into_bytes();
+            http.extend_from_slice(body);
+            let mut warc = format!(
+                "WARC/1.0\r\nWARC-Type: response\r\nWARC-Target-URI: {url}\r\n\
+                 WARC-Date: 2023-01-01T00:00:00Z\r\n\
+                 Content-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
+                http.len()
+            )
+            .into_bytes();
+            warc.extend_from_slice(&http);
+            warc.extend_from_slice(b"\r\n\r\n");
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&warc).unwrap();
+            e.finish().unwrap()
+        };
+        let m_html = gz_record(page_url, "text/html", html.as_bytes());
+        let m_icon = gz_record("https://ex.com/icon.png", "image/png", &icon);
+        let m_hero = gz_record("https://ex.com/hero.png", "image/png", &hero);
+        let mut warc_gz = m_html.clone();
+        warc_gz.extend_from_slice(&m_icon);
+        warc_gz.extend_from_slice(&m_hero);
+
+        let gz = |b: &[u8]| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+        let (o_html, o_icon) = (0, m_html.len());
+        let o_hero = m_html.len() + m_icon.len();
+        let cdx = format!(
+            "com,ex)/ 20230101000000 {{\"url\":\"{page_url}\",\"mime\":\"text/html\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{o_html},\"length\":{}}}\n\
+             com,ex)/icon.png 20230101000000 {{\"url\":\"https://ex.com/icon.png\",\"mime\":\"image/png\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{o_icon},\"length\":{}}}\n\
+             com,ex)/hero.png 20230101000000 {{\"url\":\"https://ex.com/hero.png\",\"mime\":\"image/png\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{o_hero},\"length\":{}}}\n",
+            m_html.len(), m_icon.len(), m_hero.len()
+        );
+        let cdx_gz = gz(cdx.as_bytes());
+        let datapackage = format!("{{\"mainPageUrl\":\"{page_url}\"}}");
+
+        let mut wacz = Vec::new();
+        {
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let opt = zip::write::SimpleFileOptions::default();
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut wacz));
+            zw.start_file("archive/data.warc.gz", stored).unwrap();
+            zw.write_all(&warc_gz).unwrap();
+            zw.start_file("indexes/index.cdx.gz", opt).unwrap();
+            zw.write_all(&cdx_gz).unwrap();
+            zw.start_file("datapackage.json", opt).unwrap();
+            zw.write_all(datapackage.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let path = archive.join("crawl.wacz");
+        std::fs::write(&path, &wacz).unwrap();
+        index_path(&path, tmp.path(), None).unwrap();
+
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let id = &manifest.waczs[0].id;
+        let thumb = tmp
+            .path()
+            .join("index")
+            .join("thumbs")
+            .join(format!("{id}.jpg"));
+        assert!(
+            thumb.exists(),
+            "with no og:image, a thumbnail should be generated from the largest embedded image"
         );
     }
 

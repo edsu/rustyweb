@@ -64,6 +64,7 @@ rustyweb reindex        [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve          [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set [--home <DIR>] <COLLECTION> <WACZ_ID>...
 rustyweb collection list[--home <DIR>]
+rustyweb crawl set      [--home <DIR>] <CRAWL_ID> --image <FILE>
 rustyweb search-url     [--home <DIR>] <URL>
 rustyweb verify         [--home <DIR>]
 ```
@@ -515,14 +516,24 @@ inspectable responses (status + `Retry-After`) rather than opaque errors.
 
 To make the UI visual, each crawl gets a small representative image on its card
 and detail pages. The source is the crawl's **main-page `og:image`** (the site's
-own social-preview image; `twitter:image` as a fallback) - not a Browsertrix
-screenshot, which this era of crawls (e.g. SUCHO) doesn't capture. After indexing
-a CDX-streamable WACZ, `thumbnail::generate` (best-effort): reads the main page's
-HTML from the WACZ, extracts `og:image`, resolves it against the page URL, looks
-that captured image up in the CDX, range-fetches it, decodes + downscales it (the
-`image` crate; longest edge 400px), and writes `<home>/index/thumbs/<crawl_id>.jpg`.
-Any failure - no main page, no `og:image`, an image that isn't captured or won't
-decode - just means no thumbnail. The server serves it at `GET /thumb/{id}`. The homepage collection card and the
+own social-preview image; `twitter:image` next), and **failing that, the largest
+content image the main page embeds** (`<img>`/`srcset`, resolved against the page
+URL, chosen by captured byte size so icons/sprites/tracking pixels below a small
+floor are skipped). This fallback matters because `og:image` is far from
+universal - cultural-heritage crawls (SUCHO) and even some magazines omit it,
+while the page still embeds real images. (Browsertrix screenshots would be another
+source, but this era of crawls doesn't capture them.) After indexing a
+CDX-streamable WACZ, `thumbnail::generate` (best-effort) reads the main page's
+HTML from the WACZ, picks the image per the above, range-fetches it from the CDX,
+decodes + downscales it (the `image` crate; longest edge 400px), and writes
+`<home>/index/thumbs/<crawl_id>.jpg`. Any failure - no main page, no usable image,
+an image that isn't captured or won't decode - just means no thumbnail.
+
+A curator can **pin a specific image** with `rustyweb crawl set <id> --image
+<file>` (any local PNG/JPEG/WebP/GIF): it's downscaled, cached, and marked pinned
+via a sidecar `<crawl_id>.pinned` file, so a later (re)index leaves it untouched.
+
+The server serves the thumbnail at `GET /thumb/{id}`. The homepage collection card and the
 crawl detail page each show one image; the **collection detail page shows a grid
 of its member crawls**, each with its own thumbnail, so the page conveys that a
 collection spans multiple crawls of multiple sites. When a crawl has no image the
