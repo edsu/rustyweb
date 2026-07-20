@@ -107,6 +107,36 @@ pub struct HomeBrowse {
     pub sites: Vec<BrowseLink>,
 }
 
+/// One labeled group of browse-links in a detail page's scoped facet overview
+/// (e.g. "Top sites" on a collection page), each link a search within that scope.
+pub struct FacetSection {
+    pub label: String,
+    pub links: Vec<BrowseLink>,
+}
+
+/// Render a `.browse` block from facet sections (reused on detail pages). Empty
+/// sections render nothing.
+fn facet_browse(facets: &[FacetSection]) -> Markup {
+    html! {
+        @if !facets.is_empty() {
+            div.browse {
+                @for f in facets {
+                    div.browse-group {
+                        h3 { (f.label) }
+                        div.browse-links {
+                            @for l in &f.links {
+                                a.browse-link href=(l.href) {
+                                    (l.label) " " span.browse-count { (l.count) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The homepage: search box, tips, browse-by entry points, and a card per
 /// collection.
 pub fn home(cards: &[CollectionCard], browse: &HomeBrowse) -> Markup {
@@ -430,6 +460,7 @@ pub fn collection(
     name: &str,
     description: Option<&str>,
     meta: &[MetaRow],
+    facets: &[FacetSection],
     members: &[MemberItem],
 ) -> Markup {
     let body = html! {
@@ -437,6 +468,7 @@ pub fn collection(
         h1 { (name) }
         @if let Some(d) = description { p.desc { (d) } }
         (meta_table(meta))
+        (facet_browse(facets))
         h2 { "Crawls" }
         @if members.is_empty() {
             p.muted { "No crawls in this collection." }

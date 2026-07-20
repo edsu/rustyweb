@@ -254,6 +254,29 @@ impl SearchIndex {
         Ok(facets_from_aggregations(&agg_json))
     }
 
+    /// Facet counts restricted to one collection or one crawl, for the scoped
+    /// facet overview on detail pages. Same aggregation as [`facet_overview`], but
+    /// run over a term query on the scope field instead of match-all — still just
+    /// the aggregation (no result fetch), so still cheap.
+    pub fn facet_overview_scoped(&self, scope: FacetScope) -> Result<Vec<FacetGroup>> {
+        let schema = self.index.schema();
+        let (field, value) = match scope {
+            FacetScope::Collection(v) => (schema.get_field(FIELD_COLLECTION).unwrap(), v),
+            FacetScope::Crawl(v) => (schema.get_field(FIELD_COLLECTION_ID).unwrap(), v),
+        };
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let query = tantivy::query::TermQuery::new(
+            Term::from_field_text(field, value),
+            IndexRecordOption::Basic,
+        );
+        let agg_collector =
+            AggregationCollector::from_aggs(facet_aggregations(), AggContextParams::default());
+        let agg_results = searcher.search(&query, &agg_collector)?;
+        let agg_json = serde_json::to_value(&agg_results).unwrap_or_default();
+        Ok(facets_from_aggregations(&agg_json))
+    }
+
     /// Search the top `limit` results by relevance. A thin wrapper over
     /// [`search_faceted`](Self::search_faceted) that returns only the hits (no
     /// facet counts, no pagination); kept for callers that don't need them.
@@ -490,6 +513,15 @@ pub struct FacetGroup {
 pub struct FacetBucket {
     pub value: String,
     pub count: u64,
+}
+
+/// What a scoped facet overview ([`SearchIndex::facet_overview_scoped`]) is
+/// restricted to.
+pub enum FacetScope<'a> {
+    /// A curated collection, by its id/slug (the `collection` field).
+    Collection(&'a str),
+    /// A single crawl/WACZ, by its id (the `collection_id` field).
+    Crawl(&'a str),
 }
 
 /// The sidebar facet dimensions, in display order: `(index field, label)`. The

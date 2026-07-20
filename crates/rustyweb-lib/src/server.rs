@@ -483,7 +483,67 @@ async fn collection_page(
         })
         .collect();
 
-    views::collection(&c.name, c.description.as_deref(), &meta, &member_items).into_response()
+    // Scoped facet overview: what's *in* this collection, each value a search
+    // scoped to it. Turns the page into a faceted entry point, not just a list.
+    let overview = state
+        .search
+        .facet_overview_scoped(crate::search::FacetScope::Collection(&id))
+        .unwrap_or_default();
+    let facets = scoped_facet_sections(&overview, &format!("collection:{id}"));
+
+    views::collection(
+        &c.name,
+        c.description.as_deref(),
+        &meta,
+        &facets,
+        &member_items,
+    )
+    .into_response()
+}
+
+/// Build the scoped facet sections for a detail page. Each dimension becomes a
+/// labeled group whose links run a search within `scope` (e.g. `collection:slug`)
+/// further filtered by that value. The Collection dimension is skipped (moot on a
+/// scoped page), and empty dimensions are dropped.
+fn scoped_facet_sections(
+    overview: &[crate::search::FacetGroup],
+    scope: &str,
+) -> Vec<views::FacetSection> {
+    // (facet field == filter field, heading, sort by value desc, max shown)
+    const DIMS: [(&str, &str, bool, usize); 4] = [
+        ("site", "Top sites", false, 10),
+        ("year", "By year", true, 12),
+        ("type", "Types", false, 6),
+        ("lang", "Languages", false, 8),
+    ];
+    DIMS.iter()
+        .filter_map(|(field, label, by_value_desc, max)| {
+            let group = overview.iter().find(|g| g.field == *field)?;
+            let mut buckets: Vec<&crate::search::FacetBucket> = group.buckets.iter().collect();
+            if buckets.is_empty() {
+                return None;
+            }
+            if *by_value_desc {
+                buckets.sort_by(|a, b| b.value.cmp(&a.value));
+            }
+            let links = buckets
+                .into_iter()
+                .take(*max)
+                .map(|b| views::BrowseLink {
+                    label: b.value.clone(),
+                    count: b.count,
+                    href: format!(
+                        "/search?q={}",
+                        url_encode(&format!("{scope} {field}:{}", b.value))
+                    ),
+                })
+                .collect();
+            Some(views::FacetSection {
+                label: label.to_string(),
+                links,
+            })
+        })
+        .collect()
 }
 
 async fn crawl_page(
