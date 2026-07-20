@@ -538,11 +538,14 @@ const FACET_DIMENSIONS: [(&str, &str); 5] = [
 /// Filterable `field:value` fields that aren't sidebar facets: `month` (the
 /// timeline) and `domain` (exact host — the Site facet uses the registrable
 /// domain instead), with labels for their active-filter chips.
-const EXTRA_FILTERS: [(&str, &str); 4] = [
+const EXTRA_FILTERS: [(&str, &str); 5] = [
     (FIELD_MONTH, "Month"),
     (FIELD_DOMAIN, "Host"),
     (FIELD_STATUS, "Status"),
     (FIELD_MODIFIED, "Modified"),
+    // Scopes a search to a single crawl (WACZ). Its value is an opaque WACZ id,
+    // so the server resolves it to the crawl's name for the active-filter chip.
+    (FIELD_COLLECTION_ID, "Crawl"),
 ];
 
 /// Whether `field` can be used as a `field:value` filter: a sidebar facet
