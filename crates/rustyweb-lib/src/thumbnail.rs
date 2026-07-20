@@ -280,4 +280,26 @@ mod tests {
             .unwrap();
         assert!(out.width() <= THUMB_MAX_EDGE && out.height() <= THUMB_MAX_EDGE);
     }
+
+    #[test]
+    fn generate_skips_a_pinned_thumbnail() {
+        // A pinned thumbnail must survive (re)indexing: generate() returns early
+        // without regenerating. The pinned check runs before the WACZ is opened,
+        // so the fetch source is never read (a dummy file stands in for it).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let thumbs = tmp.path().join("thumbs");
+        let src = tmp.path().join("pic.png");
+        std::fs::write(&src, png_bytes(24, 16)).unwrap();
+        set_manual(&thumbs, "pinned1", &src).unwrap();
+        let before = std::fs::read(thumb_file(&thumbs, "pinned1")).unwrap();
+
+        let dummy = tmp.path().join("dummy.bin");
+        std::fs::write(&dummy, b"not a wacz").unwrap();
+        let fetch = crate::http_range::FileFetch::open(&dummy).unwrap();
+        let wrote = generate(fetch, &thumbs, "pinned1", "https://ex.com/").unwrap();
+
+        assert!(!wrote, "generate() should skip a pinned crawl");
+        let after = std::fs::read(thumb_file(&thumbs, "pinned1")).unwrap();
+        assert_eq!(before, after, "the pinned thumbnail must be left untouched");
+    }
 }

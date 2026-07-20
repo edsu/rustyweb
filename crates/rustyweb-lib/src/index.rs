@@ -296,7 +296,9 @@ pub fn set_crawl_thumbnail(home: &Path, crawl_id: &str, image_file: &Path) -> Re
     let index_dir = index_dir(home);
     let manifest = Manifest::open(&index_dir)?;
     if manifest.wacz_by_id(crawl_id).is_none() {
-        anyhow::bail!("no crawl with id \"{crawl_id}\" (see `rustyweb collection list`)");
+        anyhow::bail!(
+            "no crawl with id \"{crawl_id}\" - it's the id in the crawl's page URL (/crawl/<id>)"
+        );
     }
     crate::thumbnail::set_manual(&index_dir.join("thumbs"), crawl_id, image_file)
         .with_context(|| format!("setting thumbnail for crawl {crawl_id}"))?;
