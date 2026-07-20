@@ -737,9 +737,9 @@ struct CrawlStats {
 /// text and falls back to scraped HTML; the title comes from the HTML.
 fn index_wacz(
     wacz_path: &Path,
-    // WACZ id/name (tagged on each page as collection_id/collection_name).
-    collection_id: &str,
-    collection_name: &str,
+    // WACZ id/name (tagged on each page as crawl_id/crawl_name).
+    crawl_id: &str,
+    crawl_name: &str,
     // Curated collection id (slug) the WACZ belongs to.
     collection: &str,
     search: &Mutex<SearchIndex>,
@@ -787,8 +787,8 @@ fn index_wacz(
     index_merged(
         raws,
         warcinfo,
-        collection_id,
-        collection_name,
+        crawl_id,
+        crawl_name,
         collection,
         search,
         &wacz_path.display().to_string(),
@@ -802,8 +802,8 @@ fn index_wacz(
 #[allow(clippy::too_many_arguments)]
 fn index_wacz_streaming<F>(
     fetch: F,
-    collection_id: &str,
-    collection_name: &str,
+    crawl_id: &str,
+    crawl_name: &str,
     collection: &str,
     search: &Mutex<SearchIndex>,
     label: &str,
@@ -815,13 +815,7 @@ where
 {
     let (raws, warcinfo) = collect_page_records_via_cdx(fetch, concurrency, progress)?;
     index_merged(
-        raws,
-        warcinfo,
-        collection_id,
-        collection_name,
-        collection,
-        search,
-        label,
+        raws, warcinfo, crawl_id, crawl_name, collection, search, label,
     )
 }
 
@@ -831,8 +825,8 @@ where
 fn index_merged(
     raws: Vec<RawRecord>,
     warcinfo: Option<Warcinfo>,
-    collection_id: &str,
-    collection_name: &str,
+    crawl_id: &str,
+    crawl_name: &str,
     collection: &str,
     search: &Mutex<SearchIndex>,
     label: &str,
@@ -947,8 +941,8 @@ fn index_merged(
                 lang: &lang,
                 status: m.status,
                 modified_year: m.modified_year,
-                collection_id,
-                collection_name,
+                crawl_id,
+                crawl_name,
                 collection,
             })?;
             count += 1;
@@ -1737,7 +1731,7 @@ mod tests {
                 .unwrap();
         let results = idx.search("example", 10).unwrap();
         assert!(!results.is_empty(), "should find HTML content from WACZ");
-        assert_eq!(results[0].collection_name, "simple");
+        assert_eq!(results[0].crawl_name, "simple");
     }
 
     #[test]

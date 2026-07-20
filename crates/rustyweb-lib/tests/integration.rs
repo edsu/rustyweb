@@ -61,7 +61,7 @@ fn index_wacz_collection_document_indexed() {
 }
 
 #[test]
-fn index_wacz_result_has_collection_fields() {
+fn index_wacz_result_has_crawl_fields() {
     let tmp = make_index(&["simple.wacz"]);
     let idx = rustyweb_lib::search::SearchIndex::open(
         tmp.path().join("index").join("full_text").as_path(),
@@ -69,11 +69,8 @@ fn index_wacz_result_has_collection_fields() {
     .unwrap();
     let results = idx.search("example", 10).unwrap();
     let page = results.iter().find(|r| r.doc_type == "page").unwrap();
-    assert!(
-        !page.collection_id.is_empty(),
-        "page should have collection_id"
-    );
-    assert_eq!(page.collection_name, "simple");
+    assert!(!page.crawl_id.is_empty(), "page should have crawl_id");
+    assert_eq!(page.crawl_name, "simple");
 }
 
 #[test]
@@ -115,7 +112,7 @@ async fn search_api_returns_results() {
 }
 
 #[tokio::test]
-async fn search_api_result_includes_collection_fields() {
+async fn search_api_result_includes_crawl_fields() {
     let tmp = make_index(&["simple.wacz"]);
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
     let req = Request::get("/api/search?q=example")
@@ -128,11 +125,11 @@ async fn search_api_result_includes_collection_fields() {
     let results = json["results"].as_array().unwrap();
     let first = &results[0];
     assert!(first
-        .get("collection_id")
+        .get("crawl_id")
         .and_then(|v| v.as_str())
         .map(|s| !s.is_empty())
         .unwrap_or(false));
-    assert!(first.get("collection_name").is_some());
+    assert!(first.get("crawl_name").is_some());
     assert!(first.get("doc_type").is_some());
 }
 
@@ -521,7 +518,7 @@ async fn collection_page_shows_scoped_facets() {
 #[tokio::test]
 async fn crawl_page_shows_scoped_facets() {
     // The crawl detail page carries the same scoped facet overview as a
-    // collection, scoped to the single crawl (`collection_id:<id>`).
+    // collection, scoped to the single crawl (`crawl:<id>`).
     let tmp = make_index(&["a.wacz"]);
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
     let id = manifest.waczs[0].id.clone();

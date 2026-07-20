@@ -105,9 +105,9 @@ Two document types share the same index, distinguished by `doc_type`.
 | Field | Type | Stored | Indexed | Fast | Notes |
 |---|---|---|---|---|---|
 | `doc_type` | STRING | ✓ | exact | - | `"page"` or `"collection"` |
-| `collection_id` | STRING | ✓ | exact | - | Per-WACZ hash (e.g. `e02536ec`) |
-| `collection_name` | STRING | ✓ | - | - | Human-readable WACZ name |
-| `collection` | STRING | ✓ | exact | ✓ | Curated collection slug the WACZ belongs to, for `collection:` filtering + faceting |
+| `crawl_id` | STRING | ✓ | exact | - | Per-crawl (per-WACZ) hash, e.g. `e02536ec`; scoped by the `crawl:` filter |
+| `crawl_name` | STRING | ✓ | - | - | Human-readable crawl (WACZ) name |
+| `collection` | STRING | ✓ | exact | ✓ | Curated collection slug the crawl belongs to, for `collection:` filtering + faceting |
 | `url` | STRING | ✓ | exact | - | Page URL (empty for collection docs) |
 | `timestamp` | STRING | ✓ | - | - | 14-digit crawl timestamp |
 | `title` | TEXT | ✓ | BM25 | - | Page title or collection name |
@@ -137,12 +137,12 @@ results, the total, facet counts, and the month timeline together (see *Faceted,
 discovery* below). `SearchIndex::search` is a thin wrapper returning just the hits.
 `SearchIndex::facet_overview()` runs only the aggregation over a match-all query (the
 homepage browse entry points); `facet_overview_scoped(FacetScope)` does the same restricted
-to one collection (`collection`) or crawl (`collection_id`) — this backs the **scoped facet
+to one collection (`collection`) or crawl (`crawl_id`) — this backs the **scoped facet
 overview on the collection and crawl detail pages**, where each value (top sites, years,
 types, languages) links into a search already scoped to that collection or crawl. The
-crawl-scoped links use a `crawl:<id>` filter - a friendly alias rewritten to the internal
-`collection_id` field before parsing (`collection_id` would be misleading UI jargon). Since
-the id is opaque, the search page resolves it to the crawl's name for the active-filter chip.
+crawl-scoped links use a `crawl:<id>` filter - a short alias rewritten to the `crawl_id`
+field before parsing. Since the id is opaque, the search page resolves it to the crawl's
+name for the active-filter chip.
 
 Queries go through Tantivy's `QueryParser`, configured in `search_faceted`:
 

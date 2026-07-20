@@ -13,8 +13,8 @@ use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
 const FIELD_DOC_TYPE: &str = "doc_type";
-const FIELD_COLLECTION_ID: &str = "collection_id";
-const FIELD_COLLECTION_NAME: &str = "collection_name";
+const FIELD_CRAWL_ID: &str = "crawl_id";
+const FIELD_CRAWL_NAME: &str = "crawl_name";
 const FIELD_URL: &str = "url";
 const FIELD_TS: &str = "timestamp";
 const FIELD_TITLE: &str = "title";
@@ -130,10 +130,10 @@ impl SearchIndex {
     /// Tantivy applies a delete only to documents committed before it, so the
     /// caller should `delete_collection()` first, then `index_page()` /
     /// `index_collection()`, then `commit()` - the fresh documents survive.
-    pub fn delete_collection(&mut self, collection_id: &str) {
-        let field = self.index.schema().get_field(FIELD_COLLECTION_ID).unwrap();
+    pub fn delete_collection(&mut self, crawl_id: &str) {
+        let field = self.index.schema().get_field(FIELD_CRAWL_ID).unwrap();
         self.writer_mut()
-            .delete_term(Term::from_field_text(field, collection_id));
+            .delete_term(Term::from_field_text(field, crawl_id));
     }
 
     /// Index a single page from an archive. Fields not set on the [`Page`]
@@ -142,14 +142,8 @@ impl SearchIndex {
         let schema = self.index.schema();
         let mut doc = TantivyDocument::default();
         doc.add_text(schema.get_field(FIELD_DOC_TYPE).unwrap(), "page");
-        doc.add_text(
-            schema.get_field(FIELD_COLLECTION_ID).unwrap(),
-            page.collection_id,
-        );
-        doc.add_text(
-            schema.get_field(FIELD_COLLECTION_NAME).unwrap(),
-            page.collection_name,
-        );
+        doc.add_text(schema.get_field(FIELD_CRAWL_ID).unwrap(), page.crawl_id);
+        doc.add_text(schema.get_field(FIELD_CRAWL_NAME).unwrap(), page.crawl_name);
         doc.add_text(schema.get_field(FIELD_COLLECTION).unwrap(), page.collection);
         doc.add_text(schema.get_field(FIELD_URL).unwrap(), page.url);
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), page.timestamp);
@@ -201,26 +195,20 @@ impl SearchIndex {
     /// `body` should be the concatenation of the description and seed page titles/URLs.
     pub fn index_collection(
         &mut self,
-        collection_id: &str,
-        collection_name: &str,
+        crawl_id: &str,
+        crawl_name: &str,
         collection: &str,
         body: &str,
     ) -> Result<()> {
         let schema = self.index.schema();
         let mut doc = TantivyDocument::default();
         doc.add_text(schema.get_field(FIELD_DOC_TYPE).unwrap(), "collection");
-        doc.add_text(
-            schema.get_field(FIELD_COLLECTION_ID).unwrap(),
-            collection_id,
-        );
-        doc.add_text(
-            schema.get_field(FIELD_COLLECTION_NAME).unwrap(),
-            collection_name,
-        );
+        doc.add_text(schema.get_field(FIELD_CRAWL_ID).unwrap(), crawl_id);
+        doc.add_text(schema.get_field(FIELD_CRAWL_NAME).unwrap(), crawl_name);
         doc.add_text(schema.get_field(FIELD_COLLECTION).unwrap(), collection);
         doc.add_text(schema.get_field(FIELD_URL).unwrap(), "");
         doc.add_text(schema.get_field(FIELD_TS).unwrap(), "");
-        doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), collection_name);
+        doc.add_text(schema.get_field(FIELD_TITLE).unwrap(), crawl_name);
         doc.add_text(schema.get_field(FIELD_BODY).unwrap(), body);
         // Collection docs have no page URL or HTML metadata; keep those empty.
         doc.add_text(schema.get_field(FIELD_DESCRIPTION).unwrap(), "");
@@ -262,7 +250,7 @@ impl SearchIndex {
         let schema = self.index.schema();
         let (field, value) = match scope {
             FacetScope::Collection(v) => (schema.get_field(FIELD_COLLECTION).unwrap(), v),
-            FacetScope::Crawl(v) => (schema.get_field(FIELD_COLLECTION_ID).unwrap(), v),
+            FacetScope::Crawl(v) => (schema.get_field(FIELD_CRAWL_ID).unwrap(), v),
         };
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
@@ -294,7 +282,7 @@ impl SearchIndex {
         limit: usize,
         offset: usize,
     ) -> Result<SearchResponse> {
-        // Map the `crawl:` filter alias onto its real `collection_id` field before
+        // Map the `crawl:` filter alias onto its real `crawl_id` field before
         // parsing (the query parser resolves against schema field names).
         let query_str = &rewrite_crawl_alias(query_str);
         let reader = self.index.reader()?;
@@ -304,8 +292,8 @@ impl SearchIndex {
         let title_f = schema.get_field(FIELD_TITLE).unwrap();
         let body_f = schema.get_field(FIELD_BODY).unwrap();
         let doc_type_f = schema.get_field(FIELD_DOC_TYPE).unwrap();
-        let coll_id_f = schema.get_field(FIELD_COLLECTION_ID).unwrap();
-        let coll_name_f = schema.get_field(FIELD_COLLECTION_NAME).unwrap();
+        let coll_id_f = schema.get_field(FIELD_CRAWL_ID).unwrap();
+        let coll_name_f = schema.get_field(FIELD_CRAWL_NAME).unwrap();
         let url_f = schema.get_field(FIELD_URL).unwrap();
         let ts_f = schema.get_field(FIELD_TS).unwrap();
         let domain_f = schema.get_field(FIELD_DOMAIN).unwrap();
@@ -394,8 +382,8 @@ impl SearchIndex {
             let snippet = snippet_gen.snippet_from_doc(&doc);
             results.push(SearchResult {
                 doc_type: get_text(&doc, doc_type_f),
-                collection_id: get_text(&doc, coll_id_f),
-                collection_name: get_text(&doc, coll_name_f),
+                crawl_id: get_text(&doc, coll_id_f),
+                crawl_name: get_text(&doc, coll_name_f),
                 collection: get_text(&doc, collection_f),
                 url: get_text(&doc, url_f),
                 domain: get_text(&doc, domain_f),
@@ -448,8 +436,8 @@ pub struct Page<'a> {
     /// Year from the HTTP `Last-Modified` header, if present.
     pub modified_year: Option<u64>,
     /// The WACZ this page came from (id and display name).
-    pub collection_id: &'a str,
-    pub collection_name: &'a str,
+    pub crawl_id: &'a str,
+    pub crawl_name: &'a str,
     /// The curated collection id (slug) this page's WACZ belongs to.
     pub collection: &'a str,
 }
@@ -458,8 +446,8 @@ pub struct Page<'a> {
 pub struct SearchResult {
     pub doc_type: String,
     /// The WACZ this result came from (id and display name).
-    pub collection_id: String,
-    pub collection_name: String,
+    pub crawl_id: String,
+    pub crawl_name: String,
     /// The curated collection id (slug) the WACZ belongs to, for `collection:`
     /// filtering and linking to the collection page.
     pub collection: String,
@@ -523,7 +511,7 @@ pub struct FacetBucket {
 pub enum FacetScope<'a> {
     /// A curated collection, by its id/slug (the `collection` field).
     Collection(&'a str),
-    /// A single crawl/WACZ, by its id (the `collection_id` field).
+    /// A single crawl/WACZ, by its id (the `crawl_id` field).
     Crawl(&'a str),
 }
 
@@ -547,18 +535,18 @@ const EXTRA_FILTERS: [(&str, &str); 5] = [
     (FIELD_STATUS, "Status"),
     (FIELD_MODIFIED, "Modified"),
     // Scopes a search to a single crawl (WACZ). `crawl` is a friendly alias for
-    // the internal `collection_id` field (see `rewrite_crawl_alias`); its value is
+    // the internal `crawl_id` field (see `rewrite_crawl_alias`); its value is
     // an opaque WACZ id, so the server resolves it to the crawl's name for the
     // active-filter chip.
     (FILTER_CRAWL, "Crawl"),
 ];
 
 /// User-facing filter name that scopes a search to a single crawl - a friendly
-/// alias for the internal [`FIELD_COLLECTION_ID`] field (a crawl is one WACZ, and
-/// `collection_id` would be both internal jargon and misleading in the UI).
+/// alias for the internal [`FIELD_CRAWL_ID`] field (a crawl is one WACZ, and
+/// `crawl_id` would be both internal jargon and misleading in the UI).
 const FILTER_CRAWL: &str = "crawl";
 
-/// Rewrite the `crawl:` filter alias to the real `collection_id:` field so the
+/// Rewrite the `crawl:` filter alias to the real `crawl_id:` field so the
 /// query parser resolves it. Token-level: only a whole `crawl:<value>` token is
 /// rewritten (a bare word `crawl` in the query text is left alone). Crawl ids are
 /// simple tokens, so no range/quote handling is needed.
@@ -566,7 +554,7 @@ fn rewrite_crawl_alias(query_str: &str) -> String {
     query_str
         .split_whitespace()
         .map(|tok| match tok.strip_prefix("crawl:") {
-            Some(value) => format!("{FIELD_COLLECTION_ID}:{value}"),
+            Some(value) => format!("{FIELD_CRAWL_ID}:{value}"),
             None => tok.to_string(),
         })
         .collect::<Vec<_>>()
@@ -706,8 +694,8 @@ fn facet_string() -> TextOptions {
 fn build_schema() -> Schema {
     let mut builder = Schema::builder();
     builder.add_text_field(FIELD_DOC_TYPE, STRING | STORED);
-    builder.add_text_field(FIELD_COLLECTION_ID, STRING | STORED);
-    builder.add_text_field(FIELD_COLLECTION_NAME, STRING | STORED);
+    builder.add_text_field(FIELD_CRAWL_ID, STRING | STORED);
+    builder.add_text_field(FIELD_CRAWL_NAME, STRING | STORED);
     // Curated collection id (slug), for `collection:` filtering and faceting.
     builder.add_text_field(FIELD_COLLECTION, facet_string());
     builder.add_text_field(FIELD_URL, STRING | STORED);
@@ -1058,8 +1046,8 @@ mod tests {
             url,
             title,
             body,
-            collection_id: cid,
-            collection_name: cname,
+            crawl_id: cid,
+            crawl_name: cname,
             ..Default::default()
         }
     }
@@ -1071,8 +1059,8 @@ mod tests {
             timestamp: ts,
             title: "T",
             body: "shared content",
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         }
     }
@@ -1140,8 +1128,8 @@ mod tests {
             body: "ordinary body",
             keywords: "marmots rodentia",
             author: "Ada Lovelace",
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         })
         .unwrap();
@@ -1217,8 +1205,8 @@ mod tests {
             title: "T",
             body: french,
             lang: "en-GB",
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         })
         .unwrap();
@@ -1228,8 +1216,8 @@ mod tests {
             title: "T",
             body: french,
             lang: "",
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         })
         .unwrap();
@@ -1267,8 +1255,8 @@ mod tests {
             body: "shared",
             media_type: "html",
             lang: "en-US",
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         })
         .unwrap();
@@ -1278,8 +1266,8 @@ mod tests {
             body: "shared",
             media_type: "pdf",
             lang: "",
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         })
         .unwrap();
@@ -1317,7 +1305,7 @@ mod tests {
         let results = idx.search("Rust programming", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].url, "http://example.com/");
-        assert_eq!(results[0].collection_id, "abc12345");
+        assert_eq!(results[0].crawl_id, "abc12345");
         assert_eq!(results[0].doc_type, "page");
     }
 
@@ -1331,8 +1319,8 @@ mod tests {
             body: "ordinary body",
             description: "a treatise on marmots",
             headings: "Notable Rodents",
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         })
         .unwrap();
@@ -1371,7 +1359,7 @@ mod tests {
         let results = idx.search("digital preservation", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc_type, "collection");
-        assert_eq!(results[0].collection_id, "abc12345");
+        assert_eq!(results[0].crawl_id, "abc12345");
     }
 
     #[test]
@@ -1438,8 +1426,8 @@ mod tests {
             body: "shared",
             status: Some(200),
             modified_year: Some(2015),
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         })
         .unwrap();
@@ -1449,8 +1437,8 @@ mod tests {
             body: "shared",
             status: Some(404),
             modified_year: Some(2020),
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         })
         .unwrap();
@@ -1593,8 +1581,8 @@ mod tests {
             url: "https://a.com/1",
             title: "A",
             body: "shared",
-            collection_id: "w1",
-            collection_name: "W1",
+            crawl_id: "w1",
+            crawl_name: "W1",
             collection: "demo",
             ..Default::default()
         })
@@ -1603,8 +1591,8 @@ mod tests {
             url: "https://b.com/1",
             title: "B",
             body: "shared",
-            collection_id: "w2",
-            collection_name: "W2",
+            crawl_id: "w2",
+            crawl_name: "W2",
             collection: "other",
             ..Default::default()
         })
@@ -1736,8 +1724,8 @@ mod tests {
             media_type: "html",
             lang: "en-US",
             collection: "demo",
-            collection_id: "w1",
-            collection_name: "W1",
+            crawl_id: "w1",
+            crawl_name: "W1",
             ..Default::default()
         })
         .unwrap();
@@ -1749,8 +1737,8 @@ mod tests {
             media_type: "html",
             lang: "en",
             collection: "demo",
-            collection_id: "w1",
-            collection_name: "W1",
+            crawl_id: "w1",
+            crawl_name: "W1",
             ..Default::default()
         })
         .unwrap();
@@ -1762,8 +1750,8 @@ mod tests {
             media_type: "pdf",
             lang: "fr",
             collection: "news",
-            collection_id: "w2",
-            collection_name: "W2",
+            crawl_id: "w2",
+            crawl_name: "W2",
             ..Default::default()
         })
         .unwrap();
@@ -1812,8 +1800,8 @@ mod tests {
                 title: "A",
                 body: "shared",
                 timestamp: ts,
-                collection_id: "c1",
-                collection_name: "C1",
+                crawl_id: "c1",
+                crawl_name: "C1",
                 ..Default::default()
             })
             .unwrap();
@@ -1822,8 +1810,8 @@ mod tests {
             url: "https://ex.com/b",
             title: "B",
             body: "shared",
-            collection_id: "c1",
-            collection_name: "C1",
+            crawl_id: "c1",
+            crawl_name: "C1",
             ..Default::default()
         })
         .unwrap();
@@ -1895,8 +1883,8 @@ mod tests {
                 url: &url,
                 title: "T",
                 body: "shared",
-                collection_id: "c1",
-                collection_name: "C1",
+                crawl_id: "c1",
+                crawl_name: "C1",
                 ..Default::default()
             })
             .unwrap();

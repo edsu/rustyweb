@@ -288,7 +288,7 @@ async fn search_page(
             let is_collection = r.doc_type == "collection";
             let title = if r.title.is_empty() {
                 if is_collection {
-                    r.collection_name.clone()
+                    r.crawl_name.clone()
                 } else {
                     r.url.clone()
                 }
@@ -304,8 +304,8 @@ async fn search_page(
                 .unwrap_or(&r.collection)
                 .to_string();
             let coll_href = url_encode(&r.collection);
-            let name_enc = url_encode(&r.collection_name);
-            let source_enc = url_encode(&source_for(&r.collection_id));
+            let name_enc = url_encode(&r.crawl_name);
+            let source_enc = url_encode(&source_for(&r.crawl_id));
             // Carry the collection breadcrumb (name + id) into the replay viewer.
             let coll_q = format!(
                 "&collection={}&collection_id={coll_href}",
@@ -792,8 +792,8 @@ async fn search_api(
                     "domain": r.domain,
                     "timestamp": r.timestamp,
                     "title": r.title,
-                    "collection_id": r.collection_id,
-                    "collection_name": r.collection_name,
+                    "crawl_id": r.crawl_id,
+                    "crawl_name": r.crawl_name,
                     "collection": r.collection,
                     "snippet": r.snippet,
                     "capture_count": r.capture_count,
