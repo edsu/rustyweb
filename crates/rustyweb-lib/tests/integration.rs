@@ -544,8 +544,8 @@ async fn crawl_page_shows_scoped_facets() {
         "crawl page should show a scoped facet overview"
     );
     assert!(
-        html.contains(&format!("collection_id%3A{id}")),
-        "crawl facet links should scope the search to this crawl"
+        html.contains(&format!("crawl%3A{id}")),
+        "crawl facet links should scope the search to this crawl (via the crawl: alias)"
     );
 }
 

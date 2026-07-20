@@ -294,6 +294,9 @@ impl SearchIndex {
         limit: usize,
         offset: usize,
     ) -> Result<SearchResponse> {
+        // Map the `crawl:` filter alias onto its real `collection_id` field before
+        // parsing (the query parser resolves against schema field names).
+        let query_str = &rewrite_crawl_alias(query_str);
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
         let schema = self.index.schema();
@@ -543,10 +546,32 @@ const EXTRA_FILTERS: [(&str, &str); 5] = [
     (FIELD_DOMAIN, "Host"),
     (FIELD_STATUS, "Status"),
     (FIELD_MODIFIED, "Modified"),
-    // Scopes a search to a single crawl (WACZ). Its value is an opaque WACZ id,
-    // so the server resolves it to the crawl's name for the active-filter chip.
-    (FIELD_COLLECTION_ID, "Crawl"),
+    // Scopes a search to a single crawl (WACZ). `crawl` is a friendly alias for
+    // the internal `collection_id` field (see `rewrite_crawl_alias`); its value is
+    // an opaque WACZ id, so the server resolves it to the crawl's name for the
+    // active-filter chip.
+    (FILTER_CRAWL, "Crawl"),
 ];
+
+/// User-facing filter name that scopes a search to a single crawl - a friendly
+/// alias for the internal [`FIELD_COLLECTION_ID`] field (a crawl is one WACZ, and
+/// `collection_id` would be both internal jargon and misleading in the UI).
+const FILTER_CRAWL: &str = "crawl";
+
+/// Rewrite the `crawl:` filter alias to the real `collection_id:` field so the
+/// query parser resolves it. Token-level: only a whole `crawl:<value>` token is
+/// rewritten (a bare word `crawl` in the query text is left alone). Crawl ids are
+/// simple tokens, so no range/quote handling is needed.
+fn rewrite_crawl_alias(query_str: &str) -> String {
+    query_str
+        .split_whitespace()
+        .map(|tok| match tok.strip_prefix("crawl:") {
+            Some(value) => format!("{FIELD_COLLECTION_ID}:{value}"),
+            None => tok.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Whether `field` can be used as a `field:value` filter: a sidebar facet
 /// dimension or one of the extra filter fields. The single source of truth the

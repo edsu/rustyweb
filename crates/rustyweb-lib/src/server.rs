@@ -370,14 +370,14 @@ async fn search_page(
     // to page 1.
     let filters = active_filters(&q);
     let search_href = |new_q: &str| format!("/search?q={}", url_encode(new_q));
-    // The `collection_id` filter's value is an opaque WACZ id (from a crawl-page
-    // facet link); show the crawl's name in the chip instead. Other filters show
-    // their value as-is. The removal token still uses the raw id.
+    // The `crawl:` filter's value is an opaque WACZ id (from a crawl-page facet
+    // link); show the crawl's name in the chip instead. Other filters show their
+    // value as-is. The removal token still uses the raw id.
     let manifest = Manifest::open(&state.index_dir).ok();
     let active: Vec<views::ActiveFilter> = filters
         .iter()
         .map(|(f, v)| {
-            let display = if f == "collection_id" {
+            let display = if f == "crawl" {
                 manifest
                     .as_ref()
                     .and_then(|m| m.wacz_by_id(v))
@@ -658,7 +658,7 @@ async fn crawl_page(
                 .search
                 .facet_overview_scoped(crate::search::FacetScope::Crawl(&id))
                 .unwrap_or_default(),
-            &format!("collection_id:{id}"),
+            &format!("crawl:{id}"),
         ),
         pages,
     };

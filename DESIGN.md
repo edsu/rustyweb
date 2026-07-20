@@ -140,8 +140,9 @@ homepage browse entry points); `facet_overview_scoped(FacetScope)` does the same
 to one collection (`collection`) or crawl (`collection_id`) — this backs the **scoped facet
 overview on the collection and crawl detail pages**, where each value (top sites, years,
 types, languages) links into a search already scoped to that collection or crawl. The
-crawl-scoped links use a `collection_id:<id>` filter; since that id is opaque, the search
-page resolves it to the crawl's name for the active-filter chip.
+crawl-scoped links use a `crawl:<id>` filter - a friendly alias rewritten to the internal
+`collection_id` field before parsing (`collection_id` would be misleading UI jargon). Since
+the id is opaque, the search page resolves it to the crawl's name for the active-filter chip.
 
 Queries go through Tantivy's `QueryParser`, configured in `search_faceted`:
 
