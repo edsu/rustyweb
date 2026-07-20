@@ -88,7 +88,7 @@ resolves.
 |---|---|
 | `GET /` | Homepage: search box, browse-by-facet entry points, and the collection overview |
 | `GET /search?q=...&page=N` | Server-rendered results with a facet sidebar, month timeline, snippets, and pagination |
-| `GET /collection/{id}` | Collection detail: metadata + member crawls |
+| `GET /collection/{id}` | Collection detail: metadata, a scoped facet overview, and member crawls |
 | `GET /crawl/{id}` | Crawl detail: provenance panel, file metadata, seed pages (a crawl is one WACZ) |
 | `GET /api/search?q=...` | Full-text search → JSON (results, `total`, `capped`, `facets`) |
 | `GET /files/{id}` | Stream a registered WACZ file with byte-range support |
@@ -135,6 +135,11 @@ The facet dimensions (`collection`, `site`, `type`, `lang`) and the numeric `yea
 `SearchIndex::search_faceted(query, limit, offset)` runs one query and returns a page of
 results, the total, facet counts, and the month timeline together (see *Faceted, temporal
 discovery* below). `SearchIndex::search` is a thin wrapper returning just the hits.
+`SearchIndex::facet_overview()` runs only the aggregation over a match-all query (the
+homepage browse entry points); `facet_overview_scoped(FacetScope)` does the same restricted
+to one collection (`collection`) or crawl (`collection_id`) — this backs the **scoped facet
+overview on the collection detail page**, where each value (top sites, years, types,
+languages) links into a search already scoped to that collection.
 
 Queries go through Tantivy's `QueryParser`, configured in `search_faceted`:
 
@@ -185,7 +190,7 @@ Fields extracted:
 - `software` - crawler/packager software (also enriched from the WARC `warcinfo`)
 - Seed pages - first entries from the `pages` array (url, title, timestamp)
 
-The WACZ detail page shows this per WACZ; the collection page aggregates it across members.
+The crawl detail page shows this per crawl; the collection page aggregates it across members.
 
 ---
 

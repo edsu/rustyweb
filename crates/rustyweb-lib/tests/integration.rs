@@ -485,6 +485,40 @@ async fn collection_page_lists_members() {
 }
 
 #[tokio::test]
+async fn collection_page_shows_scoped_facets() {
+    // The collection page carries a scoped facet overview: each value links into
+    // a search restricted to this collection (`collection:<id>`), turning the page
+    // into a faceted entry point rather than just a member list.
+    let tmp = make_index(&["a.wacz"]);
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let coll_id = manifest.collections[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/collection/{coll_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    // At least one facet dimension renders (a.wacz has real captures → sites/years).
+    assert!(
+        html.contains("Top sites") || html.contains("By year"),
+        "collection page should show a scoped facet overview"
+    );
+    // Its facet links scope the search to this collection (url-encoded `collection:`).
+    assert!(
+        html.contains(&format!("collection%3A{coll_id}")),
+        "facet links should scope the search to this collection"
+    );
+}
+
+#[tokio::test]
 async fn collection_page_unknown_id_404() {
     let tmp = TempDir::new().unwrap();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
