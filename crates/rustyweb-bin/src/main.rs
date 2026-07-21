@@ -153,6 +153,17 @@ enum Commands {
         #[command(subcommand)]
         action: CrawlCmd,
     },
+    /// Import content into rustyweb from an external web-archiving service.
+    Import {
+        #[command(subcommand)]
+        action: ImportCmd,
+    },
+}
+
+/// Sources that content can be imported from. Each is its own command (their
+/// flags differ), grouped under `import`.
+#[derive(Subcommand)]
+enum ImportCmd {
     /// Import WACZ files from a Browsertrix instance (Webrecorder's hosted
     /// crawler). Authenticates with credentials from the environment:
     /// BROWSERTRIX_USER + BROWSERTRIX_PASSWORD, or a BROWSERTRIX_TOKEN — kept out
@@ -433,13 +444,15 @@ async fn main() -> Result<()> {
         &cli.command,
         Commands::Index { verbose: true, .. }
             | Commands::Reindex { verbose: true, .. }
-            | Commands::Browsertrix { verbose: true, .. }
+            | Commands::Import {
+                action: ImportCmd::Browsertrix { verbose: true, .. }
+            }
     );
     // `index`, `reindex`, and `browsertrix` (which indexes what it downloads) all
     // stream records and show the progress bar.
     let shows_progress = matches!(
         &cli.command,
-        Commands::Index { .. } | Commands::Reindex { .. } | Commands::Browsertrix { .. }
+        Commands::Index { .. } | Commands::Reindex { .. } | Commands::Import { .. }
     );
     let show_bar = shows_progress && !verbose && std::io::stderr().is_terminal();
     let default_level = if verbose {
@@ -449,15 +462,18 @@ async fn main() -> Result<()> {
     } else {
         "info"
     };
-    // Default filter: our level, but silence pdf-extract/lopdf, which log noisy
-    // per-glyph warnings ("unknown glyph name ...") through the tracing-log bridge
-    // during PDF text extraction. We already handle PDF outcomes ourselves, so
-    // these are pure noise (and stomp the progress bar). RUST_LOG overrides the
-    // whole thing if you want to see them.
+    // Default filter: our level, but silence third-party parsers that log noisy,
+    // non-fatal diagnostics through the tracing-log bridge during indexing:
+    //  - pdf-extract/lopdf: per-glyph warnings ("unknown glyph name ...").
+    //  - html5ever: HTML quirks like "foster parenting not implemented" while
+    //    parsing archived pages for text/images — harmless, and it recovers.
+    // We handle these outcomes ourselves, so the log lines are pure noise (and
+    // stomp the progress bar). RUST_LOG overrides the whole thing to see them.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(default_level)
             .add_directive("pdf_extract=off".parse().unwrap())
             .add_directive("lopdf=off".parse().unwrap())
+            .add_directive("html5ever=off".parse().unwrap())
     });
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -659,42 +675,44 @@ async fn main() -> Result<()> {
             }
         },
 
-        Commands::Browsertrix {
-            host,
-            org,
-            home,
-            collection,
-            crawl,
-            into,
-            include_unreviewed,
-            min_review,
-            limit,
-            dry_run,
-            force,
-            verbose: _,
-        } => {
-            let bar = show_bar.then(BarProgress::new);
-            let progress = bar
-                .as_ref()
-                .map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
-            let opts = ImportOpts {
-                collection: collection.as_deref(),
-                crawl: crawl.as_deref(),
-                into: into.as_deref(),
+        Commands::Import { action } => match action {
+            ImportCmd::Browsertrix {
+                host,
+                org,
+                home,
+                collection,
+                crawl,
+                into,
                 include_unreviewed,
                 min_review,
                 limit,
                 dry_run,
                 force,
-            };
-            let result = run_browsertrix(&host, org.as_deref(), &home, &opts, progress);
-            if result.is_err() {
-                if let Some(b) = &bar {
-                    b.clear();
+                verbose: _,
+            } => {
+                let bar = show_bar.then(BarProgress::new);
+                let progress = bar
+                    .as_ref()
+                    .map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
+                let opts = ImportOpts {
+                    collection: collection.as_deref(),
+                    crawl: crawl.as_deref(),
+                    into: into.as_deref(),
+                    include_unreviewed,
+                    min_review,
+                    limit,
+                    dry_run,
+                    force,
+                };
+                let result = run_browsertrix(&host, org.as_deref(), &home, &opts, progress);
+                if result.is_err() {
+                    if let Some(b) = &bar {
+                        b.clear();
+                    }
                 }
+                result?;
             }
-            result?;
-        }
+        },
     }
 
     Ok(())
