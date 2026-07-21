@@ -67,6 +67,7 @@ rustyweb collection list[--home <DIR>]
 rustyweb crawl set      [--home <DIR>] <CRAWL_ID> --image <FILE>
 rustyweb search-url     [--home <DIR>] <URL>
 rustyweb verify         [--home <DIR>]
+rustyweb import browsertrix [--home <DIR>] [--host <URL>] [--org <SLUG>] [--collection <ID|SLUG>] [--crawl <ID>] [--into <NAME>] [--include-unreviewed] [--min-review <N>] [--limit <N>] [--dry-run] [--force] [-v]
 ```
 
 Every command takes `--home <DIR>` (default `.`). The home directory holds two
@@ -81,6 +82,7 @@ resolves.
 - `collection set` / `collection list`: reassign WACZs to a collection (by WACZ id) / list collections and their members. Metadata like description and curator is edited in `collections.json` directly.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
 - `verify`: re-hashes every WACZ in the manifest and compares against the stored SHA-256, reporting each as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
+- `import <source>`: a group of importers that pull content from external web-archiving services (each source is its own subcommand, since their auth and selection differ; grouped so future sources — Archive-It, a WARC→WACZ builder — are siblings rather than new top-level verbs). `import browsertrix` authenticates to a [Browsertrix](https://browsertrix.com/) instance (credentials from `BROWSERTRIX_USER`/`BROWSERTRIX_PASSWORD` or `BROWSERTRIX_TOKEN` in the environment, never argv), resolves the org, and for each selected archived item **downloads** the WACZ into `<home>/archive` via its presigned `replay.json` URL and indexes it as a durable local (File) source. Downloading (rather than streaming in place) is deliberate: Browsertrix presigned URLs expire in ~48h, so a streamed remote source would break replay — the download keeps replay durable. Selection: `--collection <ID|SLUG|NAME>` (resolved to the collection UUID the API requires) or `--crawl <ID>`; default is the whole org. **QA filter:** by default only crawls a reviewer has QA'd in Browsertrix (`reviewStatus` set) are imported; `--include-unreviewed` / `--min-review <1-5>` adjust this, and a single named `--crawl` is always included. **Incremental:** provenance recorded on each crawl (`browsertrix` field in the manifest: host, item id, resource hash) lets a re-run skip already-imported items unless `--force`. `--into <NAME>` groups the imports into a curated collection; `--dry-run` lists without downloading. The HTTP client (`browsertrix.rs`) is transport-abstracted for testing (mirrors `http_range::RangeFetch`). See *Indexing Pipeline*.
 
 ---
 

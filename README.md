@@ -273,6 +273,55 @@ conveying that a collection spans multiple crawls of multiple sites. Crawls
 without an image fall back to a CSS placeholder. A curator can pin a specific
 image with `rustyweb crawl set <crawl-id> --image <file>` (kept across reindexing).
 
+## Importing from Browsertrix
+
+If your WACZs live in a [Browsertrix](https://browsertrix.com/) account
+(Webrecorder's hosted crawler), `rustyweb import browsertrix` downloads them into
+`<home>/archive` and indexes them as durable local sources.
+
+Credentials come from the **environment**, never the command line, so they don't
+show up in the process list:
+
+```sh
+export BROWSERTRIX_USER='you@example.org'
+read -rs BROWSERTRIX_PASSWORD; export BROWSERTRIX_PASSWORD   # prompts, no echo
+# or, instead of user/password:  export BROWSERTRIX_TOKEN='<a JWT>'
+```
+
+Then import - preview first with `--dry-run`, then pull for real:
+
+```sh
+# everything you've QA'd in your (only) org, into ~/webarchive
+rustyweb import browsertrix --home ~/webarchive --dry-run
+rustyweb import browsertrix --home ~/webarchive
+
+# just one collection (by id, slug, or name), grouped into a rustyweb collection
+rustyweb import browsertrix --collection us-govarchive --into "US Gov" --home ~/webarchive
+
+# a single crawl
+rustyweb import browsertrix --crawl <item-id> --home ~/webarchive
+```
+
+Notes:
+
+- **QA'd crawls only, by default.** Browsertrix lets a reviewer rate a crawl
+  (`reviewStatus`); rustyweb imports only reviewed crawls so you publish vetted
+  content. Add `--include-unreviewed` to import everything, or `--min-review <1-5>`
+  for a rating threshold. A single named `--crawl` is always imported. When crawls
+  are skipped for this reason, rustyweb says so.
+- **Selection.** `--collection <ID|SLUG|NAME>` limits to one Browsertrix
+  collection; `--crawl <ID>` to a single archived item; neither imports the whole
+  org. `--org <SLUG>` picks the org when your account has more than one.
+- **Incremental.** Re-running skips crawls already imported (matched by content
+  hash), so syncing an account is cheap; `--force` re-imports anyway.
+- **Durable.** WACZs are downloaded (not streamed) into `<home>/archive`, because
+  Browsertrix's presigned URLs expire after ~48h - a downloaded copy keeps replay
+  working long-term. `--host <URL>` targets a self-hosted Browsertrix (default is
+  `https://app.browsertrix.com`).
+- `--into <NAME>` groups the imports into one rustyweb collection; without it each
+  crawl is its own. `--limit <N>` caps how many are imported; `--dry-run` lists
+  them without downloading.
+
 ## Command line
 
 ```
@@ -284,6 +333,7 @@ rustyweb collection list [--home <DIR>]
 rustyweb crawl set       [--home <DIR>] <CRAWL_ID> --image <FILE>
 rustyweb search-url      [--home <DIR>] <URL>
 rustyweb verify          [--home <DIR>]
+rustyweb import browsertrix [--home <DIR>] [--host <URL>] [--org <SLUG>] [--collection <ID|SLUG>] [--crawl <ID>] [--into <NAME>] [--include-unreviewed] [--min-review <N>] [--limit <N>] [--dry-run] [--force] [-v]
 ```
 
 Every command takes `--home <DIR>` (default `.`); `archive/` and `index/` are
@@ -339,6 +389,9 @@ derived siblings under it.
   `MISSING`. Exits non-zero if any collection fails, so it works in a cron job
   or CI. This is rustyweb's fixity check - a small guard against the archive
   quietly bit-rotting or being tampered with.
+- **`import browsertrix`** - imports WACZ files from a [Browsertrix](https://browsertrix.com/)
+  instance (Webrecorder's hosted crawler) - the "index your own crawls" path.
+  See [Importing from Browsertrix](#importing-from-browsertrix).
 
 ## Testing
 
