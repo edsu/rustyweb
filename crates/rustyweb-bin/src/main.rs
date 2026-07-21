@@ -171,9 +171,23 @@ enum Commands {
         #[arg(long, default_value = ".")]
         home: PathBuf,
 
-        /// Show at most N items (0 = all).
+        /// Add the imported crawls to this collection (created if new). Without
+        /// it, each crawl is its own collection.
+        #[arg(long)]
+        collection: Option<String>,
+
+        /// Import at most N items (0 = all).
         #[arg(long, value_name = "N", default_value_t = 0)]
         limit: usize,
+
+        /// List what would be imported, without downloading or indexing.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Verbose logging (debug level). Replaces the progress bar with detailed
+        /// per-record logs.
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
 }
 
@@ -387,12 +401,15 @@ async fn main() -> Result<()> {
     // RUST_LOG overrides the level in all cases.
     let verbose = matches!(
         &cli.command,
-        Commands::Index { verbose: true, .. } | Commands::Reindex { verbose: true, .. }
+        Commands::Index { verbose: true, .. }
+            | Commands::Reindex { verbose: true, .. }
+            | Commands::Browsertrix { verbose: true, .. }
     );
-    // Both `index` and `reindex` stream records and show the progress bar.
+    // `index`, `reindex`, and `browsertrix` (which indexes what it downloads) all
+    // stream records and show the progress bar.
     let shows_progress = matches!(
         &cli.command,
-        Commands::Index { .. } | Commands::Reindex { .. }
+        Commands::Index { .. } | Commands::Reindex { .. } | Commands::Browsertrix { .. }
     );
     let show_bar = shows_progress && !verbose && std::io::stderr().is_terminal();
     let default_level = if verbose {
@@ -616,9 +633,30 @@ async fn main() -> Result<()> {
             host,
             org,
             home,
+            collection,
             limit,
+            dry_run,
+            verbose: _,
         } => {
-            run_browsertrix(&host, org.as_deref(), &home, limit)?;
+            let bar = show_bar.then(BarProgress::new);
+            let progress = bar
+                .as_ref()
+                .map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
+            let result = run_browsertrix(
+                &host,
+                org.as_deref(),
+                &home,
+                collection.as_deref(),
+                limit,
+                dry_run,
+                progress,
+            );
+            if result.is_err() {
+                if let Some(b) = &bar {
+                    b.clear();
+                }
+            }
+            result?;
         }
     }
 
@@ -758,14 +796,23 @@ fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Authenticate to Browsertrix, resolve the org, and list its archived items.
-/// The download-and-index flow is a follow-up task (rustyweb-15z.3); for now
-/// this proves the auth + org-selection path and shows what's there.
+/// Authenticate to Browsertrix, resolve the org, and import its archived items:
+/// download each item's WACZ into `<home>/archive` and index it as a durable
+/// local (File) source. `--dry-run` lists what would be imported instead.
+///
+/// Each WACZ is downloaded via its presigned `replay.json` URL (a flat, single
+/// WACZ) rather than the combined per-item `/download` (which can be a nested
+/// multi-WACZ — see rustyweb-15z.8), so it indexes cleanly today. Downloading
+/// (rather than streaming in place) keeps replay durable: the presigned URLs
+/// expire in ~48 h, so they're an ingest artifact, not a replay source.
 fn run_browsertrix(
     host: &str,
     org: Option<&str>,
     home: &std::path::Path,
+    collection: Option<&str>,
     limit: usize,
+    dry_run: bool,
+    progress: Option<&dyn rustyweb_lib::index::IndexProgress>,
 ) -> Result<()> {
     let client = connect(host)?;
     let orgs = client.orgs().context("listing organizations")?;
@@ -773,39 +820,141 @@ fn run_browsertrix(
     tracing::info!(org = %org.name, id = %org.id, "using organization");
 
     let items = client.items(&org.id).context("listing archived items")?;
-    let shown = if limit == 0 {
+    let count = if limit == 0 {
         items.len()
     } else {
         limit.min(items.len())
     };
-    println!(
-        "{} item(s) in \"{}\" ({}):",
-        items.len(),
-        org.name,
-        org.slug
-    );
-    for item in items.iter().take(shown) {
-        let kind = if item.is_upload() { "upload" } else { "crawl" };
+    let selected = &items[..count];
+
+    if dry_run {
         println!(
-            "  {:<6} {:>10}  {}  {}",
-            kind,
-            human_size(item.file_size),
-            item.id,
-            item.name
+            "{} item(s) in \"{}\" ({}):",
+            items.len(),
+            org.name,
+            org.slug
         );
+        for item in selected {
+            let kind = if item.is_upload() { "upload" } else { "crawl" };
+            println!(
+                "  {:<6} {:>10}  {}  {}",
+                kind,
+                human_size(item.file_size),
+                item.id,
+                item.name
+            );
+        }
+        if count < items.len() {
+            println!(
+                "  … {} more (raise --limit to import them)",
+                items.len() - count
+            );
+        }
+        return Ok(());
     }
-    if shown < items.len() {
-        println!(
-            "  … {} more (use --limit 0 to show all)",
-            items.len() - shown
-        );
+
+    let archive = rustyweb_lib::index::archive_dir(home);
+    std::fs::create_dir_all(&archive)
+        .with_context(|| format!("creating archive dir {}", archive.display()))?;
+
+    let mut imported = 0usize;
+    for item in selected {
+        let resources = client
+            .resources(&org.id, item)
+            .with_context(|| format!("resolving resources for item {}", item.id))?;
+        if resources.is_empty() {
+            tracing::warn!(item = %item.name, id = %item.id, "no WACZ resources; skipping");
+            continue;
+        }
+        for res in &resources {
+            let filename = safe_wacz_filename(&res.name, &item.id);
+            let dest = archive.join(&filename);
+            let size = if res.size > 0 {
+                format!(" ({})", human_size(res.size))
+            } else {
+                String::new()
+            };
+            eprintln!("↓ downloading {filename}{size}");
+            download_wacz(&res.path, &dest)?;
+
+            // pdf-extract writes glyph diagnostics to stdout during indexing;
+            // silence it (as `index`/`reindex` do) so it doesn't stomp the bar.
+            let quiet = gag::Gag::stdout().ok();
+            let indexed = rustyweb_lib::index::index_location(
+                &dest.to_string_lossy(),
+                home,
+                Some(&item.name),
+                collection,
+                false,
+                None,
+                progress,
+            );
+            drop(quiet);
+            indexed.with_context(|| format!("indexing {}", dest.display()))?;
+            imported += 1;
+        }
     }
-    // The actual import lands in 15z.3; make the target explicit until then.
-    tracing::info!(
-        home = %home.display(),
-        "download + index into <home>/archive is not wired yet (rustyweb-15z.3)"
-    );
+    tracing::info!(imported, "browsertrix import complete");
     Ok(())
+}
+
+/// Download a WACZ to `dest` via a temp `.part` file renamed on success, so an
+/// interrupted download never leaves a truncated file that looks complete.
+/// Returns the number of bytes written.
+fn download_wacz(url: &str, dest: &std::path::Path) -> Result<u64> {
+    use std::io::{Read, Write};
+
+    let mut tmp = dest.as_os_str().to_owned();
+    tmp.push(".part");
+    let tmp = PathBuf::from(tmp);
+
+    let mut reader =
+        rustyweb_lib::http_range::get_reader(url).with_context(|| format!("fetching {url}"))?;
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("reading {url}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        written += n as u64;
+    }
+    file.sync_all().ok();
+    drop(file);
+    std::fs::rename(&tmp, dest).with_context(|| format!("finalizing {}", dest.display()))?;
+    Ok(written)
+}
+
+/// A filesystem-safe `.wacz` filename derived from a resource name (falling back
+/// to the item id). Non-`[A-Za-z0-9._-]` characters — including any path
+/// separators — become `_`, so the result stays a single component inside the
+/// archive folder.
+fn safe_wacz_filename(name: &str, fallback_id: &str) -> String {
+    let base = if name.trim().is_empty() {
+        fallback_id
+    } else {
+        name.trim()
+    };
+    let mut out: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if !out.to_ascii_lowercase().ends_with(".wacz") {
+        out.push_str(".wacz");
+    }
+    out
 }
 
 /// Build a Browsertrix client from environment credentials, so secrets never
@@ -875,7 +1024,7 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::parse_source_lines;
-    use super::{human_size, resolve_org};
+    use super::{human_size, resolve_org, safe_wacz_filename};
     use rustyweb_lib::browsertrix::Org;
 
     fn org(id: &str, slug: &str) -> Org {
@@ -919,6 +1068,21 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MiB");
+    }
+
+    #[test]
+    fn safe_wacz_filename_sanitizes_and_ensures_extension() {
+        assert_eq!(safe_wacz_filename("my crawl.wacz", "id1"), "my_crawl.wacz");
+        // Path separators and other unsafe chars become '_'; extension appended.
+        assert_eq!(
+            safe_wacz_filename("../etc/passwd", "id1"),
+            ".._etc_passwd.wacz"
+        );
+        assert_eq!(safe_wacz_filename("plain", "id1"), "plain.wacz");
+        // Empty name falls back to the item id.
+        assert_eq!(safe_wacz_filename("   ", "abc123"), "abc123.wacz");
+        // Already-correct names are preserved (case-insensitive extension check).
+        assert_eq!(safe_wacz_filename("a-b_c.WACZ", "id1"), "a-b_c.WACZ");
     }
 
     #[test]
