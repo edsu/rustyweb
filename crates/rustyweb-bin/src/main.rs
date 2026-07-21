@@ -171,10 +171,35 @@ enum Commands {
         #[arg(long, default_value = ".")]
         home: PathBuf,
 
-        /// Add the imported crawls to this collection (created if new). Without
-        /// it, each crawl is its own collection.
-        #[arg(long)]
+        /// Import only this Browsertrix collection (its id). Default: the whole
+        /// org.
+        #[arg(long, conflicts_with = "crawl")]
         collection: Option<String>,
+
+        /// Import only this archived item (a crawl or upload) by id. Implies
+        /// including it even if it hasn't been QA'd.
+        #[arg(long)]
+        crawl: Option<String>,
+
+        /// Group the imported crawls into this rustyweb collection (created if
+        /// new). Without it, each crawl is its own collection.
+        #[arg(long)]
+        into: Option<String>,
+
+        /// Also import crawls that haven't been QA'd. By default only crawls a
+        /// reviewer has QA'd in Browsertrix are imported.
+        #[arg(long)]
+        include_unreviewed: bool,
+
+        /// Only import crawls whose QA review rating is at least N (1–5). Implies
+        /// reviewed-only.
+        #[arg(
+            long,
+            value_name = "N",
+            value_parser = clap::value_parser!(u8).range(1..=5),
+            conflicts_with = "include_unreviewed"
+        )]
+        min_review: Option<u8>,
 
         /// Import at most N items (0 = all).
         #[arg(long, value_name = "N", default_value_t = 0)]
@@ -639,6 +664,10 @@ async fn main() -> Result<()> {
             org,
             home,
             collection,
+            crawl,
+            into,
+            include_unreviewed,
+            min_review,
             limit,
             dry_run,
             force,
@@ -648,16 +677,17 @@ async fn main() -> Result<()> {
             let progress = bar
                 .as_ref()
                 .map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
-            let result = run_browsertrix(
-                &host,
-                org.as_deref(),
-                &home,
-                collection.as_deref(),
+            let opts = ImportOpts {
+                collection: collection.as_deref(),
+                crawl: crawl.as_deref(),
+                into: into.as_deref(),
+                include_unreviewed,
+                min_review,
                 limit,
                 dry_run,
                 force,
-                progress,
-            );
+            };
+            let result = run_browsertrix(&host, org.as_deref(), &home, &opts, progress);
             if result.is_err() {
                 if let Some(b) = &bar {
                     b.clear();
@@ -812,52 +842,105 @@ fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
 /// multi-WACZ — see rustyweb-15z.8), so it indexes cleanly today. Downloading
 /// (rather than streaming in place) keeps replay durable: the presigned URLs
 /// expire in ~48 h, so they're an ingest artifact, not a replay source.
-#[allow(clippy::too_many_arguments)]
+/// Options for a Browsertrix import (from the `browsertrix` subcommand).
+struct ImportOpts<'a> {
+    /// Import only this Browsertrix collection (its id); `None` = whole org.
+    collection: Option<&'a str>,
+    /// Import only this archived item by id; `None` = all selected.
+    crawl: Option<&'a str>,
+    /// Group imports into this rustyweb collection; `None` = one per crawl.
+    into: Option<&'a str>,
+    /// Import crawls that haven't been QA'd too (default: reviewed-only).
+    include_unreviewed: bool,
+    /// Minimum QA review rating to import (implies reviewed-only).
+    min_review: Option<u8>,
+    limit: usize,
+    dry_run: bool,
+    force: bool,
+}
+
+/// Authenticate to Browsertrix, resolve the org, and import its archived items:
+/// download each item's WACZ into `<home>/archive` and index it as a durable
+/// local (File) source. `--dry-run` lists what would be imported instead.
+///
+/// By default only crawls a reviewer has QA'd in Browsertrix are imported (see
+/// [`passes_review`]); `--include-unreviewed` and `--min-review` adjust that,
+/// and naming a single `--crawl` always includes it.
+///
+/// Each WACZ is downloaded via its presigned `replay.json` URL (a flat, single
+/// WACZ) rather than the combined per-item `/download` (which can be a nested
+/// multi-WACZ — see rustyweb-15z.8), so it indexes cleanly today. Downloading
+/// (rather than streaming in place) keeps replay durable: the presigned URLs
+/// expire in ~48 h, so they're an ingest artifact, not a replay source.
 fn run_browsertrix(
     host: &str,
     org: Option<&str>,
     home: &std::path::Path,
-    collection: Option<&str>,
-    limit: usize,
-    dry_run: bool,
-    force: bool,
+    opts: &ImportOpts,
     progress: Option<&dyn rustyweb_lib::index::IndexProgress>,
 ) -> Result<()> {
+    use rustyweb_lib::browsertrix::ItemQuery;
+
     let client = connect(host)?;
     let host = client.host().to_string();
     let orgs = client.orgs().context("listing organizations")?;
     let org = resolve_org(&orgs, org)?;
     tracing::info!(org = %org.name, id = %org.id, "using organization");
 
-    let items = client.items(&org.id).context("listing archived items")?;
-    let count = if limit == 0 {
-        items.len()
-    } else {
-        limit.min(items.len())
+    // Selection is server-side (a collection or a single item); the review
+    // filter is applied client-side so we can report what was skipped.
+    let query = ItemQuery {
+        collection_id: opts.collection,
+        item_id: opts.crawl,
     };
-    let selected = &items[..count];
+    let items = client
+        .items(&org.id, &query)
+        .context("listing archived items")?;
 
-    if dry_run {
+    // A single named --crawl is an explicit choice, so import it regardless of
+    // its review status.
+    let include_unreviewed = opts.include_unreviewed || opts.crawl.is_some();
+    let reviewed: Vec<&rustyweb_lib::browsertrix::Item> = items
+        .iter()
+        .filter(|it| passes_review(it, include_unreviewed, opts.min_review))
+        .collect();
+    let skipped_review = items.len() - reviewed.len();
+    if skipped_review > 0 {
+        tracing::info!(
+            skipped_review,
+            "skipped crawls that aren't QA'd (use --include-unreviewed to import them)"
+        );
+    }
+
+    let count = if opts.limit == 0 {
+        reviewed.len()
+    } else {
+        opts.limit.min(reviewed.len())
+    };
+    let selected = &reviewed[..count];
+
+    if opts.dry_run {
         println!(
-            "{} item(s) in \"{}\" ({}):",
-            items.len(),
+            "{} item(s) to import from \"{}\" ({}):",
+            selected.len(),
             org.name,
             org.slug
         );
-        for item in selected {
-            let kind = if item.is_upload() { "upload" } else { "crawl" };
+        for &item in selected {
             println!(
-                "  {:<6} {:>10}  {}  {}",
-                kind,
+                "  {:<6} {:>10}  {:>4}  {}  {}",
+                if item.is_upload() { "upload" } else { "crawl" },
                 human_size(item.file_size),
+                item.review_status
+                    .map_or("—".to_string(), |s| format!("QA{s}")),
                 item.id,
                 item.name
             );
         }
-        if count < items.len() {
+        if count < reviewed.len() {
             println!(
                 "  … {} more (raise --limit to import them)",
-                items.len() - count
+                reviewed.len() - count
             );
         }
         return Ok(());
@@ -875,7 +958,7 @@ fn run_browsertrix(
 
     let mut imported = 0usize;
     let mut skipped = 0usize;
-    for item in selected {
+    for &item in selected {
         let resources = client
             .resources(&org.id, item)
             .with_context(|| format!("resolving resources for item {}", item.id))?;
@@ -885,7 +968,7 @@ fn run_browsertrix(
         }
         for res in &resources {
             let key = (host.clone(), item.id.clone(), res.hash.clone());
-            if !force && seen.contains(&key) {
+            if !opts.force && seen.contains(&key) {
                 tracing::debug!(item = %item.name, "already imported; skipping");
                 skipped += 1;
                 continue;
@@ -908,7 +991,7 @@ fn run_browsertrix(
                 &dest.to_string_lossy(),
                 home,
                 Some(&item.name),
-                collection,
+                opts.into,
                 false,
                 None,
                 progress,
@@ -927,6 +1010,23 @@ fn run_browsertrix(
     }
     tracing::info!(imported, skipped, "browsertrix import complete");
     Ok(())
+}
+
+/// Whether an item passes the QA-review filter. Reviewed-only is the default;
+/// `include_unreviewed` lets everything through, and `min_review` (which implies
+/// reviewed-only) requires at least that rating.
+fn passes_review(
+    item: &rustyweb_lib::browsertrix::Item,
+    include_unreviewed: bool,
+    min_review: Option<u8>,
+) -> bool {
+    if include_unreviewed {
+        return true;
+    }
+    match item.review_status {
+        Some(s) => min_review.is_none_or(|m| s >= m),
+        None => false,
+    }
 }
 
 /// Load the set of already-imported Browsertrix resources — `(host, item_id,
@@ -1073,8 +1173,18 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::parse_source_lines;
-    use super::{human_size, resolve_org, safe_wacz_filename};
-    use rustyweb_lib::browsertrix::Org;
+    use super::{human_size, passes_review, resolve_org, safe_wacz_filename};
+    use rustyweb_lib::browsertrix::{Item, Org};
+
+    fn item(review: Option<u8>) -> Item {
+        Item {
+            id: "x".into(),
+            name: "n".into(),
+            item_type: "crawl".into(),
+            file_size: 0,
+            review_status: review,
+        }
+    }
 
     fn org(id: &str, slug: &str) -> Org {
         Org {
@@ -1117,6 +1227,27 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MiB");
+    }
+
+    #[test]
+    fn passes_review_defaults_to_reviewed_only() {
+        // Default: reviewed passes, unreviewed is skipped.
+        assert!(passes_review(&item(Some(3)), false, None));
+        assert!(!passes_review(&item(None), false, None));
+    }
+
+    #[test]
+    fn passes_review_include_unreviewed_lets_everything_through() {
+        assert!(passes_review(&item(None), true, None));
+        assert!(passes_review(&item(Some(1)), true, None));
+    }
+
+    #[test]
+    fn passes_review_min_review_is_a_threshold() {
+        assert!(passes_review(&item(Some(5)), false, Some(4)));
+        assert!(passes_review(&item(Some(4)), false, Some(4)));
+        assert!(!passes_review(&item(Some(3)), false, Some(4)));
+        assert!(!passes_review(&item(None), false, Some(4)));
     }
 
     #[test]

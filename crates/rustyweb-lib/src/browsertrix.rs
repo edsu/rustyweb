@@ -158,6 +158,10 @@ pub struct Item {
     pub item_type: String,
     #[serde(rename = "fileSize", default)]
     pub file_size: u64,
+    /// QA review rating (1–5) set by a reviewer in Browsertrix. `None` when the
+    /// item has never been QA'd.
+    #[serde(rename = "reviewStatus", default)]
+    pub review_status: Option<u8>,
 }
 
 impl Item {
@@ -166,6 +170,21 @@ impl Item {
     pub fn is_upload(&self) -> bool {
         self.item_type == "upload"
     }
+
+    /// Whether a reviewer has QA'd this item (its `reviewStatus` is set).
+    pub fn is_reviewed(&self) -> bool {
+        self.review_status.is_some()
+    }
+}
+
+/// Server-side selection filters for [`Client::items`]. Defaults to no filter
+/// (the whole org).
+#[derive(Default)]
+pub struct ItemQuery<'a> {
+    /// Limit to a Browsertrix collection by its id (UUID).
+    pub collection_id: Option<&'a str>,
+    /// Limit to a single archived item (crawl or upload) by id.
+    pub item_id: Option<&'a str>,
 }
 
 /// One WACZ file backing an item, from its `replay.json`.
@@ -281,12 +300,20 @@ impl<T: Transport> Client<T> {
 
     /// The user's organizations.
     pub fn orgs(&self) -> Result<Vec<Org>> {
-        self.list("/api/orgs")
+        self.list("/api/orgs", &[])
     }
 
-    /// All archived items (crawls + uploads) in an org, across every page.
-    pub fn items(&self, oid: &str) -> Result<Vec<Item>> {
-        self.list(&format!("/api/orgs/{oid}/all-crawls"))
+    /// Archived items (crawls + uploads) in an org, across every page, narrowed
+    /// by `query` (a collection or a single item; the default is the whole org).
+    pub fn items(&self, oid: &str, query: &ItemQuery) -> Result<Vec<Item>> {
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(c) = query.collection_id {
+            params.push(("collectionId", c.to_string()));
+        }
+        if let Some(i) = query.item_id {
+            params.push(("ids", i.to_string()));
+        }
+        self.list(&format!("/api/orgs/{oid}/all-crawls"), &params)
     }
 
     /// The WACZ resources backing an item, from its `replay.json`. Each carries
@@ -325,12 +352,20 @@ impl<T: Transport> Client<T> {
     }
 
     /// Fetch every page of a paginated list endpoint and concatenate the items.
-    fn list<D: DeserializeOwned>(&self, path: &str) -> Result<Vec<D>> {
+    /// `params` are extra query pairs (e.g. filters) appended to each page
+    /// request; values are percent-encoded.
+    fn list<D: DeserializeOwned>(&self, path: &str, params: &[(&str, String)]) -> Result<Vec<D>> {
         let mut out = Vec::new();
         let mut page = 1usize;
         loop {
-            let envelope: Paginated<D> =
-                self.get_json(&format!("{path}?page={page}&pageSize={}", self.page_size))?;
+            let mut query = format!("page={page}&pageSize={}", self.page_size);
+            for (k, v) in params {
+                query.push('&');
+                query.push_str(k);
+                query.push('=');
+                query.extend(url::form_urlencoded::byte_serialize(v.as_bytes()));
+            }
+            let envelope: Paginated<D> = self.get_json(&format!("{path}?{query}"))?;
             let got = envelope.items.len();
             out.extend(envelope.items);
             // Stop at a short/empty page (the last one), or once we've collected
@@ -481,13 +516,32 @@ mod tests {
         )
         .with_page_size(2);
 
-        let items = c.items("o1").unwrap();
+        let items = c.items("o1", &ItemQuery::default()).unwrap();
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].id, "a");
         assert!(!items[0].is_upload());
         assert!(items[1].is_upload());
         assert_eq!(items[1].file_size, 42);
         assert_eq!(items[2].id, "c");
+    }
+
+    #[test]
+    fn items_query_appends_selection_filters_and_parses_review_status() {
+        let c = logged_in(FakeTransport::default().with(
+            "https://bt.example/api/orgs/o1/all-crawls?page=1&pageSize=100&collectionId=col-9",
+            200,
+            r#"{"items":[{"id":"a","name":"A","type":"crawl","reviewStatus":4},
+                        {"id":"b","name":"B","type":"crawl"}],"total":2}"#,
+        ));
+        let query = ItemQuery {
+            collection_id: Some("col-9"),
+            ..Default::default()
+        };
+        let items = c.items("o1", &query).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].review_status, Some(4));
+        assert!(items[0].is_reviewed());
+        assert!(!items[1].is_reviewed());
     }
 
     #[test]
@@ -512,6 +566,7 @@ mod tests {
             name: "A".into(),
             item_type: "crawl".into(),
             file_size: 0,
+            review_status: None,
         };
         let res = c.resources("o1", &crawl).unwrap();
         assert_eq!(res.len(), 1);
@@ -524,6 +579,7 @@ mod tests {
             name: "B".into(),
             item_type: "upload".into(),
             file_size: 0,
+            review_status: None,
         };
         let res = c.resources("o1", &upload).unwrap();
         assert_eq!(res[0].path, "https://files/b.wacz?sig=2");
