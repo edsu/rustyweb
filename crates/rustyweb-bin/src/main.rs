@@ -914,11 +914,13 @@ fn run_browsertrix(
         .iter()
         .filter(|it| passes_review(it, include_unreviewed, opts.min_review))
         .collect();
+    // User-facing status goes to stderr with eprintln (not tracing), so it's
+    // visible even in bar mode, where the log level is raised to `warn`.
     let skipped_review = items.len() - reviewed.len();
     if skipped_review > 0 {
-        tracing::info!(
-            skipped_review,
-            "skipped crawls that aren't QA'd (use --include-unreviewed to import them)"
+        eprintln!(
+            "skipping {skipped_review} crawl(s) that aren't QA'd \
+             (use --include-unreviewed to import them)"
         );
     }
 
@@ -955,6 +957,16 @@ fn run_browsertrix(
         }
         return Ok(());
     }
+
+    if selected.is_empty() {
+        eprintln!("nothing to import.");
+        return Ok(());
+    }
+    eprintln!(
+        "importing {} crawl(s) into {}…",
+        selected.len(),
+        home.display()
+    );
 
     let archive = rustyweb_lib::index::archive_dir(home);
     std::fs::create_dir_all(&archive)
@@ -1018,7 +1030,14 @@ fn run_browsertrix(
             imported += 1;
         }
     }
-    tracing::info!(imported, skipped, "browsertrix import complete");
+    eprintln!(
+        "done: imported {imported} crawl(s){}",
+        if skipped > 0 {
+            format!(", skipped {skipped} already up to date")
+        } else {
+            String::new()
+        }
+    );
     Ok(())
 }
 
