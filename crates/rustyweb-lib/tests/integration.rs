@@ -451,6 +451,44 @@ async fn crawl_page_shows_metadata_and_pages() {
 }
 
 #[tokio::test]
+async fn crawl_page_shows_browsertrix_provenance() {
+    let tmp = make_index(&["a.wacz"]);
+    // Mark the crawl as imported from Browsertrix, as `import browsertrix` does.
+    rustyweb_lib::index::set_browsertrix_provenance(
+        tmp.path(),
+        &tmp.path().join("archive/a.wacz"),
+        "https://app.browsertrix.com",
+        "item-xyz",
+        "sha256:aa",
+    )
+    .unwrap();
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let id = manifest.waczs[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/crawl/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(
+        html.contains("Browsertrix (app.browsertrix.com)"),
+        "crawl page should attribute the Browsertrix source"
+    );
+    assert!(
+        html.contains("item-xyz"),
+        "crawl page should show the Browsertrix item id"
+    );
+}
+
+#[tokio::test]
 async fn collection_page_lists_members() {
     let tmp = make_index(&["a.wacz"]);
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
