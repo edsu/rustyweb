@@ -153,6 +153,83 @@ enum Commands {
         #[command(subcommand)]
         action: CrawlCmd,
     },
+    /// Import content into rustyweb from an external web-archiving service.
+    Import {
+        #[command(subcommand)]
+        action: ImportCmd,
+    },
+}
+
+/// Sources that content can be imported from. Each is its own command (their
+/// flags differ), grouped under `import`.
+#[derive(Subcommand)]
+enum ImportCmd {
+    /// Import WACZ files from a Browsertrix instance (Webrecorder's hosted
+    /// crawler). Authenticates with credentials from the environment:
+    /// BROWSERTRIX_USER + BROWSERTRIX_PASSWORD, or a BROWSERTRIX_TOKEN — kept out
+    /// of the command line so secrets don't appear in the process list.
+    Browsertrix {
+        /// Browsertrix host (use this for a self-hosted instance).
+        #[arg(long, default_value = rustyweb_lib::browsertrix::DEFAULT_HOST)]
+        host: String,
+
+        /// Organization to import from (its slug or id). Defaults to your only
+        /// org; required when the account has more than one.
+        #[arg(long)]
+        org: Option<String>,
+
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
+
+        /// Import only this Browsertrix collection (its id, slug, or name).
+        /// Default: the whole org.
+        #[arg(long, conflicts_with = "crawl")]
+        collection: Option<String>,
+
+        /// Import only this archived item (a crawl or upload) by id. Implies
+        /// including it even if it hasn't been QA'd.
+        #[arg(long)]
+        crawl: Option<String>,
+
+        /// Group the imported crawls into this rustyweb collection (created if
+        /// new). Without it, each crawl is its own collection.
+        #[arg(long)]
+        into: Option<String>,
+
+        /// Also import crawls that haven't been QA'd. By default only crawls a
+        /// reviewer has QA'd in Browsertrix are imported.
+        #[arg(long)]
+        include_unreviewed: bool,
+
+        /// Only import crawls whose QA review rating is at least N (1–5). Implies
+        /// reviewed-only.
+        #[arg(
+            long,
+            value_name = "N",
+            value_parser = clap::value_parser!(u8).range(1..=5),
+            conflicts_with = "include_unreviewed"
+        )]
+        min_review: Option<u8>,
+
+        /// Import at most N items (0 = all).
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        limit: usize,
+
+        /// List what would be imported, without downloading or indexing.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Re-download and re-index items even if they were already imported
+        /// (otherwise already-synced items are skipped).
+        #[arg(long)]
+        force: bool,
+
+        /// Verbose logging (debug level). Replaces the progress bar with detailed
+        /// per-record logs.
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -365,12 +442,17 @@ async fn main() -> Result<()> {
     // RUST_LOG overrides the level in all cases.
     let verbose = matches!(
         &cli.command,
-        Commands::Index { verbose: true, .. } | Commands::Reindex { verbose: true, .. }
+        Commands::Index { verbose: true, .. }
+            | Commands::Reindex { verbose: true, .. }
+            | Commands::Import {
+                action: ImportCmd::Browsertrix { verbose: true, .. }
+            }
     );
-    // Both `index` and `reindex` stream records and show the progress bar.
+    // `index`, `reindex`, and `browsertrix` (which indexes what it downloads) all
+    // stream records and show the progress bar.
     let shows_progress = matches!(
         &cli.command,
-        Commands::Index { .. } | Commands::Reindex { .. }
+        Commands::Index { .. } | Commands::Reindex { .. } | Commands::Import { .. }
     );
     let show_bar = shows_progress && !verbose && std::io::stderr().is_terminal();
     let default_level = if verbose {
@@ -380,15 +462,18 @@ async fn main() -> Result<()> {
     } else {
         "info"
     };
-    // Default filter: our level, but silence pdf-extract/lopdf, which log noisy
-    // per-glyph warnings ("unknown glyph name ...") through the tracing-log bridge
-    // during PDF text extraction. We already handle PDF outcomes ourselves, so
-    // these are pure noise (and stomp the progress bar). RUST_LOG overrides the
-    // whole thing if you want to see them.
+    // Default filter: our level, but silence third-party parsers that log noisy,
+    // non-fatal diagnostics through the tracing-log bridge during indexing:
+    //  - pdf-extract/lopdf: per-glyph warnings ("unknown glyph name ...").
+    //  - html5ever: HTML quirks like "foster parenting not implemented" while
+    //    parsing archived pages for text/images — harmless, and it recovers.
+    // We handle these outcomes ourselves, so the log lines are pure noise (and
+    // stomp the progress bar). RUST_LOG overrides the whole thing to see them.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(default_level)
             .add_directive("pdf_extract=off".parse().unwrap())
             .add_directive("lopdf=off".parse().unwrap())
+            .add_directive("html5ever=off".parse().unwrap())
     });
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -589,6 +674,45 @@ async fn main() -> Result<()> {
                 }
             }
         },
+
+        Commands::Import { action } => match action {
+            ImportCmd::Browsertrix {
+                host,
+                org,
+                home,
+                collection,
+                crawl,
+                into,
+                include_unreviewed,
+                min_review,
+                limit,
+                dry_run,
+                force,
+                verbose: _,
+            } => {
+                let bar = show_bar.then(BarProgress::new);
+                let progress = bar
+                    .as_ref()
+                    .map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
+                let opts = ImportOpts {
+                    collection: collection.as_deref(),
+                    crawl: crawl.as_deref(),
+                    into: into.as_deref(),
+                    include_unreviewed,
+                    min_review,
+                    limit,
+                    dry_run,
+                    force,
+                };
+                let result = run_browsertrix(&host, org.as_deref(), &home, &opts, progress);
+                if result.is_err() {
+                    if let Some(b) = &bar {
+                        b.clear();
+                    }
+                }
+                result?;
+            }
+        },
     }
 
     Ok(())
@@ -727,9 +851,514 @@ fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Authenticate to Browsertrix, resolve the org, and import its archived items:
+/// download each item's WACZ into `<home>/archive` and index it as a durable
+/// local (File) source. `--dry-run` lists what would be imported instead.
+///
+/// Each WACZ is downloaded via its presigned `replay.json` URL (a flat, single
+/// WACZ) rather than the combined per-item `/download` (which can be a nested
+/// multi-WACZ — see rustyweb-15z.8), so it indexes cleanly today. Downloading
+/// (rather than streaming in place) keeps replay durable: the presigned URLs
+/// expire in ~48 h, so they're an ingest artifact, not a replay source.
+/// Options for a Browsertrix import (from the `browsertrix` subcommand).
+struct ImportOpts<'a> {
+    /// Import only this Browsertrix collection (its id); `None` = whole org.
+    collection: Option<&'a str>,
+    /// Import only this archived item by id; `None` = all selected.
+    crawl: Option<&'a str>,
+    /// Group imports into this rustyweb collection; `None` = one per crawl.
+    into: Option<&'a str>,
+    /// Import crawls that haven't been QA'd too (default: reviewed-only).
+    include_unreviewed: bool,
+    /// Minimum QA review rating to import (implies reviewed-only).
+    min_review: Option<u8>,
+    limit: usize,
+    dry_run: bool,
+    force: bool,
+}
+
+/// Authenticate to Browsertrix, resolve the org, and import its archived items:
+/// download each item's WACZ into `<home>/archive` and index it as a durable
+/// local (File) source. `--dry-run` lists what would be imported instead.
+///
+/// By default only crawls a reviewer has QA'd in Browsertrix are imported (see
+/// [`passes_review`]); `--include-unreviewed` and `--min-review` adjust that,
+/// and naming a single `--crawl` always includes it.
+///
+/// Each WACZ is downloaded via its presigned `replay.json` URL (a flat, single
+/// WACZ) rather than the combined per-item `/download` (which can be a nested
+/// multi-WACZ — see rustyweb-15z.8), so it indexes cleanly today. Downloading
+/// (rather than streaming in place) keeps replay durable: the presigned URLs
+/// expire in ~48 h, so they're an ingest artifact, not a replay source.
+fn run_browsertrix(
+    host: &str,
+    org: Option<&str>,
+    home: &std::path::Path,
+    opts: &ImportOpts,
+    progress: Option<&dyn rustyweb_lib::index::IndexProgress>,
+) -> Result<()> {
+    use rustyweb_lib::browsertrix::ItemQuery;
+
+    let client = connect(host)?;
+    let host = client.host().to_string();
+    let orgs = client.orgs().context("listing organizations")?;
+    let org = resolve_org(&orgs, org)?;
+    tracing::info!(org = %org.name, id = %org.id, "using organization");
+
+    // Resolve --collection (id, slug, or name) to the Browsertrix collection the
+    // API's filter needs (by UUID).
+    let selected_collection = match opts.collection {
+        Some(sel) => {
+            let colls = client.collections(&org.id).context("listing collections")?;
+            Some(resolve_collection(&colls, sel)?)
+        }
+        None => None,
+    };
+
+    // Where imports land as a rustyweb collection: an explicit --into wins;
+    // otherwise, importing a Browsertrix collection yields a rustyweb collection
+    // of the same name (so a collection import isn't scattered into singletons);
+    // otherwise each crawl is its own collection.
+    let into = opts
+        .into
+        .or(selected_collection.as_ref().map(|c| c.name.as_str()));
+
+    // Selection is server-side (a collection or a single item); the review
+    // filter is applied client-side so we can report what was skipped.
+    let query = ItemQuery {
+        collection_id: selected_collection.as_ref().map(|c| c.id.as_str()),
+        item_id: opts.crawl,
+    };
+    let items = client
+        .items(&org.id, &query)
+        .context("listing archived items")?;
+
+    // A single named --crawl is an explicit choice, so import it regardless of
+    // its review status.
+    let include_unreviewed = opts.include_unreviewed || opts.crawl.is_some();
+    let reviewed: Vec<&rustyweb_lib::browsertrix::Item> = items
+        .iter()
+        .filter(|it| passes_review(it, include_unreviewed, opts.min_review))
+        .collect();
+    // User-facing status goes to stderr with eprintln (not tracing), so it's
+    // visible even in bar mode, where the log level is raised to `warn`.
+    let skipped_review = items.len() - reviewed.len();
+    if skipped_review > 0 {
+        eprintln!(
+            "skipping {skipped_review} crawl(s) that aren't QA'd \
+             (use --include-unreviewed to import them)"
+        );
+    }
+
+    let count = if opts.limit == 0 {
+        reviewed.len()
+    } else {
+        opts.limit.min(reviewed.len())
+    };
+    let selected = &reviewed[..count];
+
+    if opts.dry_run {
+        println!(
+            "{} item(s) to import from \"{}\" ({}):",
+            selected.len(),
+            org.name,
+            org.slug
+        );
+        for &item in selected {
+            println!(
+                "  {:<6} {:>10}  {:>4}  {}  {}",
+                if item.is_upload() { "upload" } else { "crawl" },
+                rustyweb_lib::server::human_size(item.file_size),
+                item.review_status
+                    .map_or("—".to_string(), |s| format!("QA{s}")),
+                item.id,
+                item.name
+            );
+        }
+        if count < reviewed.len() {
+            println!(
+                "  … {} more (raise --limit to import them)",
+                reviewed.len() - count
+            );
+        }
+        return Ok(());
+    }
+
+    if selected.is_empty() {
+        eprintln!("nothing to import.");
+        return Ok(());
+    }
+    eprintln!(
+        "importing {} crawl(s) into {}…",
+        selected.len(),
+        home.display()
+    );
+
+    let archive = rustyweb_lib::index::archive_dir(home);
+    std::fs::create_dir_all(&archive)
+        .with_context(|| format!("creating archive dir {}", archive.display()))?;
+
+    // Incremental sync: skip resources already recorded in the manifest (by
+    // host + item + content hash) so re-running against a large account is
+    // cheap. `--force` re-imports regardless. `mut` so within-run duplicates are
+    // skipped too.
+    let mut seen = load_imported(home);
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    for &item in selected {
+        let resources = client
+            .resources(&org.id, item)
+            .with_context(|| format!("resolving resources for item {}", item.id))?;
+        if resources.is_empty() {
+            tracing::warn!(item = %item.name, id = %item.id, "no WACZ resources; skipping");
+            continue;
+        }
+        // Each item's WACZ(s) land in their own subdirectory under archive/, so
+        // two items whose resources share a filename can't clobber each other
+        // (their crawl id is derived from the path, so a shared path would also
+        // merge their manifest entries). The subdir is still under archive/, so
+        // it satisfies the "local WACZ lives in archive/" rule.
+        let item_dir = archive.join(safe_component(&item.id));
+        std::fs::create_dir_all(&item_dir)
+            .with_context(|| format!("creating {}", item_dir.display()))?;
+
+        for (i, res) in resources.iter().enumerate() {
+            let key = (host.clone(), item.id.clone(), res.hash.clone());
+            if !opts.force && seen.contains(&key) {
+                tracing::debug!(item = %item.name, "already imported; skipping");
+                skipped += 1;
+                continue;
+            }
+
+            let filename = safe_wacz_filename(&res.name, &format!("resource-{i}"));
+            let dest = item_dir.join(&filename);
+            let size = if res.size > 0 {
+                format!(" ({})", rustyweb_lib::server::human_size(res.size))
+            } else {
+                String::new()
+            };
+            eprintln!("↓ downloading {filename}{size}");
+            download_wacz(&res.path, &dest)?;
+
+            // pdf-extract writes glyph diagnostics to stdout during indexing;
+            // silence it (as `index`/`reindex` do) so it doesn't stomp the bar.
+            let quiet = gag::Gag::stdout().ok();
+            let indexed = rustyweb_lib::index::index_location(
+                &dest.to_string_lossy(),
+                home,
+                Some(&item.name),
+                into,
+                false,
+                None,
+                progress,
+            );
+            drop(quiet);
+            indexed.with_context(|| format!("indexing {}", dest.display()))?;
+
+            // Record provenance so a later run can skip this resource.
+            rustyweb_lib::index::set_browsertrix_provenance(
+                home, &dest, &host, &item.id, &res.hash,
+            )
+            .with_context(|| format!("recording provenance for {}", dest.display()))?;
+            seen.insert(key);
+            imported += 1;
+        }
+    }
+    eprintln!(
+        "done: imported {imported} crawl(s){}",
+        if skipped > 0 {
+            format!(", skipped {skipped} already up to date")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
+/// Resolve a `--collection` value (a Browsertrix collection id, slug, or name)
+/// to the collection — we need its UUID for the API's item filter and its name
+/// to default the rustyweb target collection. Mirrors [`resolve_org`].
+fn resolve_collection(
+    colls: &[rustyweb_lib::browsertrix::Collection],
+    want: &str,
+) -> Result<rustyweb_lib::browsertrix::Collection> {
+    colls
+        .iter()
+        .find(|c| c.id == want || c.slug == want || c.name == want)
+        .cloned()
+        .ok_or_else(|| {
+            let slugs = colls
+                .iter()
+                .map(|c| c.slug.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::anyhow!("no collection matching \"{want}\"; available: {slugs}")
+        })
+}
+
+/// Whether an item passes the QA-review filter. Reviewed-only is the default;
+/// `include_unreviewed` lets everything through, and `min_review` (which implies
+/// reviewed-only) requires at least that rating.
+fn passes_review(
+    item: &rustyweb_lib::browsertrix::Item,
+    include_unreviewed: bool,
+    min_review: Option<u8>,
+) -> bool {
+    if include_unreviewed {
+        return true;
+    }
+    match item.review_status {
+        Some(s) => min_review.is_none_or(|m| s >= m),
+        None => false,
+    }
+}
+
+/// Load the set of already-imported Browsertrix resources — `(host, item_id,
+/// resource_hash)` — from the manifest, for incremental-sync skip checks.
+/// Returns empty when there's no manifest yet.
+fn load_imported(home: &std::path::Path) -> std::collections::HashSet<(String, String, String)> {
+    use rustyweb_lib::collections::Manifest;
+
+    let index_dir = rustyweb_lib::index::index_dir(home);
+    Manifest::open(&index_dir)
+        .map(|m| {
+            m.waczs
+                .iter()
+                .filter_map(|w| w.browsertrix.as_ref())
+                .map(|b| (b.host.clone(), b.item_id.clone(), b.resource_hash.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Download a WACZ to `dest` via a temp `.part` file renamed on success, so an
+/// interrupted download never leaves a truncated file that looks complete.
+/// Returns the number of bytes written.
+fn download_wacz(url: &str, dest: &std::path::Path) -> Result<u64> {
+    use std::io::{Read, Write};
+
+    let mut tmp = dest.as_os_str().to_owned();
+    tmp.push(".part");
+    let tmp = PathBuf::from(tmp);
+
+    let mut reader =
+        rustyweb_lib::http_range::get_reader(url).with_context(|| format!("fetching {url}"))?;
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("reading {url}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        written += n as u64;
+    }
+    file.sync_all().ok();
+    drop(file);
+    std::fs::rename(&tmp, dest).with_context(|| format!("finalizing {}", dest.display()))?;
+    Ok(written)
+}
+
+/// A filesystem-safe `.wacz` filename derived from a resource name (falling back
+/// to the item id). Non-`[A-Za-z0-9._-]` characters — including any path
+/// separators — become `_`, so the result stays a single component inside the
+/// archive folder.
+fn safe_wacz_filename(name: &str, fallback: &str) -> String {
+    let base = if name.trim().is_empty() {
+        fallback
+    } else {
+        name.trim()
+    };
+    let mut out = safe_component(base);
+    if !out.to_ascii_lowercase().ends_with(".wacz") {
+        out.push_str(".wacz");
+    }
+    out
+}
+
+/// Build a Browsertrix client from environment credentials, so secrets never
+/// appear in argv. A `BROWSERTRIX_TOKEN` (an existing JWT) short-circuits login;
+/// otherwise `BROWSERTRIX_USER` + `BROWSERTRIX_PASSWORD` are used.
+fn connect(host: &str) -> Result<rustyweb_lib::browsertrix::Client> {
+    use rustyweb_lib::browsertrix::Client;
+
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(token) = env("BROWSERTRIX_TOKEN") {
+        return Ok(Client::with_token(host, &token));
+    }
+    match (env("BROWSERTRIX_USER"), env("BROWSERTRIX_PASSWORD")) {
+        (Some(user), Some(password)) => {
+            Client::login(host, &user, &password).context("logging in to Browsertrix")
+        }
+        _ => anyhow::bail!(
+            "set BROWSERTRIX_USER and BROWSERTRIX_PASSWORD (or BROWSERTRIX_TOKEN) in the \
+             environment to authenticate — they're read from the environment so credentials \
+             stay out of the command line"
+        ),
+    }
+}
+
+/// Choose the org to import from. With `want` (a slug or id), match it exactly;
+/// otherwise use the sole org, erroring if there are none or several.
+fn resolve_org(
+    orgs: &[rustyweb_lib::browsertrix::Org],
+    want: Option<&str>,
+) -> Result<rustyweb_lib::browsertrix::Org> {
+    let slugs = || {
+        orgs.iter()
+            .map(|o| o.slug.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match want {
+        Some(w) => orgs
+            .iter()
+            .find(|o| o.slug == w || o.id == w)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no org matching \"{w}\"; available: {}", slugs())),
+        None => match orgs {
+            [] => anyhow::bail!("no organizations are available for this account"),
+            [only] => Ok(only.clone()),
+            _ => anyhow::bail!("several orgs are available; pass --org <slug>: {}", slugs()),
+        },
+    }
+}
+
+/// A filesystem-safe single path component: any character outside
+/// `[A-Za-z0-9._-]` (including path separators) becomes `_`.
+fn safe_component(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_source_lines;
+    use super::{passes_review, resolve_collection, resolve_org, safe_wacz_filename};
+    use rustyweb_lib::browsertrix::{Collection, Item, Org};
+
+    fn item(review: Option<u8>) -> Item {
+        Item {
+            id: "x".into(),
+            name: "n".into(),
+            item_type: "crawl".into(),
+            file_size: 0,
+            review_status: review,
+        }
+    }
+
+    fn org(id: &str, slug: &str) -> Org {
+        Org {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            name: format!("{slug} name"),
+        }
+    }
+
+    #[test]
+    fn resolve_org_uses_the_sole_org_by_default() {
+        let orgs = vec![org("o1", "gov")];
+        assert_eq!(resolve_org(&orgs, None).unwrap().id, "o1");
+    }
+
+    #[test]
+    fn resolve_org_requires_a_choice_when_several_exist() {
+        let orgs = vec![org("o1", "gov"), org("o2", "edu")];
+        let err = resolve_org(&orgs, None).err().unwrap().to_string();
+        assert!(err.contains("several"), "{err}");
+        assert!(err.contains("gov") && err.contains("edu"), "{err}");
+    }
+
+    #[test]
+    fn resolve_org_matches_slug_or_id() {
+        let orgs = vec![org("o1", "gov"), org("o2", "edu")];
+        assert_eq!(resolve_org(&orgs, Some("edu")).unwrap().id, "o2");
+        assert_eq!(resolve_org(&orgs, Some("o1")).unwrap().slug, "gov");
+    }
+
+    #[test]
+    fn resolve_org_errors_on_unknown_org() {
+        let orgs = vec![org("o1", "gov")];
+        let err = resolve_org(&orgs, Some("nope")).err().unwrap().to_string();
+        assert!(err.contains("nope") && err.contains("gov"), "{err}");
+    }
+
+    #[test]
+    fn resolve_collection_matches_id_slug_or_name() {
+        let colls = vec![
+            Collection {
+                id: "uuid-1".into(),
+                slug: "gov-arc".into(),
+                name: "US Gov".into(),
+            },
+            Collection {
+                id: "uuid-2".into(),
+                slug: "edu".into(),
+                name: "Universities".into(),
+            },
+        ];
+        assert_eq!(resolve_collection(&colls, "gov-arc").unwrap().id, "uuid-1");
+        assert_eq!(resolve_collection(&colls, "uuid-2").unwrap().id, "uuid-2");
+        assert_eq!(
+            resolve_collection(&colls, "Universities").unwrap().id,
+            "uuid-2"
+        );
+
+        let err = resolve_collection(&colls, "nope")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("nope") && err.contains("gov-arc"), "{err}");
+    }
+
+    #[test]
+    fn passes_review_defaults_to_reviewed_only() {
+        // Default: reviewed passes, unreviewed is skipped.
+        assert!(passes_review(&item(Some(3)), false, None));
+        assert!(!passes_review(&item(None), false, None));
+    }
+
+    #[test]
+    fn passes_review_include_unreviewed_lets_everything_through() {
+        assert!(passes_review(&item(None), true, None));
+        assert!(passes_review(&item(Some(1)), true, None));
+    }
+
+    #[test]
+    fn passes_review_min_review_is_a_threshold() {
+        assert!(passes_review(&item(Some(5)), false, Some(4)));
+        assert!(passes_review(&item(Some(4)), false, Some(4)));
+        assert!(!passes_review(&item(Some(3)), false, Some(4)));
+        assert!(!passes_review(&item(None), false, Some(4)));
+    }
+
+    #[test]
+    fn safe_wacz_filename_sanitizes_and_ensures_extension() {
+        assert_eq!(safe_wacz_filename("my crawl.wacz", "id1"), "my_crawl.wacz");
+        // Path separators and other unsafe chars become '_'; extension appended.
+        assert_eq!(
+            safe_wacz_filename("../etc/passwd", "id1"),
+            ".._etc_passwd.wacz"
+        );
+        assert_eq!(safe_wacz_filename("plain", "id1"), "plain.wacz");
+        // Empty name falls back to the item id.
+        assert_eq!(safe_wacz_filename("   ", "abc123"), "abc123.wacz");
+        // Already-correct names are preserved (case-insensitive extension check).
+        assert_eq!(safe_wacz_filename("a-b_c.WACZ", "id1"), "a-b_c.WACZ");
+    }
 
     #[test]
     fn parse_source_lines_skips_blanks_and_comments_and_trims() {

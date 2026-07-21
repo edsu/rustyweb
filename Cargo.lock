@@ -2810,10 +2810,13 @@ name = "rustyweb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "gag",
  "indicatif",
  "rustyweb-lib",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use tracing::{debug, info};
 
-use crate::collections::{file_sha256, wacz_id, Manifest, Source, Wacz};
+use crate::collections::{file_sha256, wacz_id, BrowsertrixRef, Manifest, Source, Wacz};
 use crate::search::{extract_html_text, SearchIndex};
 use crate::wacz::{extract_warc_from_wacz, iter_warc_paths, read_datapackage};
 use crate::warc::{iter_records, WarcRecord, Warcinfo};
@@ -306,6 +306,38 @@ pub fn set_crawl_thumbnail(home: &Path, crawl_id: &str, image_file: &Path) -> Re
     Ok(())
 }
 
+/// Record Browsertrix import provenance on an already-indexed WACZ. `wacz_file`
+/// is the local file (under `<home>/archive`) that was just indexed; it's looked
+/// up by the same id indexing assigns (a hash of its home-relative path). Used
+/// by the importer for provenance display and incremental re-sync. Manifest-only
+/// side effect (no reindex).
+pub fn set_browsertrix_provenance(
+    home: &Path,
+    wacz_file: &Path,
+    host: &str,
+    item_id: &str,
+    resource_hash: &str,
+) -> Result<()> {
+    let index_dir = index_dir(home);
+    let mut manifest = Manifest::open(&index_dir)?;
+    let abs = wacz_file
+        .canonicalize()
+        .with_context(|| format!("resolving {}", wacz_file.display()))?;
+    let id = wacz_id(&Source::for_file(&abs, home));
+    let wacz = manifest
+        .waczs
+        .iter_mut()
+        .find(|w| w.id == id)
+        .with_context(|| format!("no indexed crawl found for {}", wacz_file.display()))?;
+    wacz.browsertrix = Some(BrowsertrixRef {
+        host: host.to_string(),
+        item_id: item_id.to_string(),
+        resource_hash: resource_hash.to_string(),
+    });
+    manifest.save()?;
+    Ok(())
+}
+
 /// Turn one `index` argument into a source to index. An `http(s)://` URL yields
 /// a URL source. Otherwise the argument must be a `.wacz` file that already lives
 /// under `<home>/archive` - rustyweb keeps local archives there so the home
@@ -578,6 +610,10 @@ fn index_one(
         }
     }
     manifest.ensure_collection(&collection_id, &collection_name, &date_indexed);
+    // Preserve Browsertrix import provenance (set out-of-band by the importer)
+    // across a reindex, which otherwise rebuilds the entry from scratch.
+    let browsertrix = manifest.wacz_by_id(&id).and_then(|w| w.browsertrix.clone());
+
     manifest.upsert_wacz(Wacz {
         id,
         collection: collection_id,
@@ -596,6 +632,7 @@ fn index_one(
         page_count: Some(stats.pages),
         capture_start: stats.earliest_capture,
         capture_end: stats.latest_capture,
+        browsertrix,
     });
 
     // Note: the spinner/bar is *not* finished here - the Tantivy commit happens
@@ -1483,6 +1520,40 @@ mod tests {
             col.software
         );
         assert!(col.page_count.is_some(), "page_count should be recorded");
+    }
+
+    #[test]
+    fn browsertrix_provenance_is_recorded_and_survives_reindex() {
+        let tmp = TempDir::new().unwrap();
+        let dest = index_fixture("simple.wacz", tmp.path(), None);
+
+        set_browsertrix_provenance(
+            tmp.path(),
+            &dest,
+            "https://app.browsertrix.com",
+            "item-1",
+            "sha256:aa",
+        )
+        .unwrap();
+
+        let recorded = |home: &Path| {
+            Manifest::open(&home.join("index")).unwrap().waczs[0]
+                .browsertrix
+                .clone()
+        };
+        let b = recorded(tmp.path()).expect("provenance recorded");
+        assert_eq!(b.item_id, "item-1");
+        assert_eq!(b.resource_hash, "sha256:aa");
+
+        // A reindex rebuilds each manifest entry from scratch; provenance set
+        // out-of-band by the importer must be carried over, not wiped.
+        reindex(tmp.path(), None, None).unwrap();
+        assert_eq!(
+            recorded(tmp.path())
+                .expect("provenance after reindex")
+                .item_id,
+            "item-1"
+        );
     }
 
     #[test]
