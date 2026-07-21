@@ -295,8 +295,8 @@ Then import - preview first with `--dry-run`, then pull for real:
 rustyweb import browsertrix --home ~/webarchive --dry-run
 rustyweb import browsertrix --home ~/webarchive
 
-# just one collection (by id, slug, or name), grouped into a rustyweb collection
-rustyweb import browsertrix --collection us-govarchive --into "US Gov" --home ~/webarchive
+# just one collection (by id, slug, or name) → a matching rustyweb collection
+rustyweb import browsertrix --collection us-govarchive --home ~/webarchive
 
 # a single crawl
 rustyweb import browsertrix --crawl <item-id> --home ~/webarchive
@@ -318,9 +318,11 @@ Notes:
   Browsertrix's presigned URLs expire after ~48h - a downloaded copy keeps replay
   working long-term. `--host <URL>` targets a self-hosted Browsertrix (default is
   `https://app.browsertrix.com`).
-- `--into <NAME>` groups the imports into one rustyweb collection; without it each
-  crawl is its own. `--limit <N>` caps how many are imported; `--dry-run` lists
-  them without downloading.
+- **Grouping.** Importing a `--collection` groups its crawls into a rustyweb
+  collection of the same name. `--into <NAME>` overrides that name (and is the way
+  to group an org-wide or single-`--crawl` import, which otherwise land as
+  individual collections). `--limit <N>` caps how many are imported; `--dry-run`
+  lists them without downloading.
 
 ## Command line
 
