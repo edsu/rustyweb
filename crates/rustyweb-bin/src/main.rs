@@ -905,9 +905,9 @@ fn run_browsertrix(
     let org = resolve_org(&orgs, org)?;
     tracing::info!(org = %org.name, id = %org.id, "using organization");
 
-    // Resolve --collection (id, slug, or name) to the UUID the API's filter
-    // requires.
-    let collection_id = match opts.collection {
+    // Resolve --collection (id, slug, or name) to the Browsertrix collection the
+    // API's filter needs (by UUID).
+    let selected_collection = match opts.collection {
         Some(sel) => {
             let colls = client.collections(&org.id).context("listing collections")?;
             Some(resolve_collection(&colls, sel)?)
@@ -915,10 +915,18 @@ fn run_browsertrix(
         None => None,
     };
 
+    // Where imports land as a rustyweb collection: an explicit --into wins;
+    // otherwise, importing a Browsertrix collection yields a rustyweb collection
+    // of the same name (so a collection import isn't scattered into singletons);
+    // otherwise each crawl is its own collection.
+    let into = opts
+        .into
+        .or(selected_collection.as_ref().map(|c| c.name.as_str()));
+
     // Selection is server-side (a collection or a single item); the review
     // filter is applied client-side so we can report what was skipped.
     let query = ItemQuery {
-        collection_id: collection_id.as_deref(),
+        collection_id: selected_collection.as_ref().map(|c| c.id.as_str()),
         item_id: opts.crawl,
     };
     let items = client
@@ -1031,7 +1039,7 @@ fn run_browsertrix(
                 &dest.to_string_lossy(),
                 home,
                 Some(&item.name),
-                opts.into,
+                into,
                 false,
                 None,
                 progress,
@@ -1060,16 +1068,16 @@ fn run_browsertrix(
 }
 
 /// Resolve a `--collection` value (a Browsertrix collection id, slug, or name)
-/// to its UUID — the form the API's item filter requires. Mirrors
-/// [`resolve_org`].
+/// to the collection — we need its UUID for the API's item filter and its name
+/// to default the rustyweb target collection. Mirrors [`resolve_org`].
 fn resolve_collection(
     colls: &[rustyweb_lib::browsertrix::Collection],
     want: &str,
-) -> Result<String> {
+) -> Result<rustyweb_lib::browsertrix::Collection> {
     colls
         .iter()
         .find(|c| c.id == want || c.slug == want || c.name == want)
-        .map(|c| c.id.clone())
+        .cloned()
         .ok_or_else(|| {
             let slugs = colls
                 .iter()
@@ -1311,10 +1319,10 @@ mod tests {
                 name: "Universities".into(),
             },
         ];
-        assert_eq!(resolve_collection(&colls, "gov-arc").unwrap(), "uuid-1");
-        assert_eq!(resolve_collection(&colls, "uuid-2").unwrap(), "uuid-2");
+        assert_eq!(resolve_collection(&colls, "gov-arc").unwrap().id, "uuid-1");
+        assert_eq!(resolve_collection(&colls, "uuid-2").unwrap().id, "uuid-2");
         assert_eq!(
-            resolve_collection(&colls, "Universities").unwrap(),
+            resolve_collection(&colls, "Universities").unwrap().id,
             "uuid-2"
         );
 
