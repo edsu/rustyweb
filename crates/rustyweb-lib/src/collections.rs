@@ -143,6 +143,12 @@ pub struct Wacz {
     /// Latest capture timestamp seen (14-digit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_end: Option<String>,
+
+    /// Where this WACZ was imported from, when it came via `rustyweb
+    /// browsertrix`. Drives incremental re-sync (skip already-imported items)
+    /// and attributes provenance. Absent for hand-indexed WACZs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browsertrix: Option<BrowsertrixRef>,
 }
 
 impl Wacz {
@@ -154,6 +160,21 @@ impl Wacz {
             None => true, // URL source
         }
     }
+}
+
+/// Provenance for a WACZ imported from a Browsertrix instance (`rustyweb
+/// browsertrix`). The `(host, item_id, resource_hash)` triple lets a re-run skip
+/// an item that's already indexed without re-downloading it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowsertrixRef {
+    /// The Browsertrix host the item came from.
+    pub host: String,
+    /// The Browsertrix archived-item id (a crawl or an upload).
+    pub item_id: String,
+    /// The WACZ resource content hash from `replay.json` (e.g. `sha256:…`), when
+    /// present — the strongest signal that content is unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resource_hash: String,
 }
 
 /// A curated collection: a named group of [`Wacz`] members with its own
@@ -543,7 +564,40 @@ mod tests {
             page_count: None,
             capture_start: None,
             capture_end: None,
+            browsertrix: None,
         }
+    }
+
+    #[test]
+    fn wacz_without_browsertrix_field_deserializes_to_none() {
+        // Backward compatibility: an older collections.json entry has no
+        // `browsertrix` key; it must load with the field defaulting to None.
+        let json = r#"{
+            "id": "abc12345",
+            "source": "/data/test.wacz",
+            "name": "test",
+            "date_indexed": "2026-07-01T00:00:00Z",
+            "file_size": 1024,
+            "sha256": "deadbeef"
+        }"#;
+        let w: Wacz = serde_json::from_str(json).unwrap();
+        assert!(w.browsertrix.is_none());
+    }
+
+    #[test]
+    fn browsertrix_ref_roundtrips() {
+        let w = {
+            let mut w = wacz("abc12345", "test", None);
+            w.browsertrix = Some(BrowsertrixRef {
+                host: "https://app.browsertrix.com".to_string(),
+                item_id: "item-1".to_string(),
+                resource_hash: "sha256:aa".to_string(),
+            });
+            w
+        };
+        let json = serde_json::to_string(&w).unwrap();
+        let back: Wacz = serde_json::from_str(&json).unwrap();
+        assert_eq!(w.browsertrix, back.browsertrix);
     }
 
     #[test]

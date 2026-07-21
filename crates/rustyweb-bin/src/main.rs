@@ -184,6 +184,11 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Re-download and re-index items even if they were already imported
+        /// (otherwise already-synced items are skipped).
+        #[arg(long)]
+        force: bool,
+
         /// Verbose logging (debug level). Replaces the progress bar with detailed
         /// per-record logs.
         #[arg(short = 'v', long)]
@@ -636,6 +641,7 @@ async fn main() -> Result<()> {
             collection,
             limit,
             dry_run,
+            force,
             verbose: _,
         } => {
             let bar = show_bar.then(BarProgress::new);
@@ -649,6 +655,7 @@ async fn main() -> Result<()> {
                 collection.as_deref(),
                 limit,
                 dry_run,
+                force,
                 progress,
             );
             if result.is_err() {
@@ -805,6 +812,7 @@ fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
 /// multi-WACZ — see rustyweb-15z.8), so it indexes cleanly today. Downloading
 /// (rather than streaming in place) keeps replay durable: the presigned URLs
 /// expire in ~48 h, so they're an ingest artifact, not a replay source.
+#[allow(clippy::too_many_arguments)]
 fn run_browsertrix(
     host: &str,
     org: Option<&str>,
@@ -812,9 +820,11 @@ fn run_browsertrix(
     collection: Option<&str>,
     limit: usize,
     dry_run: bool,
+    force: bool,
     progress: Option<&dyn rustyweb_lib::index::IndexProgress>,
 ) -> Result<()> {
     let client = connect(host)?;
+    let host = client.host().to_string();
     let orgs = client.orgs().context("listing organizations")?;
     let org = resolve_org(&orgs, org)?;
     tracing::info!(org = %org.name, id = %org.id, "using organization");
@@ -857,7 +867,14 @@ fn run_browsertrix(
     std::fs::create_dir_all(&archive)
         .with_context(|| format!("creating archive dir {}", archive.display()))?;
 
+    // Incremental sync: skip resources already recorded in the manifest (by
+    // host + item + content hash) so re-running against a large account is
+    // cheap. `--force` re-imports regardless. `mut` so within-run duplicates are
+    // skipped too.
+    let mut seen = load_imported(home);
+
     let mut imported = 0usize;
+    let mut skipped = 0usize;
     for item in selected {
         let resources = client
             .resources(&org.id, item)
@@ -867,6 +884,13 @@ fn run_browsertrix(
             continue;
         }
         for res in &resources {
+            let key = (host.clone(), item.id.clone(), res.hash.clone());
+            if !force && seen.contains(&key) {
+                tracing::debug!(item = %item.name, "already imported; skipping");
+                skipped += 1;
+                continue;
+            }
+
             let filename = safe_wacz_filename(&res.name, &item.id);
             let dest = archive.join(&filename);
             let size = if res.size > 0 {
@@ -891,11 +915,36 @@ fn run_browsertrix(
             );
             drop(quiet);
             indexed.with_context(|| format!("indexing {}", dest.display()))?;
+
+            // Record provenance so a later run can skip this resource.
+            rustyweb_lib::index::set_browsertrix_provenance(
+                home, &dest, &host, &item.id, &res.hash,
+            )
+            .with_context(|| format!("recording provenance for {}", dest.display()))?;
+            seen.insert(key);
             imported += 1;
         }
     }
-    tracing::info!(imported, "browsertrix import complete");
+    tracing::info!(imported, skipped, "browsertrix import complete");
     Ok(())
+}
+
+/// Load the set of already-imported Browsertrix resources — `(host, item_id,
+/// resource_hash)` — from the manifest, for incremental-sync skip checks.
+/// Returns empty when there's no manifest yet.
+fn load_imported(home: &std::path::Path) -> std::collections::HashSet<(String, String, String)> {
+    use rustyweb_lib::collections::Manifest;
+
+    let index_dir = rustyweb_lib::index::index_dir(home);
+    Manifest::open(&index_dir)
+        .map(|m| {
+            m.waczs
+                .iter()
+                .filter_map(|w| w.browsertrix.as_ref())
+                .map(|b| (b.host.clone(), b.item_id.clone(), b.resource_hash.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Download a WACZ to `dest` via a temp `.part` file renamed on success, so an
