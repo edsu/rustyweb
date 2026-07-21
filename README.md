@@ -367,7 +367,9 @@ derived siblings under it.
   once during CDX-guided (streaming) indexing (default: 4 for remote URLs — gentle
   on the host, raise for object stores like S3; CPU count for local files; capped
   at 64 per host). Indexing shows a progress bar on an interactive terminal;
-  `-v`/`--verbose` replaces it with debug logs.
+  `-v`/`--verbose` replaces it with debug logs. A **multi-WACZ** (a WACZ that
+  bundles other WACZs, e.g. a Browsertrix combined-collection download) is
+  detected automatically and its inner crawls indexed too, into one entry.
 - **`collection`** - `collection list` shows collections and their members;
   `collection set <COLLECTION> <WACZ_ID>...` moves WACZs into a collection.
 - **`reindex`** - rebuild the search index from the WACZs already in the

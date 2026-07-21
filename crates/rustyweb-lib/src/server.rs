@@ -646,6 +646,15 @@ async fn crawl_page(
     if let Some(rb) = &c.robots {
         provenance.push(views::MetaRow::new("Robots", rb.clone()));
     }
+    if let Some(n) = c.nested_waczs {
+        provenance.push(views::MetaRow::new(
+            "Multi-WACZ",
+            format!(
+                "{n} crawl{} bundled in one file",
+                if n == 1 { "" } else { "s" }
+            ),
+        ));
+    }
     if let Some(n) = c.page_count {
         provenance.push(views::MetaRow::new("Pages", n.to_string()));
     }

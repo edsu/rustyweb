@@ -514,6 +514,26 @@ unbounded number of range requests in flight against a single host. The agent
 is built with `http_status_as_error(false)` so `4xx`/`5xx` come back as
 inspectable responses (status + `Retry-After`) rather than opaque errors.
 
+### Nested multi-WACZ
+
+A WACZ can nest: a **multi-WACZ** is a ZIP whose payload is other `.wacz` files
+rather than top-level `archive/` WARCs. This is what Browsertrix's combined
+collection `/download` returns for a collection with more than one crawl — its
+`datapackage.json` sets `profile: "multi-wacz-package"` and the inner `.wacz`
+files are top-level `Stored` entries (confirmed against a real download). Nesting
+is a Webrecorder/Browsertrix **convention, not part of the WACZ spec**, so
+`wacz::nested_wacz_entries` detects it *structurally* — `.wacz` entries present
+and *no* `archive/` WARCs — rather than depending on the non-standard `profile`
+string (which also makes it work for multi-WACZs from other tools). `index_nested`
+(in `index.rs`) then extracts each inner `.wacz` to a temp file and indexes it
+through the ordinary per-WACZ path (CDX-guided or scan), **flattening** them into
+one manifest entry tagged with the outer crawl's id — its `page_count` /
+capture-range / provenance aggregate the inner crawls (approach A). Works for a
+local file or a remote URL (the inner WACZs are read out of the outer ZIP, over
+range requests when remote). Without this, the flat-WACZ assumption would index a
+multi-WACZ as *empty*, silently. **Replay is unaffected** — ReplayWeb.page /
+wabac.js already resolves nested WACZs over range reads.
+
 ### Representative-image thumbnails
 
 To make the UI visual, each crawl gets a small representative image on its card

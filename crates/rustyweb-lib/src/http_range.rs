@@ -335,6 +335,40 @@ impl RangeFetch for FileFetch {
     }
 }
 
+/// A [`RangeFetch`] over a byte window `[base, base + len)` of another fetch.
+///
+/// Used to read a **Stored** (uncompressed) inner WACZ of a nested multi-WACZ in
+/// place: its bytes are a contiguous slice of the outer WACZ, so a window over
+/// the outer's fetch *is* the inner WACZ — the streaming indexer can read it
+/// (CDX + only the page records) without extracting it to a temp file, and a
+/// remote outer still fetches only the ranges it needs. Cheap to clone when `F`
+/// is (both `HttpFetch` and `FileFetch` are).
+#[derive(Clone)]
+pub struct SubRangeFetch<F> {
+    inner: F,
+    base: u64,
+    len: u64,
+}
+
+impl<F: RangeFetch> SubRangeFetch<F> {
+    pub fn new(inner: F, base: u64, len: u64) -> Self {
+        Self { inner, base, len }
+    }
+}
+
+impl<F: RangeFetch> RangeFetch for SubRangeFetch<F> {
+    fn total_len(&self) -> u64 {
+        self.len
+    }
+    fn fetch(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        // Translate window-relative offsets to the outer fetch, clamped to the
+        // window so a read can't stray past the inner WACZ.
+        let end = end.min(self.len);
+        let start = start.min(end);
+        self.inner.fetch(self.base + start, self.base + end)
+    }
+}
+
 /// A retried whole-file GET returning the response body reader (for downloads).
 /// Retries the request start on transient failures; a mid-stream connection drop
 /// is not resumed.

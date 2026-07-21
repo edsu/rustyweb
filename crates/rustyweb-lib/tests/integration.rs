@@ -489,6 +489,40 @@ async fn crawl_page_shows_browsertrix_provenance() {
 }
 
 #[tokio::test]
+async fn crawl_page_shows_multi_wacz_provenance() {
+    let tmp = make_index(&["a.wacz"]);
+    // Mark the entry as a multi-WACZ, as index_nested does for a nested file
+    // (set on the manifest directly so the test needn't build a nested WACZ).
+    let index_dir = tmp.path().join("index");
+    let mut m = rustyweb_lib::collections::Manifest::open(&index_dir).unwrap();
+    m.waczs[0].nested_waczs = Some(3);
+    m.save().unwrap();
+    let id = m.waczs[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/crawl/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(
+        html.contains("Multi-WACZ"),
+        "crawl page should flag a multi-WACZ"
+    );
+    assert!(
+        html.contains("3 crawls bundled"),
+        "and show the bundled-crawl count"
+    );
+}
+
+#[tokio::test]
 async fn collection_page_lists_members() {
     let tmp = make_index(&["a.wacz"]);
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
