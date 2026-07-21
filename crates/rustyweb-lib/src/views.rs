@@ -496,7 +496,7 @@ pub fn collection(
 ) -> Markup {
     let body = html! {
         (top_bar(None))
-        h1 { (name) }
+        h1.page-title { (name) }
         @if let Some(d) = description { p.desc { (d) } }
         (meta_table(meta))
         (facet_browse(facets))
@@ -567,7 +567,7 @@ pub fn crawl(p: &CrawlPage) -> Markup {
             div.crumb { "in " a href=(format!("/collection/{}", id)) { (cname) } }
         }
         div.detail-thumb { (thumb_area(p.thumb.as_deref(), &p.name)) }
-        h1 { (p.name) }
+        h1.page-title { (p.name) }
         @if let Some(d) = &p.description { p.desc { (d) } }
         a.replay-btn href=(p.replay_href) { "Replay →" }
 

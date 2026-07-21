@@ -620,6 +620,20 @@ async fn crawl_page(
 
     // Provenance panel: how this crawl was produced. Only rows with data show.
     let mut provenance = Vec::new();
+    if let Some(bt) = &c.browsertrix {
+        // Attribution for content pulled in via `rustyweb import browsertrix`.
+        let host = bt
+            .host
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        provenance.push(views::MetaRow::new(
+            "Source",
+            format!("Browsertrix ({host})"),
+        ));
+        if !bt.item_id.is_empty() {
+            provenance.push(views::MetaRow::mono("Browsertrix item", bt.item_id.clone()));
+        }
+    }
     if !c.software.is_empty() {
         provenance.push(views::MetaRow::new("Software", c.software.join(", ")));
     }
