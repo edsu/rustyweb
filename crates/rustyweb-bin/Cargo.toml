@@ -16,3 +16,10 @@ anyhow = { workspace = true }
 url = { workspace = true }
 gag = { workspace = true }
 indicatif = { workspace = true }
+
+[dev-dependencies]
+# End-to-end test that runs the built binary against a local mock Browsertrix
+# API (axum) — see tests/browsertrix_import.rs.
+axum = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
