@@ -219,6 +219,18 @@ impl Client<UreqTransport> {
     pub fn login(host: &str, username: &str, password: &str) -> Result<Self> {
         Self::login_with(UreqTransport::default(), host, username, password)
     }
+
+    /// Build a client from an existing bearer token, skipping the login
+    /// round-trip. For callers that already hold a JWT (e.g. from the
+    /// environment).
+    pub fn with_token(host: &str, token: &str) -> Self {
+        Self {
+            transport: UreqTransport::default(),
+            host: host.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            page_size: PAGE_SIZE,
+        }
+    }
 }
 
 impl<T: Transport> Client<T> {

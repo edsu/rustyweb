@@ -153,6 +153,28 @@ enum Commands {
         #[command(subcommand)]
         action: CrawlCmd,
     },
+    /// Import WACZ files from a Browsertrix instance (Webrecorder's hosted
+    /// crawler). Authenticates with credentials from the environment:
+    /// BROWSERTRIX_USER + BROWSERTRIX_PASSWORD, or a BROWSERTRIX_TOKEN — kept out
+    /// of the command line so secrets don't appear in the process list.
+    Browsertrix {
+        /// Browsertrix host (use this for a self-hosted instance).
+        #[arg(long, default_value = rustyweb_lib::browsertrix::DEFAULT_HOST)]
+        host: String,
+
+        /// Organization to import from (its slug or id). Defaults to your only
+        /// org; required when the account has more than one.
+        #[arg(long)]
+        org: Option<String>,
+
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
+
+        /// Show at most N items (0 = all).
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -589,6 +611,15 @@ async fn main() -> Result<()> {
                 }
             }
         },
+
+        Commands::Browsertrix {
+            host,
+            org,
+            home,
+            limit,
+        } => {
+            run_browsertrix(&host, org.as_deref(), &home, limit)?;
+        }
     }
 
     Ok(())
@@ -727,9 +758,168 @@ fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Authenticate to Browsertrix, resolve the org, and list its archived items.
+/// The download-and-index flow is a follow-up task (rustyweb-15z.3); for now
+/// this proves the auth + org-selection path and shows what's there.
+fn run_browsertrix(
+    host: &str,
+    org: Option<&str>,
+    home: &std::path::Path,
+    limit: usize,
+) -> Result<()> {
+    let client = connect(host)?;
+    let orgs = client.orgs().context("listing organizations")?;
+    let org = resolve_org(&orgs, org)?;
+    tracing::info!(org = %org.name, id = %org.id, "using organization");
+
+    let items = client.items(&org.id).context("listing archived items")?;
+    let shown = if limit == 0 {
+        items.len()
+    } else {
+        limit.min(items.len())
+    };
+    println!(
+        "{} item(s) in \"{}\" ({}):",
+        items.len(),
+        org.name,
+        org.slug
+    );
+    for item in items.iter().take(shown) {
+        let kind = if item.is_upload() { "upload" } else { "crawl" };
+        println!(
+            "  {:<6} {:>10}  {}  {}",
+            kind,
+            human_size(item.file_size),
+            item.id,
+            item.name
+        );
+    }
+    if shown < items.len() {
+        println!(
+            "  … {} more (use --limit 0 to show all)",
+            items.len() - shown
+        );
+    }
+    // The actual import lands in 15z.3; make the target explicit until then.
+    tracing::info!(
+        home = %home.display(),
+        "download + index into <home>/archive is not wired yet (rustyweb-15z.3)"
+    );
+    Ok(())
+}
+
+/// Build a Browsertrix client from environment credentials, so secrets never
+/// appear in argv. A `BROWSERTRIX_TOKEN` (an existing JWT) short-circuits login;
+/// otherwise `BROWSERTRIX_USER` + `BROWSERTRIX_PASSWORD` are used.
+fn connect(host: &str) -> Result<rustyweb_lib::browsertrix::Client> {
+    use rustyweb_lib::browsertrix::Client;
+
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if let Some(token) = env("BROWSERTRIX_TOKEN") {
+        return Ok(Client::with_token(host, &token));
+    }
+    match (env("BROWSERTRIX_USER"), env("BROWSERTRIX_PASSWORD")) {
+        (Some(user), Some(password)) => {
+            Client::login(host, &user, &password).context("logging in to Browsertrix")
+        }
+        _ => anyhow::bail!(
+            "set BROWSERTRIX_USER and BROWSERTRIX_PASSWORD (or BROWSERTRIX_TOKEN) in the \
+             environment to authenticate — they're read from the environment so credentials \
+             stay out of the command line"
+        ),
+    }
+}
+
+/// Choose the org to import from. With `want` (a slug or id), match it exactly;
+/// otherwise use the sole org, erroring if there are none or several.
+fn resolve_org(
+    orgs: &[rustyweb_lib::browsertrix::Org],
+    want: Option<&str>,
+) -> Result<rustyweb_lib::browsertrix::Org> {
+    let slugs = || {
+        orgs.iter()
+            .map(|o| o.slug.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match want {
+        Some(w) => orgs
+            .iter()
+            .find(|o| o.slug == w || o.id == w)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no org matching \"{w}\"; available: {}", slugs())),
+        None => match orgs {
+            [] => anyhow::bail!("no organizations are available for this account"),
+            [only] => Ok(only.clone()),
+            _ => anyhow::bail!("several orgs are available; pass --org <slug>: {}", slugs()),
+        },
+    }
+}
+
+/// Human-readable byte size (binary units) for listing output.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_source_lines;
+    use super::{human_size, resolve_org};
+    use rustyweb_lib::browsertrix::Org;
+
+    fn org(id: &str, slug: &str) -> Org {
+        Org {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            name: format!("{slug} name"),
+        }
+    }
+
+    #[test]
+    fn resolve_org_uses_the_sole_org_by_default() {
+        let orgs = vec![org("o1", "gov")];
+        assert_eq!(resolve_org(&orgs, None).unwrap().id, "o1");
+    }
+
+    #[test]
+    fn resolve_org_requires_a_choice_when_several_exist() {
+        let orgs = vec![org("o1", "gov"), org("o2", "edu")];
+        let err = resolve_org(&orgs, None).err().unwrap().to_string();
+        assert!(err.contains("several"), "{err}");
+        assert!(err.contains("gov") && err.contains("edu"), "{err}");
+    }
+
+    #[test]
+    fn resolve_org_matches_slug_or_id() {
+        let orgs = vec![org("o1", "gov"), org("o2", "edu")];
+        assert_eq!(resolve_org(&orgs, Some("edu")).unwrap().id, "o2");
+        assert_eq!(resolve_org(&orgs, Some("o1")).unwrap().slug, "gov");
+    }
+
+    #[test]
+    fn resolve_org_errors_on_unknown_org() {
+        let orgs = vec![org("o1", "gov")];
+        let err = resolve_org(&orgs, Some("nope")).err().unwrap().to_string();
+        assert!(err.contains("nope") && err.contains("gov"), "{err}");
+    }
+
+    #[test]
+    fn human_size_scales_units() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MiB");
+    }
 
     #[test]
     fn parse_source_lines_skips_blanks_and_comments_and_trims() {
