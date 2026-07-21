@@ -283,6 +283,34 @@ fn is_warc_entry(name: &str) -> bool {
     name.starts_with("archive/") && (name.ends_with(".warc.gz") || name.ends_with(".warc"))
 }
 
+/// The inner `.wacz` entry names of a **nested multi-WACZ** — a WACZ whose
+/// payload is other WACZ files (conventionally under `data/`) rather than
+/// `archive/` WARCs. This is what Browsertrix's combined collection `/download`
+/// returns for a collection with more than one crawl. Returns empty for an
+/// ordinary (flat) WACZ: nesting is only reported when there are `.wacz` entries
+/// **and no** `archive/` WARCs, so a normal WACZ that happens to bundle a `.wacz`
+/// resource isn't misread.
+pub(crate) fn nested_wacz_entries<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Vec<String> {
+    let mut waczs = Vec::new();
+    let mut has_warc = false;
+    for i in 0..zip.len() {
+        let Ok(f) = zip.by_index(i) else { continue };
+        let name = f.name();
+        if is_warc_entry(name) {
+            has_warc = true;
+        } else if name.to_ascii_lowercase().ends_with(".wacz") {
+            waczs.push(name.to_string());
+        }
+    }
+    if has_warc {
+        Vec::new()
+    } else {
+        waczs
+    }
+}
+
 /// Read and parse **all** CDX records from a WACZ ZIP (any `Read + Seek`), for
 /// CDX-guided/streaming indexing. Unlike [`search_cdx`], no URL filter.
 pub(crate) fn cdx_records<R: std::io::Read + std::io::Seek>(
