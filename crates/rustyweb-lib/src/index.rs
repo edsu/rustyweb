@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use tracing::{debug, info};
 
 use crate::collections::{file_sha256, wacz_id, BrowsertrixRef, Manifest, Source, Wacz};
+use crate::http_range::{RangeFetch, RangeReader};
 use crate::search::{extract_html_text, SearchIndex};
 use crate::wacz::{extract_warc_from_wacz, iter_warc_paths, read_datapackage};
 use crate::warc::{iter_records, WarcRecord, Warcinfo};
@@ -811,13 +812,18 @@ struct CrawlStats {
     warcinfo: Option<Warcinfo>,
 }
 
-/// Index a **nested multi-WACZ** (a WACZ whose payload is other WACZ files; see
-/// [`crate::wacz::nested_wacz_entries`]) — e.g. Browsertrix's combined collection
-/// `/download`. Each inner `.wacz` is extracted to a temp file and indexed under
-/// this (outer) crawl's id, so the whole thing stays one manifest entry
-/// (recurse + flatten). Returns `None` when the WACZ isn't nested, so the caller
-/// falls through to ordinary indexing. Replay is unaffected — wabac.js already
-/// resolves nested WACZs over range reads.
+/// Detect + index a **nested multi-WACZ** (a WACZ whose payload is other WACZ
+/// files; see [`crate::wacz::nested_wacz_locations`]) — e.g. Browsertrix's
+/// combined collection `/download`. Each inner `.wacz` is indexed under this
+/// (outer) crawl's id, so the whole thing stays one manifest entry (flatten).
+/// Returns `None` when the WACZ isn't nested, so the caller falls through to
+/// ordinary indexing. Replay is unaffected — wabac.js already resolves nesting.
+///
+/// A Stored inner WACZ is a contiguous byte window of the outer file, so it's
+/// streamed **in place** via a [`SubRangeFetch`] — no extraction, and a remote
+/// outer fetches only the ranges it needs. (Only a compressed inner entry, or an
+/// inner whose own WARCs aren't Stored, has to be materialized to a temp file —
+/// not the Browsertrix case.)
 #[allow(clippy::too_many_arguments)]
 fn index_nested(
     local: Option<&Path>,
@@ -831,28 +837,26 @@ fn index_nested(
 ) -> Result<Option<CrawlStats>> {
     match (local, remote_url) {
         (Some(p), _) => {
-            let zip = zip::ZipArchive::new(std::fs::File::open(p)?)
-                .with_context(|| format!("opening {}", p.display()))?;
-            index_nested_from_zip(
-                zip, crawl_id, crawl_name, collection, search, workers, progress,
+            let fetch = crate::http_range::FileFetch::open(p)?;
+            index_nested_from(
+                fetch, crawl_id, crawl_name, collection, search, workers, progress,
             )
         }
         (None, Some(u)) => {
-            let zip = zip::ZipArchive::new(crate::http_range::open_remote(u)?)
-                .with_context(|| format!("opening {u}"))?;
-            index_nested_from_zip(
-                zip, crawl_id, crawl_name, collection, search, workers, progress,
+            let fetch = crate::http_range::HttpFetch::open(u)?;
+            index_nested_from(
+                fetch, crawl_id, crawl_name, collection, search, workers, progress,
             )
         }
         _ => Ok(None),
     }
 }
 
-/// Core of [`index_nested`], generic over the outer WACZ's byte source (a local
-/// file or an HTTP range reader).
+/// Core of [`index_nested`], generic over the outer WACZ's byte source
+/// (`FileFetch` locally, `HttpFetch` remotely).
 #[allow(clippy::too_many_arguments)]
-fn index_nested_from_zip<R: std::io::Read + std::io::Seek>(
-    mut zip: zip::ZipArchive<R>,
+fn index_nested_from<F: RangeFetch + Clone + Send + Sync>(
+    outer: F,
     crawl_id: &str,
     crawl_name: &str,
     collection: &str,
@@ -860,37 +864,43 @@ fn index_nested_from_zip<R: std::io::Read + std::io::Seek>(
     workers: usize,
     progress: Option<&dyn IndexProgress>,
 ) -> Result<Option<CrawlStats>> {
-    let entries = crate::wacz::nested_wacz_entries(&mut zip);
-    if entries.is_empty() {
+    let inners = {
+        let mut zip = zip::ZipArchive::new(RangeReader::new(outer.clone()))
+            .context("opening WACZ to check for nesting")?;
+        crate::wacz::nested_wacz_locations(&mut zip)
+    };
+    if inners.is_empty() {
         return Ok(None);
     }
-    info!(count = entries.len(), "indexing a nested multi-WACZ");
+    info!(count = inners.len(), "indexing a nested multi-WACZ");
 
     let mut agg = CrawlStats::default();
-    for (i, entry) in entries.iter().enumerate() {
+    for (i, inner) in inners.iter().enumerate() {
         if let Some(pr) = progress {
-            pr.phase(&format!("nested WACZ {}/{}", i + 1, entries.len()));
+            pr.phase(&format!("nested WACZ {}/{}", i + 1, inners.len()));
         }
-        // Extract the inner WACZ to a temp file, then index it like any local
-        // WACZ (CDX-guided when its WARCs are Stored, else a full scan).
-        let mut tmp = tempfile::NamedTempFile::new().context("creating temp for nested WACZ")?;
-        std::io::copy(&mut zip.by_name(entry)?, tmp.as_file_mut())
-            .with_context(|| format!("extracting nested {entry}"))?;
-        let path = tmp.path();
-        let stats = if local_warcs_streamable(path).unwrap_or(false) {
-            let fetch = crate::http_range::FileFetch::open(path)?;
-            index_wacz_streaming(
-                fetch,
+        let stats = match inner.inline {
+            // Stored: read it in place as a window of the outer file.
+            Some((base, len)) => index_inner(
+                crate::http_range::SubRangeFetch::new(outer.clone(), base, len),
+                &inner.name,
                 crawl_id,
                 crawl_name,
                 collection,
                 search,
-                &path.display().to_string(),
                 workers,
                 progress,
-            )?
-        } else {
-            index_wacz(path, crawl_id, crawl_name, collection, search)?
+            )?,
+            // Compressed inner entry: extract it (decompressing) to a temp file,
+            // then full-scan it. Rare — not produced by Browsertrix.
+            None => {
+                let mut zip = zip::ZipArchive::new(RangeReader::new(outer.clone()))?;
+                let mut tmp =
+                    tempfile::NamedTempFile::new().context("temp for compressed nested WACZ")?;
+                std::io::copy(&mut zip.by_name(&inner.name)?, tmp.as_file_mut())
+                    .with_context(|| format!("extracting nested {}", inner.name))?;
+                index_wacz(tmp.path(), crawl_id, crawl_name, collection, search)?
+            }
         };
         agg.pages += stats.pages;
         merge_min(&mut agg.earliest_capture, stats.earliest_capture);
@@ -900,6 +910,50 @@ fn index_nested_from_zip<R: std::io::Read + std::io::Seek>(
         }
     }
     Ok(Some(agg))
+}
+
+/// Index one inner WACZ presented as a [`RangeFetch`] window. CDX-guided
+/// (streaming, no extraction) when its WARCs are Stored; otherwise the window is
+/// materialized to a temp file and full-scanned (rare).
+#[allow(clippy::too_many_arguments)]
+fn index_inner<F: RangeFetch + Clone + Send + Sync>(
+    fetch: F,
+    label: &str,
+    crawl_id: &str,
+    crawl_name: &str,
+    collection: &str,
+    search: &Mutex<SearchIndex>,
+    workers: usize,
+    progress: Option<&dyn IndexProgress>,
+) -> Result<CrawlStats> {
+    let streamable = zip::ZipArchive::new(RangeReader::new(fetch.clone()))
+        .ok()
+        .map(|mut z| crate::wacz::warcs_stored(&mut z).unwrap_or(false))
+        .unwrap_or(false);
+    if streamable {
+        index_wacz_streaming(
+            fetch, crawl_id, crawl_name, collection, search, label, workers, progress,
+        )
+    } else {
+        let tmp = materialize_fetch(&fetch).context("materializing nested WACZ for scan")?;
+        index_wacz(tmp.path(), crawl_id, crawl_name, collection, search)
+    }
+}
+
+/// Copy an entire [`RangeFetch`] to a temp file (chunked), for the fallback
+/// paths that need a seekable local file.
+fn materialize_fetch<F: RangeFetch>(fetch: &F) -> Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    const CHUNK: u64 = 4 * 1024 * 1024;
+    let total = fetch.total_len();
+    let mut tmp = tempfile::NamedTempFile::new()?;
+    let mut pos = 0u64;
+    while pos < total {
+        let end = (pos + CHUNK).min(total);
+        tmp.as_file_mut().write_all(&fetch.fetch(pos, end)?)?;
+        pos = end;
+    }
+    Ok(tmp)
 }
 
 /// Keep the smaller of two optional 14-digit capture timestamps (they sort
@@ -1682,32 +1736,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nested_multi_wacz_is_indexed() {
+    /// Build a nested multi-WACZ that wraps the `a.wacz` fixture, mirroring a
+    /// real Browsertrix combined download: no top-level archive/ WARCs, the inner
+    /// .wacz a top-level *Stored* entry, and a multi-wacz-package datapackage.
+    fn nested_multi_wacz() -> Vec<u8> {
         use std::io::Write;
-        // Wrap a normal WACZ as the payload of a nested multi-WACZ, mirroring a
-        // real Browsertrix combined download: no top-level archive/ WARCs, the
-        // inner .wacz a top-level Stored entry, and a multi-wacz-package
-        // datapackage. (Detection is structural, so it ignores the datapackage —
-        // it's here to keep the fixture faithful.)
         let inner = std::fs::read(fixture("a.wacz")).unwrap();
         let inner_name = "20250101000000-abc-0.wacz";
         let mut outer = Vec::new();
-        {
-            let stored = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            let opt = zip::write::SimpleFileOptions::default();
-            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut outer));
-            zw.start_file(inner_name, stored).unwrap();
-            zw.write_all(&inner).unwrap();
-            zw.start_file("datapackage.json", opt).unwrap();
-            let dp = format!(
-                r#"{{"profile":"multi-wacz-package","resources":[{{"name":"{inner_name}","path":"{inner_name}"}}]}}"#
-            );
-            zw.write_all(dp.as_bytes()).unwrap();
-            zw.finish().unwrap();
-        }
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let opt = zip::write::SimpleFileOptions::default();
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut outer));
+        zw.start_file(inner_name, stored).unwrap();
+        zw.write_all(&inner).unwrap();
+        zw.start_file("datapackage.json", opt).unwrap();
+        let dp = format!(
+            r#"{{"profile":"multi-wacz-package","resources":[{{"name":"{inner_name}","path":"{inner_name}"}}]}}"#
+        );
+        zw.write_all(dp.as_bytes()).unwrap();
+        zw.finish().unwrap(); // consumes zw, releasing the borrow of `outer`
+        outer
+    }
 
+    /// In-memory [`RangeFetch`], a stand-in for a remote `HttpFetch`.
+    #[derive(Clone)]
+    struct MemFetch(std::sync::Arc<Vec<u8>>);
+    impl crate::http_range::RangeFetch for MemFetch {
+        fn total_len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn fetch(&self, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
+            Ok(self.0[start as usize..end as usize].to_vec())
+        }
+    }
+
+    #[test]
+    fn nested_multi_wacz_is_indexed() {
+        let outer = nested_multi_wacz();
         let tmp = TempDir::new().unwrap();
         let archive = tmp.path().join("archive");
         std::fs::create_dir_all(&archive).unwrap();
@@ -1728,6 +1794,24 @@ mod tests {
             w.software.iter().any(|s| s.contains("Browsertrix-Crawler")),
             "the inner crawl's software should surface on the outer entry: {:?}",
             w.software
+        );
+    }
+
+    #[test]
+    fn nested_multi_wacz_streams_over_a_range_fetch() {
+        // Drive index_nested through an in-memory RangeFetch (a stand-in for a
+        // remote HttpFetch) to prove the Stored inner WACZ is read in place via
+        // SubRangeFetch — no extraction, no full download.
+        let outer = MemFetch(std::sync::Arc::new(nested_multi_wacz()));
+        let tmp = TempDir::new().unwrap();
+        let search = Mutex::new(SearchIndex::open(&tmp.path().join("ft")).unwrap());
+
+        let stats = index_nested_from(outer, "cid", "Nested", "coll", &search, 2, None)
+            .unwrap()
+            .expect("should detect and index the nested WACZ");
+        assert!(
+            stats.pages > 0,
+            "inner pages should be indexed by streaming in place"
         );
     }
 

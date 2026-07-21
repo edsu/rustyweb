@@ -297,18 +297,27 @@ fn is_warc_entry(name: &str) -> bool {
 /// and also catches multi-WACZs from other tools. Returns empty for an ordinary
 /// (flat) WACZ, so one that merely bundles a `.wacz` alongside its WARCs isn't
 /// misread.
-pub(crate) fn nested_wacz_entries<R: std::io::Read + std::io::Seek>(
+pub(crate) fn nested_wacz_locations<R: std::io::Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
-) -> Vec<String> {
+) -> Vec<NestedWacz> {
     let mut waczs = Vec::new();
     let mut has_warc = false;
     for i in 0..zip.len() {
         let Ok(f) = zip.by_index(i) else { continue };
-        let name = f.name();
-        if is_warc_entry(name) {
+        let name = f.name().to_string();
+        if is_warc_entry(&name) {
             has_warc = true;
         } else if name.to_ascii_lowercase().ends_with(".wacz") {
-            waczs.push(name.to_string());
+            // A Stored inner WACZ is a contiguous, uncompressed byte window of the
+            // outer file — record where it starts and how long it is so it can be
+            // range-read in place (no extraction). A deflated one (`inline: None`)
+            // has to be materialized to read it.
+            let inline = if f.compression() == zip::CompressionMethod::Stored {
+                f.data_start().map(|start| (start, f.size()))
+            } else {
+                None
+            };
+            waczs.push(NestedWacz { name, inline });
         }
     }
     if has_warc {
@@ -316,6 +325,14 @@ pub(crate) fn nested_wacz_entries<R: std::io::Read + std::io::Seek>(
     } else {
         waczs
     }
+}
+
+/// An inner `.wacz` of a nested multi-WACZ. `inline` is `Some((data_start, len))`
+/// when the entry is Stored and can be read in place as a window of the outer
+/// file; `None` when it's compressed and must be extracted first.
+pub(crate) struct NestedWacz {
+    pub name: String,
+    pub inline: Option<(u64, u64)>,
 }
 
 /// Read and parse **all** CDX records from a WACZ ZIP (any `Read + Seek`), for
