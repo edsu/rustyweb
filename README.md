@@ -314,10 +314,11 @@ Notes:
   org. `--org <SLUG>` picks the org when your account has more than one.
 - **Incremental.** Re-running skips crawls already imported (matched by content
   hash), so syncing an account is cheap; `--force` re-imports anyway.
-- **Durable.** WACZs are downloaded (not streamed) into `<home>/archive`, because
-  Browsertrix's presigned URLs expire after ~48h - a downloaded copy keeps replay
-  working long-term. `--host <URL>` targets a self-hosted Browsertrix (default is
-  `https://app.browsertrix.com`).
+- **Durable.** WACZs are downloaded (not streamed) into `<home>/archive/<item-id>/`
+  (a subfolder per Browsertrix item, so items can't clash on a shared filename),
+  because Browsertrix's presigned URLs expire after ~48h - a downloaded copy keeps
+  replay working long-term. `--host <URL>` targets a self-hosted Browsertrix
+  (default is `https://app.browsertrix.com`).
 - **Grouping.** Importing a `--collection` groups its crawls into a rustyweb
   collection of the same name. `--into <NAME>` overrides that name (and is the way
   to group an org-wide or single-`--crawl` import, which otherwise land as

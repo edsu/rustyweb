@@ -674,7 +674,9 @@ async fn crawl_page(
 }
 
 /// Format a byte count as a short human-readable size.
-fn human_size(bytes: u64) -> String {
+/// Format a byte count for display (e.g. `48.2 MB`). Shared by the web UI and
+/// the CLI so both show sizes the same way.
+pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut b = bytes as f64;
     let mut i = 0;

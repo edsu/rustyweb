@@ -968,7 +968,7 @@ fn run_browsertrix(
             println!(
                 "  {:<6} {:>10}  {:>4}  {}  {}",
                 if item.is_upload() { "upload" } else { "crawl" },
-                human_size(item.file_size),
+                rustyweb_lib::server::human_size(item.file_size),
                 item.review_status
                     .map_or("—".to_string(), |s| format!("QA{s}")),
                 item.id,
@@ -1014,7 +1014,16 @@ fn run_browsertrix(
             tracing::warn!(item = %item.name, id = %item.id, "no WACZ resources; skipping");
             continue;
         }
-        for res in &resources {
+        // Each item's WACZ(s) land in their own subdirectory under archive/, so
+        // two items whose resources share a filename can't clobber each other
+        // (their crawl id is derived from the path, so a shared path would also
+        // merge their manifest entries). The subdir is still under archive/, so
+        // it satisfies the "local WACZ lives in archive/" rule.
+        let item_dir = archive.join(safe_component(&item.id));
+        std::fs::create_dir_all(&item_dir)
+            .with_context(|| format!("creating {}", item_dir.display()))?;
+
+        for (i, res) in resources.iter().enumerate() {
             let key = (host.clone(), item.id.clone(), res.hash.clone());
             if !opts.force && seen.contains(&key) {
                 tracing::debug!(item = %item.name, "already imported; skipping");
@@ -1022,10 +1031,10 @@ fn run_browsertrix(
                 continue;
             }
 
-            let filename = safe_wacz_filename(&res.name, &item.id);
-            let dest = archive.join(&filename);
+            let filename = safe_wacz_filename(&res.name, &format!("resource-{i}"));
+            let dest = item_dir.join(&filename);
             let size = if res.size > 0 {
-                format!(" ({})", human_size(res.size))
+                format!(" ({})", rustyweb_lib::server::human_size(res.size))
             } else {
                 String::new()
             };
@@ -1160,22 +1169,13 @@ fn download_wacz(url: &str, dest: &std::path::Path) -> Result<u64> {
 /// to the item id). Non-`[A-Za-z0-9._-]` characters — including any path
 /// separators — become `_`, so the result stays a single component inside the
 /// archive folder.
-fn safe_wacz_filename(name: &str, fallback_id: &str) -> String {
+fn safe_wacz_filename(name: &str, fallback: &str) -> String {
     let base = if name.trim().is_empty() {
-        fallback_id
+        fallback
     } else {
         name.trim()
     };
-    let mut out: String = base
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let mut out = safe_component(base);
     if !out.to_ascii_lowercase().ends_with(".wacz") {
         out.push_str(".wacz");
     }
@@ -1230,26 +1230,24 @@ fn resolve_org(
     }
 }
 
-/// Human-readable byte size (binary units) for listing output.
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
+/// A filesystem-safe single path component: any character outside
+/// `[A-Za-z0-9._-]` (including path separators) becomes `_`.
+fn safe_component(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::parse_source_lines;
-    use super::{human_size, passes_review, resolve_collection, resolve_org, safe_wacz_filename};
+    use super::{passes_review, resolve_collection, resolve_org, safe_wacz_filename};
     use rustyweb_lib::browsertrix::{Collection, Item, Org};
 
     fn item(review: Option<u8>) -> Item {
@@ -1296,13 +1294,6 @@ mod tests {
         let orgs = vec![org("o1", "gov")];
         let err = resolve_org(&orgs, Some("nope")).err().unwrap().to_string();
         assert!(err.contains("nope") && err.contains("gov"), "{err}");
-    }
-
-    #[test]
-    fn human_size_scales_units() {
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1024), "1.0 KiB");
-        assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MiB");
     }
 
     #[test]

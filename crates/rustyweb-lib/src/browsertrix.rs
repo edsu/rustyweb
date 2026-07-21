@@ -31,6 +31,10 @@ pub const DEFAULT_HOST: &str = "https://app.browsertrix.com";
 /// size the client asks for.
 const PAGE_SIZE: usize = 100;
 
+/// Safety valve for the pagination loop: far above any real listing, but bounds
+/// the loop if a misbehaving server never signals the last page.
+const MAX_PAGES: usize = 100_000;
+
 // ── Transport ────────────────────────────────────────────────────────────────
 
 /// The subset of HTTP the client performs, behind a trait so the client's
@@ -347,12 +351,18 @@ impl<T: Transport> Client<T> {
     }
 
     /// The authenticated URL that streams an item's WACZ as a durable download.
+    ///
+    /// Note: the importer does *not* use this — it downloads each flat,
+    /// single-WACZ resource from [`Self::resources`] (which indexes cleanly),
+    /// because the combined per-item `/download` can be a nested multi-WACZ. This
+    /// is here for callers that want that combined download.
     pub fn download_url(&self, oid: &str, item_id: &str) -> String {
         format!("{}/api/orgs/{oid}/all-crawls/{item_id}/download", self.host)
     }
 
-    /// Open an item's WACZ download as a streaming reader (the durable, always-
-    /// download path).
+    /// Open an item's combined WACZ download as a streaming reader. See
+    /// [`Self::download_url`] on why the importer uses [`Self::resources`]
+    /// instead.
     pub fn download(&self, oid: &str, item_id: &str) -> Result<Box<dyn Read + Send>> {
         let url = self.download_url(oid, item_id);
         self.transport.get_stream(&url, Some(&self.token))
@@ -393,6 +403,9 @@ impl<T: Transport> Client<T> {
                 break;
             }
             page += 1;
+            if page > MAX_PAGES {
+                bail!("{path}: pagination did not terminate after {MAX_PAGES} pages");
+            }
         }
         Ok(out)
     }

@@ -140,10 +140,10 @@ fn import_a_collection_then_skip_on_rerun() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    // WACZ landed under archive/.
+    // WACZ landed under archive/, in the item's subdirectory.
     assert!(
-        home.path().join("archive/simple.wacz").exists(),
-        "downloaded WACZ should be under <home>/archive"
+        home.path().join("archive/item1/simple.wacz").exists(),
+        "downloaded WACZ should be under <home>/archive/<item-id>/"
     );
 
     // Manifest records the crawl, with Browsertrix provenance.
