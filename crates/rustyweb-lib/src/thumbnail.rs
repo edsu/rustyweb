@@ -1,12 +1,13 @@
 //! Representative-image thumbnails.
 //!
-//! A crawl's home page usually points at a representative image — via
-//! `<meta property="og:image">`, or failing that the largest content image the
-//! page embeds. We pull that image out of the WACZ (it's one of the resources the
-//! crawl captured), downscale it, and cache a small JPEG the UI shows on
-//! collection cards and detail pages. Everything here is **best-effort**: a crawl
-//! with no usable image produces no thumbnail and the UI falls back to a CSS
-//! placeholder.
+//! Where a crawl's representative image comes from, in priority order: a
+//! Browsertrix page **screenshot** of the home page (crawls with screenshots
+//! enabled store one per page); failing that the home page's `og:image`; failing
+//! that the largest content image the page embeds. We pull the chosen image out
+//! of the WACZ (it's one of the resources the crawl captured), downscale it, and
+//! cache a small JPEG the UI shows on collection cards and detail pages.
+//! Everything here is **best-effort**: a crawl with no usable image produces no
+//! thumbnail and the UI falls back to a CSS placeholder.
 //!
 //! A curator can also pin a thumbnail explicitly (`rustyweb crawl set <id>
 //! --image <file>`); a pinned thumbnail is never overwritten by (re)indexing.
@@ -72,12 +73,13 @@ pub(crate) fn set_manual(thumbs_dir: &Path, crawl_id: &str, image_file: &Path) -
     Ok(())
 }
 
-/// Generate and cache a crawl's representative thumbnail from its WACZ: prefer the
-/// main page's `og:image`, else the largest content image the page embeds.
-/// Returns whether a thumbnail was written. Skips pinned thumbnails. Best-effort.
+/// Generate and cache a crawl's representative thumbnail from its WACZ: prefer a
+/// Browsertrix page screenshot of the main page, else its `og:image`, else the
+/// largest content image the page embeds. Returns whether a thumbnail was
+/// written. Skips pinned thumbnails. Best-effort.
 ///
-/// Only works for CDX-streamable WACZs: it locates the HTML and image records
-/// through the CDX, the same way indexing does.
+/// Only works for CDX-streamable WACZs: it locates the screenshot, HTML, and
+/// image records through the CDX, the same way indexing does.
 pub(crate) fn generate<F>(
     fetch: F,
     thumbs_dir: &Path,
@@ -97,13 +99,22 @@ where
     let starts = wacz::warc_data_starts(&mut zip)?;
     drop(zip);
 
+    // 0. Best by far: a Browsertrix screenshot of the main page. It's an actual
+    //    rendered picture of the page, so it beats every heuristic below and works
+    //    for JS-rendered sites where the saved HTML lists no usable image. Checked
+    //    first, before the HTML is even fetched.
+    if let Some(bytes) = screenshot_bytes(&fetch, &cdx, &starts, main_page_url)? {
+        write_thumbnail(thumbs_dir, crawl_id, &bytes)?;
+        return Ok(true);
+    }
+
     // The main page's HTML → image candidates.
     let Some(html) = fetch_payload(&fetch, &cdx, &starts, main_page_url, "html")? else {
         return Ok(false);
     };
     let (og_image, embedded) = candidate_images(&html);
 
-    // 1. Preferred: the declared og:image / twitter:image, if it was captured.
+    // 1. The declared og:image / twitter:image, if it was captured.
     if let Some(src) = og_image {
         if let Some(abs) = resolve(main_page_url, &src) {
             if let Some(bytes) = fetch_payload(&fetch, &cdx, &starts, &abs, "image")? {
@@ -213,6 +224,40 @@ fn find_image_record<'a>(cdx: &'a [CdxjRecord], url: &str) -> Option<&'a CdxjRec
     cdx.iter().find(|c| c.url == url && is_raster_image(c))
 }
 
+/// The page URL as-is plus its trailing-slash-toggled variant, so a screenshot
+/// keyed on `…/` still matches a `main_page_url` without the slash (or vice
+/// versa).
+fn page_url_variants(url: &str) -> Vec<String> {
+    let url = url.trim();
+    match url.strip_suffix('/') {
+        Some(stripped) => vec![url.to_string(), stripped.to_string()],
+        None => vec![url.to_string(), format!("{url}/")],
+    }
+}
+
+/// A Browsertrix page screenshot for `page_url`, if the crawl captured one.
+/// Browsertrix stores per-page screenshots as WARC records keyed by a `urn:` URL:
+/// `urn:thumbnail:<page>` (a small, ready-made JPEG — preferred) and
+/// `urn:view:<page>` (the full-page PNG). Matched on the exact page URL,
+/// tolerating a trailing-slash difference.
+fn screenshot_bytes<F: RangeFetch>(
+    fetch: &F,
+    cdx: &[CdxjRecord],
+    starts: &HashMap<String, u64>,
+    page_url: &str,
+) -> Result<Option<Vec<u8>>> {
+    for scheme in ["urn:thumbnail:", "urn:view:"] {
+        for variant in page_url_variants(page_url) {
+            if let Some(rec) = find_image_record(cdx, &format!("{scheme}{variant}")) {
+                if let Some(bytes) = fetch_record_bytes(fetch, starts, rec)? {
+                    return Ok(Some(bytes));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Fetch and return the HTTP body of a CDX record's capture.
 fn fetch_record_bytes<F: RangeFetch>(
     fetch: &F,
@@ -279,6 +324,21 @@ mod tests {
         let out = image::load_from_memory(&std::fs::read(thumb_file(&thumbs, "abc123")).unwrap())
             .unwrap();
         assert!(out.width() <= THUMB_MAX_EDGE && out.height() <= THUMB_MAX_EDGE);
+    }
+
+    #[test]
+    fn page_url_variants_toggles_trailing_slash() {
+        assert_eq!(
+            page_url_variants("https://ex.com/"),
+            vec!["https://ex.com/".to_string(), "https://ex.com".to_string()]
+        );
+        assert_eq!(
+            page_url_variants("https://ex.com/p"),
+            vec![
+                "https://ex.com/p".to_string(),
+                "https://ex.com/p/".to_string()
+            ]
+        );
     }
 
     #[test]

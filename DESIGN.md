@@ -517,31 +517,39 @@ inspectable responses (status + `Retry-After`) rather than opaque errors.
 ### Representative-image thumbnails
 
 To make the UI visual, each crawl gets a small representative image on its card
-and detail pages, chosen in three tiers (first hit wins):
+and detail pages, chosen in tiers (first hit wins):
 
-1. the crawl's **main-page `og:image`** (the site's own social-preview image;
+0. a **Browsertrix page screenshot** of the main page, if the crawl captured one.
+   Browsertrix (with screenshots enabled - common) stores a rendered image of each
+   page as a WARC record keyed by a `urn:` URL: `urn:thumbnail:<page>` (a small,
+   ready-made JPEG - preferred) or `urn:view:<page>` (the full-page PNG). It's an
+   actual picture of the page, so it beats every heuristic below and works even for
+   JS-rendered sites; matched on the exact page URL (tolerating a trailing-slash
+   difference).
+1. else the crawl's **main-page `og:image`** (the site's own social-preview image;
    `twitter:image` next);
 2. else the **largest content image the main page embeds** (`<img>`/`srcset`,
    resolved against the page URL);
 3. else the **largest captured image on the crawl's own registrable domain**
    (`site_of`), read straight from the CDX.
 
-Tiers 2-3 matter because `og:image` is far from universal - cultural-heritage
-crawls (SUCHO) and even some magazines omit it. And tier 3 specifically handles
-**JS-rendered sites**, whose *saved* HTML has no `og:image` and no `<img>` at all
-(the images are injected client-side), yet the crawl still captured them; it
-ignores third-party/CDN/ad images on other domains. All tiers pick by captured
-byte size within a window (`MIN_IMAGE_BYTES` 5 KB .. `MAX_IMAGE_BYTES` 3 MB): the
-floor skips icons/sprites/tracking pixels, the ceiling avoids fetching + decoding
-a full-res original for a 400px thumbnail. (Browsertrix screenshots would be
-another source, but this era of crawls doesn't capture them.)
+Tiers 1-3 matter for crawls *without* screenshots: `og:image` is far from
+universal - cultural-heritage crawls (SUCHO) and even some magazines omit it - and
+tier 3 specifically handles **JS-rendered sites**, whose *saved* HTML has no
+`og:image` and no `<img>` at all (images are injected client-side), yet the crawl
+still captured them; it ignores third-party/CDN/ad images on other domains. Tiers
+2-3 pick by captured byte size within a window (`MIN_IMAGE_BYTES` 5 KB ..
+`MAX_IMAGE_BYTES` 3 MB): the floor skips icons/sprites/tracking pixels, the ceiling
+avoids fetching + decoding a full-res original for a 400px thumbnail. (Tier 0's
+screenshot is purpose-built, so it skips that window.)
 
-After indexing a CDX-streamable WACZ, `thumbnail::generate` (best-effort) reads
-the main page's HTML from the WACZ, picks the image per the tiers, range-fetches
-it from the CDX, decodes + downscales it (the `image` crate; longest edge 400px),
-and writes `<home>/index/thumbs/<crawl_id>.jpg`. Any failure - no main page, no
-usable image, an image that isn't captured or won't decode - just means no
-thumbnail (the UI shows a placeholder; a curator can pin one).
+After indexing a CDX-streamable WACZ, `thumbnail::generate` (best-effort) checks
+for a screenshot first, then reads the main page's HTML for the `og:image` /
+embedded-image tiers, range-fetches the chosen image from the CDX, decodes +
+downscales it (the `image` crate; longest edge 400px), and writes
+`<home>/index/thumbs/<crawl_id>.jpg`. Any failure - no usable image, an image that
+isn't captured or won't decode - just means no thumbnail (the UI shows a
+placeholder; a curator can pin one).
 
 A curator can **pin a specific image** with `rustyweb crawl set <id> --image
 <file>` (any local PNG/JPEG/WebP/GIF): it's downscaled, cached, and marked pinned

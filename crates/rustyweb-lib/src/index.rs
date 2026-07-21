@@ -1926,6 +1926,131 @@ mod tests {
     }
 
     #[test]
+    fn browsertrix_screenshot_is_preferred_over_og_image() {
+        use std::io::Write;
+        // A crawl that has BOTH an og:image and a Browsertrix screenshot
+        // (urn:thumbnail:<page>) should thumbnail from the *screenshot* — it's an
+        // actual picture of the page. We tell them apart by aspect ratio:
+        // thumbnail() scales to fit 400px preserving aspect, so the 40x30 (4:3)
+        // screenshot yields 400x300, whereas the 24x16 (3:2) og:image would yield
+        // 400x266.
+        let page_url = "https://ex.com/";
+        let og_url = "https://ex.com/preview.png";
+
+        let png = |w: u32, h: u32| {
+            let mut b = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                w,
+                h,
+                image::Rgb([9, 9, 9]),
+            ))
+            .write_to(&mut b, image::ImageFormat::Png)
+            .unwrap();
+            b.into_inner()
+        };
+        let jpeg = |w: u32, h: u32| {
+            let mut b = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                w,
+                h,
+                image::Rgb([9, 9, 9]),
+            ))
+            .write_to(&mut b, image::ImageFormat::Jpeg)
+            .unwrap();
+            b.into_inner()
+        };
+        let og_png = png(24, 16);
+        let shot = jpeg(40, 30);
+
+        let html = format!(
+            "<html><head><meta property=\"og:image\" content=\"{og_url}\"></head>\
+             <body>hi</body></html>"
+        );
+
+        let gz_record = |url: &str, ctype: &str, body: &[u8]| {
+            let mut http = format!("HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n\r\n").into_bytes();
+            http.extend_from_slice(body);
+            let mut warc = format!(
+                "WARC/1.0\r\nWARC-Type: response\r\nWARC-Target-URI: {url}\r\n\
+                 WARC-Date: 2022-01-01T00:00:00Z\r\n\
+                 Content-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
+                http.len()
+            )
+            .into_bytes();
+            warc.extend_from_slice(&http);
+            warc.extend_from_slice(b"\r\n\r\n");
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&warc).unwrap();
+            e.finish().unwrap()
+        };
+        let html_m = gz_record(page_url, "text/html", html.as_bytes());
+        let og_m = gz_record(og_url, "image/png", &og_png);
+        let shot_m = gz_record(&format!("urn:thumbnail:{page_url}"), "image/jpeg", &shot);
+        let mut warc_gz = html_m.clone();
+        warc_gz.extend_from_slice(&og_m);
+        warc_gz.extend_from_slice(&shot_m);
+
+        let gz = |b: &[u8]| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+        let cdx = format!(
+            "com,ex)/ 20220101000000 {{\"url\":\"{page_url}\",\"mime\":\"text/html\",\
+             \"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":0,\"length\":{}}}\n\
+             com,ex)/preview.png 20220101000000 {{\"url\":\"{og_url}\",\"mime\":\"image/png\",\
+             \"status\":\"200\",\"filename\":\"data.warc.gz\",\"offset\":{},\"length\":{}}}\n\
+             urn:thumbnail:{page_url} 20220101000000 {{\"url\":\"urn:thumbnail:{page_url}\",\
+             \"mime\":\"image/jpeg\",\"status\":\"200\",\"filename\":\"data.warc.gz\",\
+             \"offset\":{},\"length\":{}}}\n",
+            html_m.len(),
+            html_m.len(),
+            og_m.len(),
+            html_m.len() + og_m.len(),
+            shot_m.len(),
+        );
+        let cdx_gz = gz(cdx.as_bytes());
+        let datapackage = format!("{{\"mainPageUrl\":\"{page_url}\"}}");
+
+        let mut wacz = Vec::new();
+        {
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let opt = zip::write::SimpleFileOptions::default();
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut wacz));
+            zw.start_file("archive/data.warc.gz", stored).unwrap();
+            zw.write_all(&warc_gz).unwrap();
+            zw.start_file("indexes/index.cdx.gz", opt).unwrap();
+            zw.write_all(&cdx_gz).unwrap();
+            zw.start_file("datapackage.json", opt).unwrap();
+            zw.write_all(datapackage.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let archive = tmp.path().join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let path = archive.join("crawl.wacz");
+        std::fs::write(&path, &wacz).unwrap();
+        index_path(&path, tmp.path(), None).unwrap();
+
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let id = &manifest.waczs[0].id;
+        let thumb = tmp
+            .path()
+            .join("index")
+            .join("thumbs")
+            .join(format!("{id}.jpg"));
+        assert!(thumb.exists(), "a screenshot should produce a thumbnail");
+        let decoded = image::load_from_memory(&std::fs::read(&thumb).unwrap()).unwrap();
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (400, 300),
+            "the thumbnail should come from the 4:3 screenshot, not the 3:2 og:image"
+        );
+    }
+
+    #[test]
     fn thumbnail_falls_back_to_largest_page_image() {
         use std::io::Write;
         // The main page has NO og:image but embeds two images (a tiny icon and a
