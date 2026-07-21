@@ -171,8 +171,8 @@ enum Commands {
         #[arg(long, default_value = ".")]
         home: PathBuf,
 
-        /// Import only this Browsertrix collection (its id). Default: the whole
-        /// org.
+        /// Import only this Browsertrix collection (its id, slug, or name).
+        /// Default: the whole org.
         #[arg(long, conflicts_with = "crawl")]
         collection: Option<String>,
 
@@ -887,10 +887,20 @@ fn run_browsertrix(
     let org = resolve_org(&orgs, org)?;
     tracing::info!(org = %org.name, id = %org.id, "using organization");
 
+    // Resolve --collection (id, slug, or name) to the UUID the API's filter
+    // requires.
+    let collection_id = match opts.collection {
+        Some(sel) => {
+            let colls = client.collections(&org.id).context("listing collections")?;
+            Some(resolve_collection(&colls, sel)?)
+        }
+        None => None,
+    };
+
     // Selection is server-side (a collection or a single item); the review
     // filter is applied client-side so we can report what was skipped.
     let query = ItemQuery {
-        collection_id: opts.collection,
+        collection_id: collection_id.as_deref(),
         item_id: opts.crawl,
     };
     let items = client
@@ -1010,6 +1020,27 @@ fn run_browsertrix(
     }
     tracing::info!(imported, skipped, "browsertrix import complete");
     Ok(())
+}
+
+/// Resolve a `--collection` value (a Browsertrix collection id, slug, or name)
+/// to its UUID — the form the API's item filter requires. Mirrors
+/// [`resolve_org`].
+fn resolve_collection(
+    colls: &[rustyweb_lib::browsertrix::Collection],
+    want: &str,
+) -> Result<String> {
+    colls
+        .iter()
+        .find(|c| c.id == want || c.slug == want || c.name == want)
+        .map(|c| c.id.clone())
+        .ok_or_else(|| {
+            let slugs = colls
+                .iter()
+                .map(|c| c.slug.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::anyhow!("no collection matching \"{want}\"; available: {slugs}")
+        })
 }
 
 /// Whether an item passes the QA-review filter. Reviewed-only is the default;
@@ -1173,8 +1204,8 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::parse_source_lines;
-    use super::{human_size, passes_review, resolve_org, safe_wacz_filename};
-    use rustyweb_lib::browsertrix::{Item, Org};
+    use super::{human_size, passes_review, resolve_collection, resolve_org, safe_wacz_filename};
+    use rustyweb_lib::browsertrix::{Collection, Item, Org};
 
     fn item(review: Option<u8>) -> Item {
         Item {
@@ -1227,6 +1258,34 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MiB");
+    }
+
+    #[test]
+    fn resolve_collection_matches_id_slug_or_name() {
+        let colls = vec![
+            Collection {
+                id: "uuid-1".into(),
+                slug: "gov-arc".into(),
+                name: "US Gov".into(),
+            },
+            Collection {
+                id: "uuid-2".into(),
+                slug: "edu".into(),
+                name: "Universities".into(),
+            },
+        ];
+        assert_eq!(resolve_collection(&colls, "gov-arc").unwrap(), "uuid-1");
+        assert_eq!(resolve_collection(&colls, "uuid-2").unwrap(), "uuid-2");
+        assert_eq!(
+            resolve_collection(&colls, "Universities").unwrap(),
+            "uuid-2"
+        );
+
+        let err = resolve_collection(&colls, "nope")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("nope") && err.contains("gov-arc"), "{err}");
     }
 
     #[test]

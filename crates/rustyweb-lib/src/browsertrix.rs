@@ -147,6 +147,17 @@ pub struct Org {
     pub name: String,
 }
 
+/// A Browsertrix collection (a named group of crawls). The API's item filters
+/// take the `id` (a UUID), not the slug.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Collection {
+    pub id: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub name: String,
+}
+
 /// An archived item — a crawl or an upload — from `all-crawls`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Item {
@@ -301,6 +312,12 @@ impl<T: Transport> Client<T> {
     /// The user's organizations.
     pub fn orgs(&self) -> Result<Vec<Org>> {
         self.list("/api/orgs", &[])
+    }
+
+    /// The collections in an org (id + slug + name), across every page. Used to
+    /// resolve a user-supplied slug/name to the UUID the item filters require.
+    pub fn collections(&self, oid: &str) -> Result<Vec<Collection>> {
+        self.list(&format!("/api/orgs/{oid}/collections"), &[])
     }
 
     /// Archived items (crawls + uploads) in an org, across every page, narrowed
@@ -495,6 +512,20 @@ mod tests {
         assert_eq!(orgs.len(), 1);
         assert_eq!(orgs[0].id, "o1");
         assert_eq!(orgs[0].slug, "gov");
+    }
+
+    #[test]
+    fn collections_are_parsed() {
+        let c = logged_in(FakeTransport::default().with(
+            "https://bt.example/api/orgs/o1/collections?page=1&pageSize=100",
+            200,
+            r#"{"items":[{"id":"uuid-1","slug":"gov-arc","name":"US Gov"}],"total":1}"#,
+        ));
+        let colls = c.collections("o1").unwrap();
+        assert_eq!(colls.len(), 1);
+        assert_eq!(colls[0].id, "uuid-1");
+        assert_eq!(colls[0].slug, "gov-arc");
+        assert_eq!(colls[0].name, "US Gov");
     }
 
     #[test]
