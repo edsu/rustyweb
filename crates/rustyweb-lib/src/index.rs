@@ -1685,21 +1685,26 @@ mod tests {
     #[test]
     fn nested_multi_wacz_is_indexed() {
         use std::io::Write;
-        // Wrap a normal WACZ as the payload of a nested multi-WACZ: no top-level
-        // archive/ WARCs, just an inner .wacz under data/ (what Browsertrix's
-        // combined collection download looks like).
+        // Wrap a normal WACZ as the payload of a nested multi-WACZ, mirroring a
+        // real Browsertrix combined download: no top-level archive/ WARCs, the
+        // inner .wacz a top-level Stored entry, and a multi-wacz-package
+        // datapackage. (Detection is structural, so it ignores the datapackage —
+        // it's here to keep the fixture faithful.)
         let inner = std::fs::read(fixture("a.wacz")).unwrap();
+        let inner_name = "20250101000000-abc-0.wacz";
         let mut outer = Vec::new();
         {
             let stored = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             let opt = zip::write::SimpleFileOptions::default();
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut outer));
-            zw.start_file("data/a.wacz", stored).unwrap();
+            zw.start_file(inner_name, stored).unwrap();
             zw.write_all(&inner).unwrap();
             zw.start_file("datapackage.json", opt).unwrap();
-            zw.write_all(br#"{"resources":[{"name":"a.wacz","path":"data/a.wacz"}]}"#)
-                .unwrap();
+            let dp = format!(
+                r#"{{"profile":"multi-wacz-package","resources":[{{"name":"{inner_name}","path":"{inner_name}"}}]}}"#
+            );
+            zw.write_all(dp.as_bytes()).unwrap();
             zw.finish().unwrap();
         }
 

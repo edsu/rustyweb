@@ -517,10 +517,14 @@ inspectable responses (status + `Retry-After`) rather than opaque errors.
 ### Nested multi-WACZ
 
 A WACZ can nest: a **multi-WACZ** is a ZIP whose payload is other `.wacz` files
-(conventionally under `data/`) rather than top-level `archive/` WARCs. This is
-what Browsertrix's combined collection `/download` returns for a collection with
-more than one crawl. `wacz::nested_wacz_entries` detects the case (has `.wacz`
-entries and *no* `archive/` WARCs) and lists the inner files. `index_nested`
+rather than top-level `archive/` WARCs. This is what Browsertrix's combined
+collection `/download` returns for a collection with more than one crawl — its
+`datapackage.json` sets `profile: "multi-wacz-package"` and the inner `.wacz`
+files are top-level `Stored` entries (confirmed against a real download). Nesting
+is a Webrecorder/Browsertrix **convention, not part of the WACZ spec**, so
+`wacz::nested_wacz_entries` detects it *structurally* — `.wacz` entries present
+and *no* `archive/` WARCs — rather than depending on the non-standard `profile`
+string (which also makes it work for multi-WACZs from other tools). `index_nested`
 (in `index.rs`) then extracts each inner `.wacz` to a temp file and indexes it
 through the ordinary per-WACZ path (CDX-guided or scan), **flattening** them into
 one manifest entry tagged with the outer crawl's id — its `page_count` /

@@ -284,12 +284,19 @@ fn is_warc_entry(name: &str) -> bool {
 }
 
 /// The inner `.wacz` entry names of a **nested multi-WACZ** — a WACZ whose
-/// payload is other WACZ files (conventionally under `data/`) rather than
-/// `archive/` WARCs. This is what Browsertrix's combined collection `/download`
-/// returns for a collection with more than one crawl. Returns empty for an
-/// ordinary (flat) WACZ: nesting is only reported when there are `.wacz` entries
-/// **and no** `archive/` WARCs, so a normal WACZ that happens to bundle a `.wacz`
-/// resource isn't misread.
+/// payload is other WACZ files rather than `archive/` WARCs. This is what
+/// Browsertrix's combined collection `/download` returns for a collection with
+/// more than one crawl. (Verified against a real download: the inner `.wacz`
+/// files are top-level, `Stored` entries, and `datapackage.json` carries
+/// `profile: "multi-wacz-package"` listing them.)
+///
+/// Nesting is a Webrecorder/Browsertrix **convention, not part of the WACZ
+/// spec**, so we detect it *structurally* — `.wacz` entries present **and no**
+/// `archive/` WARCs — rather than trusting the non-standard `profile` string.
+/// This is robust to the exact layout (the inner files needn't be under `data/`)
+/// and also catches multi-WACZs from other tools. Returns empty for an ordinary
+/// (flat) WACZ, so one that merely bundles a `.wacz` alongside its WARCs isn't
+/// misread.
 pub(crate) fn nested_wacz_entries<R: std::io::Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
 ) -> Vec<String> {
