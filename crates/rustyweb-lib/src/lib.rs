@@ -1,3 +1,4 @@
+pub mod browsertrix;
 pub mod collections;
 pub mod http_range;
 pub mod index;
