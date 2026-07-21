@@ -149,6 +149,10 @@ pub struct Wacz {
     /// and attributes provenance. Absent for hand-indexed WACZs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browsertrix: Option<BrowsertrixRef>,
+    /// For a nested multi-WACZ (a WACZ bundling other WACZs), the number of inner
+    /// WACZs flattened into this crawl. `None` for an ordinary (flat) WACZ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_waczs: Option<u64>,
 }
 
 impl Wacz {
@@ -565,6 +569,7 @@ mod tests {
             capture_start: None,
             capture_end: None,
             browsertrix: None,
+            nested_waczs: None,
         }
     }
 

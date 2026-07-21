@@ -651,6 +651,7 @@ fn index_one(
         capture_start: stats.earliest_capture,
         capture_end: stats.latest_capture,
         browsertrix,
+        nested_waczs: stats.nested_waczs,
     });
 
     // Note: the spinner/bar is *not* finished here - the Tantivy commit happens
@@ -810,6 +811,9 @@ struct CrawlStats {
     earliest_capture: Option<String>,
     latest_capture: Option<String>,
     warcinfo: Option<Warcinfo>,
+    /// For a nested multi-WACZ: how many inner WACZs were flattened into this
+    /// crawl. `None` for an ordinary (flat) WACZ.
+    nested_waczs: Option<u64>,
 }
 
 /// Detect + index a **nested multi-WACZ** (a WACZ whose payload is other WACZ
@@ -909,6 +913,7 @@ fn index_nested_from<F: RangeFetch + Clone + Send + Sync>(
             agg.warcinfo = stats.warcinfo;
         }
     }
+    agg.nested_waczs = Some(inners.len() as u64);
     Ok(Some(agg))
 }
 
@@ -1211,6 +1216,8 @@ fn index_merged(
         earliest_capture: earliest,
         latest_capture: latest,
         warcinfo,
+        // Set by index_nested for a multi-WACZ; a single WACZ isn't nested.
+        nested_waczs: None,
     })
 }
 
@@ -1794,6 +1801,11 @@ mod tests {
             w.software.iter().any(|s| s.contains("Browsertrix-Crawler")),
             "the inner crawl's software should surface on the outer entry: {:?}",
             w.software
+        );
+        assert_eq!(
+            w.nested_waczs,
+            Some(1),
+            "the entry should record how many inner WACZs it bundles"
         );
     }
 
