@@ -515,6 +515,10 @@ fn index_one(
     // collection download) has no top-level WARCs, so the normal paths would
     // index it as empty. Detect and index it up front, flattening all inner
     // WACZs into this one crawl; otherwise fall through to normal indexing.
+    // (This costs one extra WACZ open on the common flat path — cheap: reading
+    // the ZIP directory, dwarfed by the record streaming that follows — and it's
+    // the deliberate price of detecting nesting structurally rather than trusting
+    // the non-standard multi-wacz-package profile.)
     let stats = if let Some(nested) = index_nested(
         local.as_deref(),
         remote_url.as_deref(),
