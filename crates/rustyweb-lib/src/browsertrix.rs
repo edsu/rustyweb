@@ -350,6 +350,25 @@ impl<T: Transport> Client<T> {
         Ok(replay.resources)
     }
 
+    /// The WACZ resources for an item by its id (rather than an [`Item`]),
+    /// trying the crawl then the upload `replay.json` path — an archived item is
+    /// one or the other. Used to re-resolve a fresh presigned URL for a stored
+    /// Browsertrix source at index/replay time.
+    pub fn item_resources(&self, oid: &str, item_id: &str) -> Result<Vec<Resource>> {
+        let mut last_err = None;
+        for kind in ["crawls", "uploads"] {
+            match self
+                .get_json::<ReplayJson>(&format!("/api/orgs/{oid}/{kind}/{item_id}/replay.json"))
+            {
+                Ok(r) if !r.resources.is_empty() => return Ok(r.resources),
+                Ok(_) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("no WACZ resources for Browsertrix item {item_id}")))
+    }
+
     /// The authenticated URL that streams an item's WACZ as a durable download.
     ///
     /// Note: the importer does *not* use this — it downloads each flat,

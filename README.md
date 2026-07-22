@@ -314,11 +314,18 @@ Notes:
   org. `--org <SLUG>` picks the org when your account has more than one.
 - **Incremental.** Re-running skips crawls already imported (matched by content
   hash), so syncing an account is cheap; `--force` re-imports anyway.
-- **Durable.** WACZs are downloaded (not streamed) into `<home>/archive/<item-id>/`
+- **Durable by default.** WACZs are downloaded into `<home>/archive/<item-id>/`
   (a subfolder per Browsertrix item, so items can't clash on a shared filename),
   because Browsertrix's presigned URLs expire after ~48h - a downloaded copy keeps
   replay working long-term. `--host <URL>` targets a self-hosted Browsertrix
   (default is `https://app.browsertrix.com`).
+- **`--stream` (index-only footprint).** Instead of downloading, index the WACZ
+  in place from Browsertrix and store only its stable identity, not a copy. Since
+  presigned URLs expire, rustyweb re-resolves a fresh one on demand — so **`serve`
+  needs the same `BROWSERTRIX_*` credentials** to replay these crawls (they show a
+  503 otherwise). Good for a self-hoster who wants search over their own crawls
+  without keeping the bytes; download (the default) is better for a durable,
+  offline, or shared library.
 - **Grouping.** Importing a `--collection` groups its crawls into a rustyweb
   collection of the same name. `--into <NAME>` overrides that name (and is the way
   to group an org-wide or single-`--crawl` import, which otherwise land as
@@ -336,7 +343,7 @@ rustyweb collection list [--home <DIR>]
 rustyweb crawl set       [--home <DIR>] <CRAWL_ID> --image <FILE>
 rustyweb search-url      [--home <DIR>] <URL>
 rustyweb verify          [--home <DIR>]
-rustyweb import browsertrix [--home <DIR>] [--host <URL>] [--org <SLUG>] [--collection <ID|SLUG>] [--crawl <ID>] [--into <NAME>] [--include-unreviewed] [--min-review <N>] [--limit <N>] [--dry-run] [--force] [-v]
+rustyweb import browsertrix [--home <DIR>] [--host <URL>] [--org <SLUG>] [--collection <ID|SLUG>] [--crawl <ID>] [--into <NAME>] [--include-unreviewed] [--min-review <N>] [--limit <N>] [--dry-run] [--stream] [--force] [-v]
 ```
 
 Every command takes `--home <DIR>` (default `.`); `archive/` and `index/` are

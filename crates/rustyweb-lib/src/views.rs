@@ -93,6 +93,10 @@ pub struct CollectionCard {
     pub date_range: Option<String>,
     /// `/thumb/{id}` for a representative member crawl, if any has one.
     pub thumb: Option<String>,
+    /// Whether the collection has any locally-stored / any remote member — both
+    /// true means a mixed collection (show both pills).
+    pub has_local: bool,
+    pub has_remote: bool,
 }
 
 /// A card/detail representative image. Shows the cached thumbnail if present,
@@ -213,7 +217,11 @@ pub fn home(cards: &[CollectionCard], browse: &HomeBrowse) -> Markup {
                         (thumb_area(c.thumb.as_deref(), &c.name))
                     }
                     div.card-header {
-                        a.card-title href=(format!("/collection/{}", c.id)) { (c.name) }
+                        span.card-title-wrap {
+                            @if c.has_local { (source_badge(false)) }
+                            @if c.has_remote { (source_badge(true)) }
+                            a.card-title href=(format!("/collection/{}", c.id)) { (c.name) }
+                        }
                         span.status.muted {
                             (c.count) " crawl" @if c.count != 1 { "s" }
                         }
@@ -477,10 +485,35 @@ pub struct MemberItem {
     pub id: String,
     pub name: String,
     pub present: bool,
+    /// Whether this crawl is hosted remotely (streamed) rather than local.
+    pub remote: bool,
     /// One-line provenance summary (plain text), if any is known.
     pub provenance: Option<String>,
     /// `/thumb/{id}` for this crawl's representative image, if it has one.
     pub thumb: Option<String>,
+}
+
+/// A pill labelling where a crawl's WACZ lives: `💾 Local` (stored in this
+/// home's `archive/`) or `🌐 Remote` (fetched from a remote host at replay time).
+fn source_badge(remote: bool) -> Markup {
+    // Icon only, but with role="img" + aria-label so a screen reader announces
+    // "Local"/"Remote" (not the emoji's Unicode name); `title` is the mouse
+    // tooltip. `title` alone would not be accessible.
+    if remote {
+        html! {
+            span.source-badge.remote role="img" aria-label="Remote"
+                title="Hosted remotely — rustyweb streams this at replay time and doesn't keep a local copy" {
+                "🌐"
+            }
+        }
+    } else {
+        html! {
+            span.source-badge.local role="img" aria-label="Local"
+                title="Stored locally in this home's archive folder" {
+                "💾"
+            }
+        }
+    }
 }
 
 /// The collection detail page: metadata + facets, then a grid of the member
@@ -511,7 +544,10 @@ pub fn collection(
                             (thumb_area(m.thumb.as_deref(), &m.name))
                         }
                         div.card-header {
-                            a.card-title href=(format!("/crawl/{}", m.id)) { (m.name) }
+                            span.card-title-wrap {
+                                (source_badge(m.remote))
+                                a.card-title href=(format!("/crawl/{}", m.id)) { (m.name) }
+                            }
                             @if m.present {
                                 span.status.ok { "✓" }
                             } @else {
@@ -546,6 +582,9 @@ pub struct CrawlPage {
     /// `/thumb/{id}` for this crawl's representative image, if it has one.
     pub thumb: Option<String>,
     pub replay_href: String,
+    /// Whether the crawl is hosted remotely (a URL or a streamed Browsertrix
+    /// source) rather than stored in `<home>/archive`.
+    pub remote: bool,
     pub provenance: Vec<MetaRow>,
     pub source: String,
     pub size: String,
@@ -567,7 +606,10 @@ pub fn crawl(p: &CrawlPage) -> Markup {
             div.crumb { "in " a href=(format!("/collection/{}", id)) { (cname) } }
         }
         div.detail-thumb { (thumb_area(p.thumb.as_deref(), &p.name)) }
-        h1.page-title { (p.name) }
+        div.crawl-title {
+            (source_badge(p.remote))
+            h1.page-title { (p.name) }
+        }
         @if let Some(d) = &p.description { p.desc { (d) } }
         a.replay-btn href=(p.replay_href) { "Replay →" }
 
