@@ -93,6 +93,10 @@ pub struct CollectionCard {
     pub date_range: Option<String>,
     /// `/thumb/{id}` for a representative member crawl, if any has one.
     pub thumb: Option<String>,
+    /// Whether the collection has any locally-stored / any remote member — both
+    /// true means a mixed collection (show both pills).
+    pub has_local: bool,
+    pub has_remote: bool,
 }
 
 /// A card/detail representative image. Shows the cached thumbnail if present,
@@ -213,7 +217,11 @@ pub fn home(cards: &[CollectionCard], browse: &HomeBrowse) -> Markup {
                         (thumb_area(c.thumb.as_deref(), &c.name))
                     }
                     div.card-header {
-                        a.card-title href=(format!("/collection/{}", c.id)) { (c.name) }
+                        span.card-title-wrap {
+                            @if c.has_local { (source_badge(false)) }
+                            @if c.has_remote { (source_badge(true)) }
+                            a.card-title href=(format!("/collection/{}", c.id)) { (c.name) }
+                        }
                         span.status.muted {
                             (c.count) " crawl" @if c.count != 1 { "s" }
                         }

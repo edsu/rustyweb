@@ -168,6 +168,9 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 thumb: members
                     .iter()
                     .find_map(|w| thumb_href(&state.index_dir, &w.id)),
+                // Which source kinds the members span — both true = mixed.
+                has_local: members.iter().any(|w| !w.source.is_remote()),
+                has_remote: members.iter().any(|w| w.source.is_remote()),
             }
         })
         .collect();

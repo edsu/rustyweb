@@ -404,6 +404,10 @@ async fn homepage_shows_collection_name() {
         text.contains("simple"),
         "homepage should show collection name: {text}"
     );
+    assert!(
+        text.contains("💾 Local"),
+        "a local collection card should show the Local pill"
+    );
 }
 
 #[tokio::test]
