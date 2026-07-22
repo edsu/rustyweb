@@ -446,6 +446,10 @@ async fn crawl_page_shows_metadata_and_pages() {
     assert!(html.contains("SHA-256"), "should show fixity metadata");
     assert!(html.contains("Replay"), "should have a replay button");
     assert!(html.contains("Pages"), "should have a pages section");
+    assert!(
+        html.contains("💾 Local"),
+        "a local crawl should show the Local source badge"
+    );
     // a.wacz's seed page (title "2Tone: The Sound of Britain").
     assert!(html.contains("2Tone"), "should list the crawl's pages");
 }
@@ -588,7 +592,7 @@ async fn browsertrix_crawl_page_flags_remote_hosting() {
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(
-        html.contains("remote-badge") && html.contains("🌐 Remote"),
+        html.contains("source-badge") && html.contains("🌐 Remote"),
         "a remotely-hosted crawl should show the remote badge"
     );
 }
@@ -639,6 +643,10 @@ async fn collection_page_lists_members() {
     assert!(
         html.contains(&format!("/crawl/{wacz_id}")),
         "collection page should link to its member crawl"
+    );
+    assert!(
+        html.contains("💾 Local"),
+        "member cards should show a source pill"
     );
 }
 

@@ -477,10 +477,31 @@ pub struct MemberItem {
     pub id: String,
     pub name: String,
     pub present: bool,
+    /// Whether this crawl is hosted remotely (streamed) rather than local.
+    pub remote: bool,
     /// One-line provenance summary (plain text), if any is known.
     pub provenance: Option<String>,
     /// `/thumb/{id}` for this crawl's representative image, if it has one.
     pub thumb: Option<String>,
+}
+
+/// A pill labelling where a crawl's WACZ lives: `💾 Local` (stored in this
+/// home's `archive/`) or `🌐 Remote` (fetched from a remote host at replay time).
+fn source_badge(remote: bool) -> Markup {
+    if remote {
+        html! {
+            span.source-badge.remote
+                title="Hosted remotely — rustyweb streams this at replay time and doesn't keep a local copy" {
+                "🌐 Remote"
+            }
+        }
+    } else {
+        html! {
+            span.source-badge.local title="Stored locally in this home's archive folder" {
+                "💾 Local"
+            }
+        }
+    }
 }
 
 /// The collection detail page: metadata + facets, then a grid of the member
@@ -518,6 +539,7 @@ pub fn collection(
                                 span.status.missing { "✗" }
                             }
                         }
+                        div.card-source { (source_badge(m.remote)) }
                         @if let Some(p) = &m.provenance { div.prov { (p) } }
                     }
                 }
@@ -584,14 +606,9 @@ pub fn crawl(p: &CrawlPage) -> Markup {
             tr {
                 th { "Source" }
                 td {
+                    (source_badge(p.remote))
+                    " "
                     span.mono { (p.source) }
-                    @if p.remote {
-                        " "
-                        span.remote-badge
-                            title="Hosted remotely — rustyweb streams this at replay time and doesn't keep a local copy" {
-                            "🌐 Remote"
-                        }
-                    }
                 }
             }
             tr { th { "Size" } td { (p.size) } }

@@ -526,6 +526,7 @@ async fn collection_page(
             id: w.id.clone(),
             name: w.name.clone(),
             present: w.is_present(&state.home),
+            remote: w.source.is_remote(),
             provenance: provenance_summary(w),
             thumb: thumb_href(&state.index_dir, &w.id),
         })

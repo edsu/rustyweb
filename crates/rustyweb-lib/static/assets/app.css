@@ -81,9 +81,12 @@ h2 { font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 0.4rem; }
 .detail-thumb { max-width: 480px; margin: 0.4rem 0 1.1rem; }
 .detail-thumb .thumb { border-radius: 6px; }
 .desc { color: #444; font-size: 0.9rem; margin: 0.4rem 0; }
-/* "Hosted remotely" flag in the crawl's Source row — a neutral grey pill (a fact
-   about the crawl, not a warning). */
-.remote-badge { font-size: 0.75rem; background: #f1f3f5; color: #5c6670; border: 1px solid #e0e4e8; border-radius: 999px; padding: 0.1rem 0.55rem; white-space: nowrap; vertical-align: middle; }
+/* Where a crawl's WACZ lives — a small pill on the crawl page's Source row and on
+   collection member cards. Local: green (stored here). Remote: grey (streamed). */
+.source-badge { font-size: 0.75rem; border-radius: 999px; padding: 0.1rem 0.55rem; white-space: nowrap; vertical-align: middle; border: 1px solid transparent; }
+.source-badge.local { background: #eaf5ec; color: #2f7d4f; border-color: #cfe8d6; }
+.source-badge.remote { background: #f1f3f5; color: #5c6670; border-color: #e0e4e8; }
+.card-source { margin-top: 0.3rem; }
 .status { font-size: 0.8rem; white-space: nowrap; }
 
 /* Provenance chip */
