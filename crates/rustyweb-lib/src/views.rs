@@ -546,9 +546,9 @@ pub struct CrawlPage {
     /// `/thumb/{id}` for this crawl's representative image, if it has one.
     pub thumb: Option<String>,
     pub replay_href: String,
-    /// Label when the crawl is hosted remotely (not stored in `<home>/archive`) —
-    /// e.g. `Remote URL` or `Browsertrix (streamed)`. `None` for a local copy.
-    pub remote: Option<String>,
+    /// Whether the crawl is hosted remotely (a URL or a streamed Browsertrix
+    /// source) rather than stored in `<home>/archive`.
+    pub remote: bool,
     pub provenance: Vec<MetaRow>,
     pub source: String,
     pub size: String,
@@ -570,11 +570,13 @@ pub fn crawl(p: &CrawlPage) -> Markup {
             div.crumb { "in " a href=(format!("/collection/{}", id)) { (cname) } }
         }
         div.detail-thumb { (thumb_area(p.thumb.as_deref(), &p.name)) }
-        h1.page-title { (p.name) }
-        @if let Some(r) = &p.remote {
-            div.remote-badge
-                title="Hosted remotely — rustyweb streams this at replay time and doesn't keep a local copy" {
-                "🌐 " (r)
+        div.crawl-head {
+            h1.page-title { (p.name) }
+            @if p.remote {
+                span.remote-badge
+                    title="Hosted remotely — rustyweb streams this at replay time and doesn't keep a local copy" {
+                    "🌐 Remote"
+                }
             }
         }
         @if let Some(d) = &p.description { p.desc { (d) } }

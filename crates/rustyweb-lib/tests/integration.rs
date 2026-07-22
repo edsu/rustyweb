@@ -588,7 +588,7 @@ async fn browsertrix_crawl_page_flags_remote_hosting() {
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(
-        html.contains("remote-badge") && html.contains("Browsertrix (streamed)"),
+        html.contains("remote-badge") && html.contains("🌐 Remote"),
         "a remotely-hosted crawl should show the remote badge"
     );
 }
