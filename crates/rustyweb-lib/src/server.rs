@@ -341,10 +341,12 @@ async fn search_page(
             let coll_href = url_encode(&r.collection);
             let name_enc = url_encode(&r.crawl_name);
             let source_enc = url_encode(&source_for(&r.crawl_id));
-            // Carry the collection breadcrumb (name + id) into the replay viewer.
+            // Carry the breadcrumb into the replay viewer: the collection (name +
+            // id) and the crawl id (so its crumb links to the crawl page).
             let coll_q = format!(
-                "&collection={}&collection_id={coll_href}",
-                url_encode(&coll_display)
+                "&collection={}&collection_id={coll_href}&crawl={}",
+                url_encode(&coll_display),
+                url_encode(&r.crawl_id)
             );
 
             let href = if is_collection {
@@ -615,7 +617,7 @@ async fn crawl_page(
     // Breadcrumb + replay params for the containing collection (name + id).
     let col = manifest.collection_by_id(&c.collection);
     let crumb = col.map(|col| (col.id.clone(), col.name.clone()));
-    let coll_q = col
+    let mut coll_q = col
         .map(|col| {
             format!(
                 "&collection={}&collection_id={}",
@@ -624,6 +626,8 @@ async fn crawl_page(
             )
         })
         .unwrap_or_default();
+    // The crawl id, so the viewer's crawl crumb links back to this page.
+    coll_q.push_str(&format!("&crawl={}", url_encode(&c.id)));
 
     // Replay button: first seed page, else the collection root.
     let replay_href = match c.seed_pages.first() {

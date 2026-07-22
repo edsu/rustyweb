@@ -34,7 +34,9 @@
       border-radius: 3px;
       color: #9ecbff;
       white-space: nowrap;
+      text-decoration: none;
     }
+    a#collection-name[href]:hover { text-decoration: underline; }
     #banner a#collection {
       background: #16213e;
       padding: 0.15rem 0.5rem;
@@ -65,7 +67,7 @@
   <div id="banner">
     <a class="home" href="/">rustyweb</a>
     <a id="collection"></a>
-    <span id="collection-name"></span>
+    <a id="collection-name"></a>
     <span id="current-url"></span>
   </div>
   <div id="replay-container"></div>
@@ -79,6 +81,7 @@
       const name   = params.get('name') || '';
       const collection   = params.get('collection') || '';
       const collectionId = params.get('collection_id') || '';
+      const crawlId      = params.get('crawl') || '';
 
       if (!source) {
         document.body.innerHTML =
@@ -88,8 +91,9 @@
 
       const collId = source.split('/').pop();
 
-      // Breadcrumb: rustyweb › <collection> › <WACZ name> › <url>. The
-      // collection crumb links back to its collection page when known.
+      // Breadcrumb: rustyweb › <collection> › <crawl name> › <url>. The
+      // collection crumb links to its collection page, and the crawl crumb to the
+      // crawl detail page, when their ids are known.
       const collEl = document.getElementById('collection');
       if (collection) {
         collEl.textContent = collection;
@@ -97,7 +101,9 @@
       } else {
         collEl.style.display = 'none';
       }
-      document.getElementById('collection-name').textContent = name || collId;
+      const nameEl = document.getElementById('collection-name');
+      nameEl.textContent = name || collId;
+      if (crawlId) nameEl.href = '/crawl/' + encodeURIComponent(crawlId);
       document.getElementById('current-url').textContent = url;
 
       // Mount the ReplayWebPage component in WACZ-direct mode: it reads the

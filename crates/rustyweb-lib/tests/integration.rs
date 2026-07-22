@@ -454,6 +454,10 @@ async fn crawl_page_shows_metadata_and_pages() {
         html.contains("aria-label=\"Local\""),
         "a local crawl should show the Local source badge"
     );
+    assert!(
+        html.contains(&format!("crawl={id}")),
+        "replay links should carry the crawl id so the viewer crumb can link back"
+    );
     // a.wacz's seed page (title "2Tone: The Sound of Britain").
     assert!(html.contains("2Tone"), "should list the crawl's pages");
 }
