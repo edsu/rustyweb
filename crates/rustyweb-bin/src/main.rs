@@ -1276,6 +1276,23 @@ impl BrowsertrixResolver {
             clients: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
+
+    /// Resolve using the cached client for `host` (logging in if there's none),
+    /// find the named resource, and return its fresh presigned URL.
+    fn try_resolve(&self, host: &str, org: &str, item: &str, resource: &str) -> Result<String> {
+        let mut clients = self.clients.lock().unwrap();
+        if !clients.contains_key(host) {
+            clients.insert(host.to_string(), connect(host)?);
+        }
+        let resources = clients.get(host).unwrap().item_resources(org, item)?;
+        resources
+            .into_iter()
+            .find(|r| r.name == resource)
+            .map(|r| r.path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("WACZ resource {resource:?} not found in Browsertrix item {item}")
+            })
+    }
 }
 
 impl rustyweb_lib::index::SourceResolver for BrowsertrixResolver {
@@ -1289,24 +1306,19 @@ impl rustyweb_lib::index::SourceResolver for BrowsertrixResolver {
         else {
             anyhow::bail!("resolver only handles Browsertrix sources");
         };
-        // Lazily authenticate (once per host) and re-resolve the item's WACZ
-        // resources; find the one this source names and return its fresh URL.
-        let mut clients = self.clients.lock().unwrap();
-        if !clients.contains_key(host) {
-            clients.insert(host.clone(), connect(host)?);
+        match self.try_resolve(host, org, item, resource) {
+            Ok(url) => Ok(url),
+            // The cached login may have gone stale (Browsertrix JWTs expire well
+            // under a long-lived server's lifetime). Drop it and retry once with
+            // a fresh login before giving up. Any non-auth failure just fails
+            // again and surfaces here.
+            Err(first) => {
+                tracing::debug!(%host, error = %first, "Browsertrix resolve failed; re-authenticating and retrying");
+                self.clients.lock().unwrap().remove(host);
+                self.try_resolve(host, org, item, resource)
+                    .with_context(|| format!("resolving Browsertrix item {item}"))
+            }
         }
-        let resources = clients
-            .get(host)
-            .unwrap()
-            .item_resources(org, item)
-            .with_context(|| format!("resolving Browsertrix item {item}"))?;
-        resources
-            .into_iter()
-            .find(|r| r.name == *resource)
-            .map(|r| r.path)
-            .ok_or_else(|| {
-                anyhow::anyhow!("WACZ resource {resource:?} not found in Browsertrix item {item}")
-            })
     }
 }
 
