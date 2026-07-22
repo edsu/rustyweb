@@ -405,7 +405,7 @@ async fn homepage_shows_collection_name() {
         "homepage should show collection name: {text}"
     );
     assert!(
-        text.contains("💾 Local"),
+        text.contains("aria-label=\"Local\""),
         "a local collection card should show the Local pill"
     );
 }
@@ -451,7 +451,7 @@ async fn crawl_page_shows_metadata_and_pages() {
     assert!(html.contains("Replay"), "should have a replay button");
     assert!(html.contains("Pages"), "should have a pages section");
     assert!(
-        html.contains("💾 Local"),
+        html.contains("aria-label=\"Local\""),
         "a local crawl should show the Local source badge"
     );
     // a.wacz's seed page (title "2Tone: The Sound of Britain").
@@ -596,7 +596,7 @@ async fn browsertrix_crawl_page_flags_remote_hosting() {
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(
-        html.contains("source-badge") && html.contains("🌐 Remote"),
+        html.contains("source-badge") && html.contains("aria-label=\"Remote\""),
         "a remotely-hosted crawl should show the remote badge"
     );
 }
@@ -649,7 +649,7 @@ async fn collection_page_lists_members() {
         "collection page should link to its member crawl"
     );
     assert!(
-        html.contains("💾 Local"),
+        html.contains("aria-label=\"Local\""),
         "member cards should show a source pill"
     );
 }

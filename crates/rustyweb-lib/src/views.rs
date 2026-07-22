@@ -496,17 +496,21 @@ pub struct MemberItem {
 /// A pill labelling where a crawl's WACZ lives: `💾 Local` (stored in this
 /// home's `archive/`) or `🌐 Remote` (fetched from a remote host at replay time).
 fn source_badge(remote: bool) -> Markup {
+    // Icon only, but with role="img" + aria-label so a screen reader announces
+    // "Local"/"Remote" (not the emoji's Unicode name); `title` is the mouse
+    // tooltip. `title` alone would not be accessible.
     if remote {
         html! {
-            span.source-badge.remote
+            span.source-badge.remote role="img" aria-label="Remote"
                 title="Hosted remotely — rustyweb streams this at replay time and doesn't keep a local copy" {
-                "🌐 Remote"
+                "🌐"
             }
         }
     } else {
         html! {
-            span.source-badge.local title="Stored locally in this home's archive folder" {
-                "💾 Local"
+            span.source-badge.local role="img" aria-label="Local"
+                title="Stored locally in this home's archive folder" {
+                "💾"
             }
         }
     }
