@@ -570,15 +570,7 @@ pub fn crawl(p: &CrawlPage) -> Markup {
             div.crumb { "in " a href=(format!("/collection/{}", id)) { (cname) } }
         }
         div.detail-thumb { (thumb_area(p.thumb.as_deref(), &p.name)) }
-        div.crawl-head {
-            h1.page-title { (p.name) }
-            @if p.remote {
-                span.remote-badge
-                    title="Hosted remotely — rustyweb streams this at replay time and doesn't keep a local copy" {
-                    "🌐 Remote"
-                }
-            }
-        }
+        h1.page-title { (p.name) }
         @if let Some(d) = &p.description { p.desc { (d) } }
         a.replay-btn href=(p.replay_href) { "Replay →" }
 
@@ -589,7 +581,19 @@ pub fn crawl(p: &CrawlPage) -> Markup {
 
         h2 { "File" }
         table.meta {
-            tr { th { "Source" } td.mono { (p.source) } }
+            tr {
+                th { "Source" }
+                td {
+                    span.mono { (p.source) }
+                    @if p.remote {
+                        " "
+                        span.remote-badge
+                            title="Hosted remotely — rustyweb streams this at replay time and doesn't keep a local copy" {
+                            "🌐 Remote"
+                        }
+                    }
+                }
+            }
             tr { th { "Size" } td { (p.size) } }
             tr { th { "SHA-256" } td.mono title=(p.sha_full) { (p.sha_short) "…" } }
             @if let Some(c) = &p.crawled { tr { th { "Crawled" } td { (c) } } }
