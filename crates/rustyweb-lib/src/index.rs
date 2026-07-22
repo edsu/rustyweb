@@ -50,6 +50,16 @@ pub trait IndexProgress: Sync {
     fn finish(&self);
 }
 
+/// Resolves a refreshable remote [`Source`] — currently a
+/// [`Source::Browsertrix`] resource — to a fresh, directly-fetchable URL
+/// (Browsertrix presigned URLs expire, so they must be re-resolved each time we
+/// index or replay). Implemented by the **binary**, which holds the credentials,
+/// keeping auth/config out of the library. `Send + Sync` so it can be shared
+/// while indexing and held in the server's shared state for replay.
+pub trait SourceResolver: Send + Sync {
+    fn resolve(&self, source: &Source) -> Result<String>;
+}
+
 /// Index a local WACZ file (which must live under `<home>/archive`) under the
 /// given home dir. Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
@@ -74,12 +84,39 @@ pub fn index_location(
     home: &Path,
     name: Option<&str>,
     collection: Option<&str>,
+    download: bool,
+    concurrency: Option<usize>,
+    progress: Option<&dyn IndexProgress>,
+) -> Result<()> {
+    index_location_with_resolver(
+        location,
+        home,
+        name,
+        collection,
+        download,
+        concurrency,
+        None,
+        progress,
+    )
+}
+
+/// Like [`index_location`], but with a [`SourceResolver`] for refreshable remote
+/// sources (Browsertrix). The importer's streaming mode passes one; plain
+/// `index` doesn't need it.
+#[allow(clippy::too_many_arguments)]
+pub fn index_location_with_resolver(
+    location: &str,
+    home: &Path,
+    name: Option<&str>,
+    collection: Option<&str>,
     // Download a remote WACZ into <home>/archive and index it as a local file
     // instead of streaming it in place.
     download: bool,
     // Concurrent record fetches for CDX-guided streaming; `None` = per-source
     // default (16 remote, CPU count local).
     concurrency: Option<usize>,
+    // Resolves a Browsertrix source to a fresh presigned URL (binary-provided).
+    resolver: Option<&dyn SourceResolver>,
     // Optional progress sink for indexing (the binary renders a bar).
     progress: Option<&dyn IndexProgress>,
 ) -> Result<()> {
@@ -111,6 +148,7 @@ pub fn index_location(
             c,
             download,
             concurrency,
+            resolver,
             progress,
         )?;
         // Print the per-WACZ summary as this one finishes, so the next WACZ's bar
@@ -155,6 +193,9 @@ pub fn reindex(
     // Concurrent record fetches per source for CDX-guided streaming; `None` picks
     // a per-source default (see `default_concurrency`).
     concurrency: Option<usize>,
+    // Resolves any Browsertrix sources in the manifest to fresh presigned URLs
+    // (binary-provided). `None` → such a source errors (needs credentials).
+    resolver: Option<&dyn SourceResolver>,
     // Optional progress sink; drives the same per-WACZ bar as `index`.
     progress: Option<&dyn IndexProgress>,
 ) -> Result<()> {
@@ -230,6 +271,7 @@ pub fn reindex(
             Some((collection_id, collection_name)),
             false,
             concurrency,
+            resolver,
             progress,
         ) {
             Ok((wacz_name, pages)) => {
@@ -319,17 +361,29 @@ pub fn set_browsertrix_provenance(
     item_id: &str,
     resource_hash: &str,
 ) -> Result<()> {
-    let index_dir = index_dir(home);
-    let mut manifest = Manifest::open(&index_dir)?;
     let abs = wacz_file
         .canonicalize()
         .with_context(|| format!("resolving {}", wacz_file.display()))?;
     let id = wacz_id(&Source::for_file(&abs, home));
+    set_browsertrix_provenance_by_id(home, &id, host, item_id, resource_hash)
+}
+
+/// As [`set_browsertrix_provenance`], but for a crawl identified by its id — used
+/// by the streaming importer, whose source is a [`Source::Browsertrix`] with no
+/// local file (its id is `wacz_id(&source)`).
+pub fn set_browsertrix_provenance_by_id(
+    home: &Path,
+    crawl_id: &str,
+    host: &str,
+    item_id: &str,
+    resource_hash: &str,
+) -> Result<()> {
+    let mut manifest = Manifest::open(&index_dir(home))?;
     let wacz = manifest
         .waczs
         .iter_mut()
-        .find(|w| w.id == id)
-        .with_context(|| format!("no indexed crawl found for {}", wacz_file.display()))?;
+        .find(|w| w.id == crawl_id)
+        .with_context(|| format!("no indexed crawl with id {crawl_id}"))?;
     wacz.browsertrix = Some(BrowsertrixRef {
         host: host.to_string(),
         item_id: item_id.to_string(),
@@ -348,6 +402,7 @@ pub fn set_browsertrix_provenance(
 fn resolve_sources(location: &str, home: &Path) -> Result<Vec<Source>> {
     match Source::parse(location) {
         url @ Source::Url(_) => Ok(vec![url]),
+        bt @ Source::Browsertrix { .. } => Ok(vec![bt]),
         Source::File(p) => Ok(vec![resolve_archive_file(&p, home)?]),
     }
 }
@@ -410,6 +465,8 @@ fn index_one(
     // Concurrent record fetches for CDX-guided streaming; `None` picks a
     // per-source default (see `default_concurrency`).
     concurrency: Option<usize>,
+    // Resolves a Browsertrix source to a fresh presigned URL (binary-provided).
+    resolver: Option<&dyn SourceResolver>,
     // Optional progress sink for indexing.
     progress: Option<&dyn IndexProgress>,
 ) -> Result<(String, u64)> {
@@ -459,6 +516,30 @@ fn index_one(
                 _tmp = Some(tmp);
                 (None, Some(p))
             }
+        }
+        // A Browsertrix resource: resolve a fresh presigned URL (they expire) and
+        // stream it. The recorded source stays the stable Browsertrix identity,
+        // so the id is stable across re-imports and replay re-resolves later.
+        bt @ Source::Browsertrix { .. } => {
+            if let Some(p) = progress {
+                p.phase("resolving");
+            }
+            let resolver = resolver.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "indexing a Browsertrix source needs credentials to resolve a fresh \
+                     URL — set BROWSERTRIX_USER + BROWSERTRIX_PASSWORD (or BROWSERTRIX_TOKEN)"
+                )
+            })?;
+            let url = resolver
+                .resolve(bt)
+                .with_context(|| format!("resolving {}", bt.location()))?;
+            if !remote_warcs_streamable(&url).unwrap_or(false) {
+                anyhow::bail!(
+                    "this Browsertrix WACZ can't be stream-indexed (compressed WARCs or \
+                     no range support); import it in download mode instead"
+                );
+            }
+            (Some(url), None)
         }
     };
     let id = wacz_id(&effective_source);
@@ -737,6 +818,10 @@ fn source_display_name(source: &Source) -> String {
             let base = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(u);
             base.strip_suffix(".wacz").unwrap_or(base).to_string()
         }
+        Source::Browsertrix { resource, .. } => resource
+            .strip_suffix(".wacz")
+            .unwrap_or(resource)
+            .to_string(),
     }
 }
 
@@ -1738,7 +1823,7 @@ mod tests {
 
         // A reindex rebuilds each manifest entry from scratch; provenance set
         // out-of-band by the importer must be carried over, not wiped.
-        reindex(tmp.path(), None, None).unwrap();
+        reindex(tmp.path(), None, None, None).unwrap();
         assert_eq!(
             recorded(tmp.path())
                 .expect("provenance after reindex")
@@ -1828,6 +1913,22 @@ mod tests {
         assert!(
             stats.pages > 0,
             "inner pages should be indexed by streaming in place"
+        );
+    }
+
+    #[test]
+    fn browsertrix_source_without_resolver_errors_clearly() {
+        // A Browsertrix source can't be indexed without a resolver to turn its
+        // stable identity into a fresh presigned URL — the error should say so.
+        let tmp = TempDir::new().unwrap();
+        let loc = "browsertrix|https://app.browsertrix.com|o1|item-1|x-0.wacz";
+        let err = index_location(loc, tmp.path(), None, None, false, None, None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("BROWSERTRIX") || err.to_lowercase().contains("credential"),
+            "{err}"
         );
     }
 
@@ -1928,7 +2029,7 @@ mod tests {
         let full_text = tmp.path().join("index").join("full_text");
         std::fs::remove_dir_all(&full_text).unwrap();
 
-        reindex(tmp.path(), None, None).unwrap();
+        reindex(tmp.path(), None, None, None).unwrap();
 
         // The manifest (and the custom name) is preserved...
         let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
@@ -1947,7 +2048,7 @@ mod tests {
     fn reindex_with_no_collections_is_ok() {
         let tmp = TempDir::new().unwrap();
         // No collections.json yet: reindex should be a no-op, not an error.
-        reindex(tmp.path(), None, None).unwrap();
+        reindex(tmp.path(), None, None, None).unwrap();
     }
 
     #[test]
@@ -1977,7 +2078,7 @@ mod tests {
 
         // Rebuild from the manifest: the run completes over the good source but
         // reports a non-zero exit (an error) because one source was skipped.
-        let err = reindex(tmp.path(), None, None)
+        let err = reindex(tmp.path(), None, None, None)
             .expect_err("a skipped source should surface as a non-zero exit, not abort mid-run");
         let msg = format!("{err:#}");
         assert!(

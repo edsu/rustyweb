@@ -37,11 +37,26 @@ struct AppState {
     home: PathBuf,
     /// `<home>/index`, where the manifest and full-text index live.
     index_dir: PathBuf,
+    /// Resolves refreshable remote sources (Browsertrix) to fresh presigned URLs
+    /// for replay. `None` if the server was started without credentials.
+    resolver: Option<Arc<dyn crate::index::SourceResolver>>,
+    /// Cache of resolved presigned URLs by crawl id, with when they were fetched
+    /// — Browsertrix URLs expire (~48h), so this is refreshed well before that.
+    signed_cache: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
 pub fn router(home: &Path) -> Result<Router> {
+    router_with_resolver(home, None)
+}
+
+/// Like [`router`], but with a [`crate::index::SourceResolver`] so the server can
+/// replay Browsertrix sources (re-resolving fresh presigned URLs on demand).
+pub fn router_with_resolver(
+    home: &Path,
+    resolver: Option<Arc<dyn crate::index::SourceResolver>>,
+) -> Result<Router> {
     let index_dir = crate::index::index_dir(home);
     // Read-only: the server never writes, so it must not hold the write lock,
     // which would block `rustyweb index` from running while serving.
@@ -50,6 +65,8 @@ pub fn router(home: &Path) -> Result<Router> {
         search,
         home: home.to_path_buf(),
         index_dir,
+        resolver,
+        signed_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     let app = Router::new()
@@ -105,7 +122,17 @@ pub fn router(home: &Path) -> Result<Router> {
 }
 
 pub async fn serve(bind: &str, home: &Path) -> Result<()> {
-    let app = router(home)?;
+    serve_with_resolver(bind, home, None).await
+}
+
+/// Like [`serve`], but with a [`crate::index::SourceResolver`] so Browsertrix
+/// sources can be replayed (fresh presigned URLs resolved on demand).
+pub async fn serve_with_resolver(
+    bind: &str,
+    home: &Path,
+    resolver: Option<Arc<dyn crate::index::SourceResolver>>,
+) -> Result<()> {
+    let app = router_with_resolver(home, resolver)?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("listening on {bind}");
     axum::serve(
@@ -716,6 +743,42 @@ pub fn human_size(bytes: u64) -> String {
 
 // ── File serving ──────────────────────────────────────────────────────────────
 
+/// Resolve a Browsertrix crawl's WACZ to a fresh presigned URL (cached well
+/// under its ~48h expiry) and 302-redirect to it, so wabac.js reads the archived
+/// copy directly. 503 if the server has no credentials; 502 if resolution fails.
+fn browsertrix_redirect(state: &AppState, col: &Wacz) -> Response {
+    // Cache TTL: comfortably under Browsertrix's ~48h presigned-URL expiry.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+    let Some(resolver) = &state.resolver else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this server has no Browsertrix credentials to resolve the archived copy",
+        )
+            .into_response();
+    };
+    if let Some((url, at)) = state.signed_cache.lock().unwrap().get(&col.id) {
+        if at.elapsed() < TTL {
+            return axum::response::Redirect::temporary(url).into_response();
+        }
+    }
+    match resolver.resolve(&col.source) {
+        Ok(url) => {
+            state
+                .signed_cache
+                .lock()
+                .unwrap()
+                .insert(col.id.clone(), (url.clone(), std::time::Instant::now()));
+            axum::response::Redirect::temporary(&url).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("could not resolve the archived copy from Browsertrix: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 async fn serve_file(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -730,6 +793,11 @@ async fn serve_file(
     // is hit for a remote source anyway, redirect to the URL as a convenience.
     if let crate::collections::Source::Url(u) = &col.source {
         return axum::response::Redirect::temporary(u).into_response();
+    }
+    // A Browsertrix source has no stable URL (its presigned URLs expire), so
+    // re-resolve a fresh one (cached) and redirect wabac.js to it.
+    if let crate::collections::Source::Browsertrix { .. } = &col.source {
+        return browsertrix_redirect(&state, col);
     }
     // File source: resolve relative paths against home.
     let path = col.source.resolve(&state.home).unwrap();
@@ -986,7 +1054,11 @@ fn load_waczs(state: &AppState) -> Vec<Wacz> {
 /// endpoint for a file, or the remote URL directly (read client-side) for a URL.
 fn viewer_source(col: &Wacz) -> String {
     match &col.source {
-        crate::collections::Source::File(_) => format!("/files/{}", col.id),
+        // A Browsertrix source is served through /files/{id}, which re-resolves a
+        // fresh presigned URL and 302-redirects to it (its stored URL expires).
+        crate::collections::Source::File(_) | crate::collections::Source::Browsertrix { .. } => {
+            format!("/files/{}", col.id)
+        }
         crate::collections::Source::Url(u) => u.clone(),
     }
 }

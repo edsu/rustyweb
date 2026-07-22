@@ -220,6 +220,13 @@ enum ImportCmd {
         #[arg(long)]
         dry_run: bool,
 
+        /// Stream-index without downloading (index-only footprint). The WACZ
+        /// isn't copied locally; replay re-resolves a fresh presigned URL from
+        /// Browsertrix on demand, so `serve` needs the same credentials.
+        /// Default: download a durable local copy.
+        #[arg(long)]
+        stream: bool,
+
         /// Re-download and re-index items even if they were already imported
         /// (otherwise already-synced items are skipped).
         #[arg(long)]
@@ -603,8 +610,14 @@ async fn main() -> Result<()> {
             #[cfg(not(unix))]
             let terminate = std::future::pending::<()>();
 
+            // Resolver so Browsertrix-sourced crawls can be replayed (fresh
+            // presigned URLs on demand). Logs in lazily with the env credentials,
+            // so a server with no Browsertrix sources never needs them.
+            let resolver: std::sync::Arc<dyn rustyweb_lib::index::SourceResolver> =
+                std::sync::Arc::new(BrowsertrixResolver::new());
+
             tokio::select! {
-                result = rustyweb_lib::server::serve(&bind, &home) => {
+                result = rustyweb_lib::server::serve_with_resolver(&bind, &home, Some(resolver)) => {
                     result?;
                 }
                 _ = ctrl_c => {}
@@ -626,7 +639,11 @@ async fn main() -> Result<()> {
             // Like `index`, silence stdout to hide third-party PDF extraction
             // noise; our logs are on stderr.
             let quiet = gag::Gag::stdout().ok();
-            let result = rustyweb_lib::index::reindex(&home, concurrency, progress);
+            // Resolver for any Browsertrix sources in the manifest (logs in
+            // lazily, so a manifest without them needs no credentials).
+            let resolver = BrowsertrixResolver::new();
+            let result =
+                rustyweb_lib::index::reindex(&home, concurrency, Some(&resolver), progress);
             drop(quiet);
             if result.is_err() {
                 // Clear any spinner/bar left up before the error propagates.
@@ -687,6 +704,7 @@ async fn main() -> Result<()> {
                 min_review,
                 limit,
                 dry_run,
+                stream,
                 force,
                 verbose: _,
             } => {
@@ -702,6 +720,7 @@ async fn main() -> Result<()> {
                     min_review,
                     limit,
                     dry_run,
+                    stream,
                     force,
                 };
                 let result = run_browsertrix(&host, org.as_deref(), &home, &opts, progress);
@@ -874,6 +893,9 @@ struct ImportOpts<'a> {
     min_review: Option<u8>,
     limit: usize,
     dry_run: bool,
+    /// Stream-index without downloading (index-only footprint); replay
+    /// re-resolves a fresh presigned URL on demand.
+    stream: bool,
     force: bool,
 }
 
@@ -1004,6 +1026,10 @@ fn run_browsertrix(
     // skipped too.
     let mut seen = load_imported(home);
 
+    // Resolves Browsertrix sources for `--stream` (re-resolves a fresh presigned
+    // URL at index time). Lazy: unused when downloading.
+    let resolver = BrowsertrixResolver::new();
+
     let mut imported = 0usize;
     let mut skipped = 0usize;
     for &item in selected {
@@ -1031,36 +1057,67 @@ fn run_browsertrix(
                 continue;
             }
 
-            let filename = safe_wacz_filename(&res.name, &format!("resource-{i}"));
-            let dest = item_dir.join(&filename);
             let size = if res.size > 0 {
                 format!(" ({})", rustyweb_lib::server::human_size(res.size))
             } else {
                 String::new()
             };
-            eprintln!("↓ downloading {filename}{size}");
-            download_wacz(&res.path, &dest)?;
 
             // pdf-extract writes glyph diagnostics to stdout during indexing;
             // silence it (as `index`/`reindex` do) so it doesn't stomp the bar.
-            let quiet = gag::Gag::stdout().ok();
-            let indexed = rustyweb_lib::index::index_location(
-                &dest.to_string_lossy(),
-                home,
-                Some(&item.name),
-                into,
-                false,
-                None,
-                progress,
-            );
-            drop(quiet);
-            indexed.with_context(|| format!("indexing {}", dest.display()))?;
+            let crawl_id = if opts.stream {
+                // Index-only: record a Browsertrix source (stable identity) and
+                // stream it in place; replay/reindex re-resolve a fresh URL.
+                let source = rustyweb_lib::collections::Source::Browsertrix {
+                    host: host.clone(),
+                    org: org.id.clone(),
+                    item: item.id.clone(),
+                    resource: res.name.clone(),
+                };
+                eprintln!("↻ streaming {}{size}", res.name);
+                let quiet = gag::Gag::stdout().ok();
+                let indexed = rustyweb_lib::index::index_location_with_resolver(
+                    &source.location(),
+                    home,
+                    Some(&item.name),
+                    into,
+                    false,
+                    None,
+                    Some(&resolver),
+                    progress,
+                );
+                drop(quiet);
+                indexed.with_context(|| format!("streaming {}", res.name))?;
+                rustyweb_lib::collections::wacz_id(&source)
+            } else {
+                // Download a durable local copy and index it as a File source.
+                let filename = safe_wacz_filename(&res.name, &format!("resource-{i}"));
+                let dest = item_dir.join(&filename);
+                eprintln!("↓ downloading {filename}{size}");
+                download_wacz(&res.path, &dest)?;
+                let quiet = gag::Gag::stdout().ok();
+                let indexed = rustyweb_lib::index::index_location(
+                    &dest.to_string_lossy(),
+                    home,
+                    Some(&item.name),
+                    into,
+                    false,
+                    None,
+                    progress,
+                );
+                drop(quiet);
+                indexed.with_context(|| format!("indexing {}", dest.display()))?;
+                let abs = dest.canonicalize().unwrap_or(dest.clone());
+                rustyweb_lib::collections::wacz_id(&rustyweb_lib::collections::Source::for_file(
+                    &abs, home,
+                ))
+            };
 
             // Record provenance so a later run can skip this resource.
-            rustyweb_lib::index::set_browsertrix_provenance(
-                home, &dest, &host, &item.id, &res.hash,
+            rustyweb_lib::index::set_browsertrix_provenance_by_id(
+                home, &crawl_id, &host, &item.id, &res.hash,
             )
-            .with_context(|| format!("recording provenance for {}", dest.display()))?;
+            .context("recording provenance")?;
             seen.insert(key);
             imported += 1;
         }
@@ -1201,6 +1258,55 @@ fn connect(host: &str) -> Result<rustyweb_lib::browsertrix::Client> {
              environment to authenticate — they're read from the environment so credentials \
              stay out of the command line"
         ),
+    }
+}
+
+/// Resolves stored Browsertrix sources (`Source::Browsertrix`) to fresh presigned
+/// URLs, for both indexing (`import --stream`, `reindex`) and replay (`serve`).
+/// Logs in lazily per host with the same env credentials as [`connect`] and
+/// caches the client, so no login happens unless a Browsertrix source is
+/// actually encountered.
+struct BrowsertrixResolver {
+    clients: std::sync::Mutex<std::collections::HashMap<String, rustyweb_lib::browsertrix::Client>>,
+}
+
+impl BrowsertrixResolver {
+    fn new() -> Self {
+        Self {
+            clients: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl rustyweb_lib::index::SourceResolver for BrowsertrixResolver {
+    fn resolve(&self, source: &rustyweb_lib::collections::Source) -> Result<String> {
+        let rustyweb_lib::collections::Source::Browsertrix {
+            host,
+            org,
+            item,
+            resource,
+        } = source
+        else {
+            anyhow::bail!("resolver only handles Browsertrix sources");
+        };
+        // Lazily authenticate (once per host) and re-resolve the item's WACZ
+        // resources; find the one this source names and return its fresh URL.
+        let mut clients = self.clients.lock().unwrap();
+        if !clients.contains_key(host) {
+            clients.insert(host.clone(), connect(host)?);
+        }
+        let resources = clients
+            .get(host)
+            .unwrap()
+            .item_resources(org, item)
+            .with_context(|| format!("resolving Browsertrix item {item}"))?;
+        resources
+            .into_iter()
+            .find(|r| r.name == *resource)
+            .map(|r| r.path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("WACZ resource {resource:?} not found in Browsertrix item {item}")
+            })
     }
 }
 

@@ -11,18 +11,49 @@ pub struct SeedPage {
     pub ts: String,
 }
 
-/// Where a collection's WACZ lives: a local file or a remote http(s) URL.
-/// Serializes as a plain string (the path or the URL) for a readable manifest.
+/// Where a collection's WACZ lives: a local file, a remote http(s) URL, or a
+/// resource in a Browsertrix instance that must be re-resolved to a fresh
+/// presigned URL on demand (see [`Source::Browsertrix`]).
+///
+/// Serializes as a plain string (the path/URL, or `browsertrix|…`) for a
+/// readable manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum Source {
     File(PathBuf),
     Url(String),
+    /// A WACZ resource inside a Browsertrix instance, identified stably by
+    /// `host` + `org` + archived-item `item` + `resource` filename. Browsertrix
+    /// serves WACZs via **presigned URLs that expire (~48 h)**, so we store the
+    /// identity, not a URL, and re-resolve a fresh presigned URL each time we
+    /// index or replay it (via a [`crate::index::SourceResolver`], which holds
+    /// the credentials). Stored as `browsertrix|host|org|item|resource`.
+    Browsertrix {
+        host: String,
+        org: String,
+        item: String,
+        resource: String,
+    },
 }
 
 impl Source {
-    /// Parse a location string: `http://`/`https://` is a URL, else a file path.
+    /// Parse a location string: `browsertrix|…` is a Browsertrix resource,
+    /// `http://`/`https://` a URL, else a file path.
     pub fn parse(s: &str) -> Self {
+        if let Some(rest) = s.strip_prefix("browsertrix|") {
+            // host|org|item|resource — split into exactly 4; the resource is the
+            // remainder, so a `|` in a filename (unheard of from Browsertrix)
+            // lands harmlessly in the last field.
+            let p: Vec<&str> = rest.splitn(4, '|').collect();
+            if p.len() == 4 {
+                return Source::Browsertrix {
+                    host: p[0].to_string(),
+                    org: p[1].to_string(),
+                    item: p[2].to_string(),
+                    resource: p[3].to_string(),
+                };
+            }
+        }
         if s.starts_with("http://") || s.starts_with("https://") {
             Source::Url(s.to_string())
         } else {
@@ -34,19 +65,31 @@ impl Source {
         matches!(self, Source::Url(_))
     }
 
+    /// Whether replaying/verifying this source needs a live fetch rather than a
+    /// local file (a URL or a Browsertrix resource).
+    pub fn is_remote(&self) -> bool {
+        !matches!(self, Source::File(_))
+    }
+
     /// The local file path, if this is a file source.
     pub fn as_file(&self) -> Option<&Path> {
         match self {
             Source::File(p) => Some(p.as_path()),
-            Source::Url(_) => None,
+            Source::Url(_) | Source::Browsertrix { .. } => None,
         }
     }
 
-    /// Stable string form: the file path or the URL.
+    /// Stable string form: the file path, the URL, or `browsertrix|…`.
     pub fn location(&self) -> String {
         match self {
             Source::File(p) => p.to_string_lossy().into_owned(),
             Source::Url(u) => u.clone(),
+            Source::Browsertrix {
+                host,
+                org,
+                item,
+                resource,
+            } => format!("browsertrix|{host}|{org}|{item}|{resource}"),
         }
     }
 
@@ -66,7 +109,7 @@ impl Source {
         match self {
             Source::File(p) if p.is_absolute() => Some(p.clone()),
             Source::File(p) => Some(home.join(p)),
-            Source::Url(_) => None,
+            Source::Url(_) | Source::Browsertrix { .. } => None,
         }
     }
 }
@@ -488,6 +531,27 @@ mod tests {
         // Round-trips back to the right variant.
         let back: Source = serde_json::from_str("\"https://ex.org/a.wacz\"").unwrap();
         assert_eq!(back, url);
+    }
+
+    #[test]
+    fn browsertrix_source_roundtrips() {
+        let s = Source::Browsertrix {
+            host: "https://app.browsertrix.com".into(),
+            org: "o1".into(),
+            item: "item-1".into(),
+            resource: "crawl-20250101-abc-0.wacz".into(),
+        };
+        let encoded = s.location();
+        assert_eq!(
+            encoded,
+            "browsertrix|https://app.browsertrix.com|o1|item-1|crawl-20250101-abc-0.wacz"
+        );
+        assert_eq!(Source::parse(&encoded), s);
+        assert!(s.is_remote());
+        assert!(s.as_file().is_none());
+        assert!(!s.is_url());
+        // A stable id (independent of the presigned URL, which changes each time).
+        assert_eq!(wacz_id(&s), wacz_id(&Source::parse(&encoded)));
     }
 
     #[test]

@@ -522,6 +522,72 @@ async fn crawl_page_shows_multi_wacz_provenance() {
     );
 }
 
+/// A stand-in resolver that always returns a canned presigned URL.
+struct FakeResolver(String);
+impl rustyweb_lib::index::SourceResolver for FakeResolver {
+    fn resolve(&self, _source: &rustyweb_lib::collections::Source) -> anyhow::Result<String> {
+        Ok(self.0.clone())
+    }
+}
+
+/// Rewrite the single crawl's source to a Browsertrix source (as `import
+/// --stream` would record it) and return its id.
+fn make_browsertrix_source(tmp: &TempDir) -> String {
+    let index_dir = tmp.path().join("index");
+    let mut m = rustyweb_lib::collections::Manifest::open(&index_dir).unwrap();
+    m.waczs[0].source = rustyweb_lib::collections::Source::Browsertrix {
+        host: "https://app.browsertrix.com".into(),
+        org: "o1".into(),
+        item: "item-1".into(),
+        resource: "a.wacz".into(),
+    };
+    let id = m.waczs[0].id.clone();
+    m.save().unwrap();
+    id
+}
+
+#[tokio::test]
+async fn browsertrix_replay_redirects_to_a_freshly_resolved_url() {
+    let tmp = make_index(&["a.wacz"]);
+    let id = make_browsertrix_source(&tmp);
+    let resolver: std::sync::Arc<dyn rustyweb_lib::index::SourceResolver> = std::sync::Arc::new(
+        FakeResolver("https://files.example/a.wacz?sig=fresh".into()),
+    );
+    let app = rustyweb_lib::server::router_with_resolver(tmp.path(), Some(resolver)).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/files/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        resp.headers().get("location").unwrap(),
+        "https://files.example/a.wacz?sig=fresh"
+    );
+}
+
+#[tokio::test]
+async fn browsertrix_replay_without_credentials_is_unavailable() {
+    let tmp = make_index(&["a.wacz"]);
+    let id = make_browsertrix_source(&tmp);
+    // Default router has no resolver (no credentials).
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/files/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 #[tokio::test]
 async fn collection_page_lists_members() {
     let tmp = make_index(&["a.wacz"]);
