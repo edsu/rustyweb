@@ -532,14 +532,16 @@ pub fn collection(
                             (thumb_area(m.thumb.as_deref(), &m.name))
                         }
                         div.card-header {
-                            a.card-title href=(format!("/crawl/{}", m.id)) { (m.name) }
+                            span.card-title-wrap {
+                                (source_badge(m.remote))
+                                a.card-title href=(format!("/crawl/{}", m.id)) { (m.name) }
+                            }
                             @if m.present {
                                 span.status.ok { "✓" }
                             } @else {
                                 span.status.missing { "✗" }
                             }
                         }
-                        div.card-source { (source_badge(m.remote)) }
                         @if let Some(p) = &m.provenance { div.prov { (p) } }
                     }
                 }
@@ -592,7 +594,10 @@ pub fn crawl(p: &CrawlPage) -> Markup {
             div.crumb { "in " a href=(format!("/collection/{}", id)) { (cname) } }
         }
         div.detail-thumb { (thumb_area(p.thumb.as_deref(), &p.name)) }
-        h1.page-title { (p.name) }
+        div.crawl-title {
+            (source_badge(p.remote))
+            h1.page-title { (p.name) }
+        }
         @if let Some(d) = &p.description { p.desc { (d) } }
         a.replay-btn href=(p.replay_href) { "Replay →" }
 
@@ -603,14 +608,7 @@ pub fn crawl(p: &CrawlPage) -> Markup {
 
         h2 { "File" }
         table.meta {
-            tr {
-                th { "Source" }
-                td {
-                    (source_badge(p.remote))
-                    " "
-                    span.mono { (p.source) }
-                }
-            }
+            tr { th { "Source" } td.mono { (p.source) } }
             tr { th { "Size" } td { (p.size) } }
             tr { th { "SHA-256" } td.mono title=(p.sha_full) { (p.sha_short) "…" } }
             @if let Some(c) = &p.crawled { tr { th { "Crawled" } td { (c) } } }
