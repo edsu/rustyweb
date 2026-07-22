@@ -689,12 +689,22 @@ async fn crawl_page(
         provenance.push(views::MetaRow::new("Capture dates", range));
     }
 
+    // A visible flag when the crawl isn't stored locally: it's fetched from a
+    // remote host at replay time, not held in <home>/archive.
+    let remote = match &c.source {
+        crate::collections::Source::File(_) => None,
+        crate::collections::Source::Url(_) => Some("Remote URL".to_string()),
+        crate::collections::Source::Browsertrix { .. } => {
+            Some("Browsertrix (streamed)".to_string())
+        }
+    };
     let page = views::CrawlPage {
         crumb,
         name: c.name.clone(),
         description: c.description.clone(),
         thumb: thumb_href(&state.index_dir, &id),
         replay_href,
+        remote,
         provenance,
         source: c.source.location(),
         size: human_size(c.file_size),

@@ -571,6 +571,29 @@ async fn browsertrix_replay_redirects_to_a_freshly_resolved_url() {
 }
 
 #[tokio::test]
+async fn browsertrix_crawl_page_flags_remote_hosting() {
+    let tmp = make_index(&["a.wacz"]);
+    let id = make_browsertrix_source(&tmp);
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/crawl/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("remote-badge") && html.contains("Browsertrix (streamed)"),
+        "a remotely-hosted crawl should show the remote badge"
+    );
+}
+
+#[tokio::test]
 async fn browsertrix_replay_without_credentials_is_unavailable() {
     let tmp = make_index(&["a.wacz"]);
     let id = make_browsertrix_source(&tmp);
