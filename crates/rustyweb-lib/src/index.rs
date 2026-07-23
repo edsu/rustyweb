@@ -520,7 +520,7 @@ fn index_one(
             if let Some(p) = progress {
                 p.phase("downloading");
             }
-            Source::File(download_into_archive(u, home)?)
+            Source::File(download_into_archive(u, home, collection.0)?)
         }
         _ => source.clone(),
     };
@@ -802,10 +802,11 @@ fn download_to_temp(url: &str) -> Result<tempfile::NamedTempFile> {
     Ok(tmp)
 }
 
-/// Download a remote WACZ into `<home>/archive/<name>.wacz` and return its path
-/// relative to `home` (so the manifest stores a portable local source). The name
-/// comes from the URL's last path segment. Used by `--download`.
-fn download_into_archive(url: &str, home: &Path) -> Result<PathBuf> {
+/// Download a remote WACZ into `<home>/archive/<collection-slug>/<name>.wacz` and
+/// return its path relative to `home` (so the manifest stores a portable local
+/// source, and the archive is browsable by collection). The name comes from the
+/// URL's last path segment. Used by `--download`.
+fn download_into_archive(url: &str, home: &Path, collection_slug: &str) -> Result<PathBuf> {
     use std::io::{copy, Write};
 
     let stem = url
@@ -821,10 +822,10 @@ fn download_into_archive(url: &str, home: &Path) -> Result<PathBuf> {
         format!("{stem}.wacz")
     };
 
-    let archive = archive_dir(home);
-    std::fs::create_dir_all(&archive)
-        .with_context(|| format!("creating archive dir {}", archive.display()))?;
-    let dest = archive.join(&name);
+    let dir = archive_dir(home).join(collection_slug);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating archive dir {}", dir.display()))?;
+    let dest = dir.join(&name);
 
     let mut file =
         std::fs::File::create(&dest).with_context(|| format!("creating {}", dest.display()))?;
@@ -832,7 +833,7 @@ fn download_into_archive(url: &str, home: &Path) -> Result<PathBuf> {
         .with_context(|| format!("writing {url} to {}", dest.display()))?;
     file.flush()?;
 
-    Ok(PathBuf::from("archive").join(&name))
+    Ok(PathBuf::from("archive").join(collection_slug).join(&name))
 }
 
 /// Whether a remote WACZ can be stream-indexed: reachable, range-capable, and

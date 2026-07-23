@@ -142,8 +142,8 @@ fn import_a_collection_then_skip_on_rerun() {
 
     // WACZ landed under archive/, in the item's subdirectory.
     assert!(
-        home.path().join("archive/item1/simple.wacz").exists(),
-        "downloaded WACZ should be under <home>/archive/<item-id>/"
+        home.path().join("archive/news/item1/simple.wacz").exists(),
+        "downloaded WACZ should be under <home>/archive/<collection-slug>/<item-id>/"
     );
 
     // Manifest records the crawl, with Browsertrix provenance.
