@@ -344,6 +344,25 @@ pub fn set_collection(
     Ok(id)
 }
 
+/// Auto-seed a collection's finding-aid metadata from ingest (WACZ datapackage,
+/// Browsertrix API): fills only fields that are still empty, never clobbering a
+/// curator's edits (see [`crate::collections::Manifest::seed_fields`]). A no-op
+/// when `fields` is empty. Returns the collection id.
+pub fn seed_collection(
+    home: &Path,
+    name: &str,
+    fields: &crate::collections::CollectionFields,
+) -> Result<String> {
+    let index_dir = index_dir(home);
+    std::fs::create_dir_all(&index_dir)
+        .with_context(|| format!("creating index dir {}", index_dir.display()))?;
+    let mut manifest = Manifest::open(&index_dir)?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let id = manifest.seed_fields(name, fields, &now);
+    manifest.save()?;
+    Ok(id)
+}
+
 /// Pin a curator-supplied local image as a collection's representative
 /// thumbnail, committed at `collections/<slug>/thumbnail.jpg`. The collection is
 /// identified by name (its slug); create it first with `collection set`.
@@ -855,6 +874,29 @@ fn index_one(
         }
     }
     manifest.ensure_collection(&collection_id, &collection_name, &date_indexed);
+
+    // Seed the collection's finding aid from this WACZ's datapackage — fill-gaps,
+    // so only empty fields are set: the first indexed WACZ with a value wins and
+    // a curator's edits are never overwritten. A single crawl's `description`
+    // isn't really the whole collection's scope, but a draft beats a blank and
+    // invites the curator to refine it.
+    let year = meta.created.as_deref().and_then(|d| {
+        d.get(..4)
+            .filter(|y| y.chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_string)
+    });
+    let seed = crate::collections::CollectionFields {
+        narrative: meta.description.clone(),
+        subjects: (!meta.keywords.is_empty()).then(|| meta.keywords.clone()),
+        dates: year,
+        creator: meta.creator.clone(),
+        rights: (!meta.licenses.is_empty()).then(|| meta.licenses.join(", ")),
+        ..Default::default()
+    };
+    if !seed.is_empty() {
+        manifest.seed_fields(&collection_name, &seed, &date_indexed);
+    }
+
     // Preserve Browsertrix import provenance (set out-of-band by the importer)
     // across a reindex, which otherwise rebuilds the entry from scratch.
     let browsertrix = manifest.wacz_by_id(&id).and_then(|w| w.browsertrix.clone());
@@ -2227,6 +2269,20 @@ mod tests {
         assert_eq!(
             m.waczs[0].source,
             Source::File(PathBuf::from("archive/my-coll/simple.wacz"))
+        );
+    }
+
+    #[test]
+    fn index_seeds_collection_finding_aid_from_the_wacz() {
+        // Indexing a WACZ pre-seeds its collection's finding aid (fill-gaps) from
+        // the datapackage. a.wacz declares created 2026-…, so `dates` is seeded.
+        let tmp = TempDir::new().unwrap();
+        index_fixture("a.wacz", tmp.path(), None); // collection "test"
+        let m = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(
+            m.collection_by_id("test").unwrap().dates.as_deref(),
+            Some("2026"),
+            "collection dates seeded from the WACZ datapackage `created` year"
         );
     }
 

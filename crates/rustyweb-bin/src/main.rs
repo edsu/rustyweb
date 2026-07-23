@@ -77,8 +77,8 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Add the WACZ(s) to this collection (created if new). Without it, each
-        /// WACZ is its own collection.
+        /// The collection these WACZ(s) belong to (created if new). Required —
+        /// every crawl belongs to a collection.
         #[arg(long)]
         collection: Option<String>,
 
@@ -1261,6 +1261,15 @@ fn run_browsertrix(
             imported += 1;
         }
     }
+
+    // Seed the rustyweb collection's finding aid from the Browsertrix metadata
+    // (fill-gaps: only empty fields, so re-syncing never clobbers curator edits).
+    let fields = browsertrix_collection_fields(&org, selected_collection.as_ref());
+    if !fields.is_empty() {
+        rustyweb_lib::index::seed_collection(home, into, &fields)
+            .context("seeding collection metadata")?;
+    }
+
     eprintln!(
         "done: imported {imported} crawl(s){}",
         if skipped > 0 {
@@ -1270,6 +1279,60 @@ fn run_browsertrix(
         }
     );
     Ok(())
+}
+
+/// Build the finding-aid seed for the rustyweb collection from Browsertrix
+/// metadata: the org is the collecting body (→ `creator`), and the selected
+/// Browsertrix collection (when one was chosen) supplies scope/abstract/subjects/
+/// dates. `access` is deliberately *not* mapped to rights (visibility ≠ reuse
+/// license). All fill-gaps via [`index::seed_collection`].
+fn browsertrix_collection_fields(
+    org: &rustyweb_lib::browsertrix::Org,
+    coll: Option<&rustyweb_lib::browsertrix::Collection>,
+) -> rustyweb_lib::collections::CollectionFields {
+    let nonblank = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+
+    // Creator: the org name, with its website appended when set.
+    let creator = {
+        let name = org.name.trim();
+        (!name.is_empty()).then(|| match nonblank(&org.website) {
+            Some(url) => format!("{name} ({url})"),
+            None => name.to_string(),
+        })
+    };
+
+    let mut fields = rustyweb_lib::collections::CollectionFields {
+        creator,
+        ..Default::default()
+    };
+    if let Some(c) = coll {
+        fields.narrative = nonblank(&c.description);
+        fields.description = nonblank(&c.caption);
+        fields.subjects = (!c.tags.is_empty()).then(|| c.tags.clone());
+        fields.dates = date_range(c.date_earliest.as_deref(), c.date_latest.as_deref());
+    }
+    fields
+}
+
+/// A human coverage-date string from a Browsertrix collection's ISO date range:
+/// the years, e.g. `2022–2023` (or just `2022` when they match / only one is set).
+fn date_range(earliest: Option<&str>, latest: Option<&str>) -> Option<String> {
+    let year = |d: Option<&str>| -> Option<String> {
+        d.and_then(|s| s.get(..4))
+            .filter(|y| y.chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_string)
+    };
+    match (year(earliest), year(latest)) {
+        (Some(a), Some(b)) if a == b => Some(a),
+        (Some(a), Some(b)) => Some(format!("{a}\u{2013}{b}")),
+        (Some(y), None) | (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
 }
 
 /// Resolve a `--collection` value (a Browsertrix collection id, slug, or name)
@@ -1546,6 +1609,7 @@ mod tests {
             id: id.to_string(),
             slug: slug.to_string(),
             name: format!("{slug} name"),
+            ..Default::default()
         }
     }
 
@@ -1584,11 +1648,13 @@ mod tests {
                 id: "uuid-1".into(),
                 slug: "gov-arc".into(),
                 name: "US Gov".into(),
+                ..Default::default()
             },
             Collection {
                 id: "uuid-2".into(),
                 slug: "edu".into(),
                 name: "Universities".into(),
+                ..Default::default()
             },
         ];
         assert_eq!(resolve_collection(&colls, "gov-arc").unwrap().id, "uuid-1");

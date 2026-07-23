@@ -445,6 +445,31 @@ impl Manifest {
         id
     }
 
+    /// Auto-*seed* a collection's curatorial metadata from ingest (the WACZ
+    /// datapackage, the Browsertrix API): like [`apply_fields`], but each value
+    /// is applied only where the collection's field is still empty, so a
+    /// curator's edit (or an earlier seed) is never overwritten. Creating a new
+    /// collection sets `created`. Returns the id.
+    ///
+    /// [`apply_fields`]: Self::apply_fields
+    pub fn seed_fields(&mut self, name: &str, fields: &CollectionFields, created: &str) -> String {
+        let id = slugify(name);
+        self.dirty.insert(id.clone());
+        if let Some(c) = self.collections.iter_mut().find(|c| c.id == id) {
+            fields.apply_to_empty(c);
+        } else {
+            let mut c = Collection {
+                id: id.clone(),
+                name: name.to_string(),
+                created: created.to_string(),
+                ..Default::default()
+            };
+            fields.apply_to_empty(&mut c);
+            self.collections.push(c);
+        }
+        id
+    }
+
     /// Persist the manifest: the derived `waczs.json`, plus a Markdown finding
     /// aid for every collection created/modified this session. Untouched finding
     /// aids are left on disk as-is (so hand edits keep their formatting).
@@ -540,6 +565,53 @@ impl CollectionFields {
         }
         if self.narrative.is_some() {
             c.narrative = self.narrative.clone();
+        }
+    }
+
+    /// Apply each `Some` value only where `c`'s corresponding field is *empty*
+    /// (`None` / empty `Vec` / blank narrative). Used to auto-*seed* a collection
+    /// from ingest metadata (WACZ datapackage, Browsertrix) without clobbering a
+    /// curator's edits or an earlier seed — "fill gaps, curator wins."
+    fn apply_to_empty(&self, c: &mut Collection) {
+        if c.description.is_none() {
+            if let Some(v) = &self.description {
+                c.description = Some(v.clone());
+            }
+        }
+        if c.curator.is_none() {
+            if let Some(v) = &self.curator {
+                c.curator = Some(v.clone());
+            }
+        }
+        if c.creator.is_none() {
+            if let Some(v) = &self.creator {
+                c.creator = Some(v.clone());
+            }
+        }
+        if c.dates.is_none() {
+            if let Some(v) = &self.dates {
+                c.dates = Some(v.clone());
+            }
+        }
+        if c.rights.is_none() {
+            if let Some(v) = &self.rights {
+                c.rights = Some(v.clone());
+            }
+        }
+        if c.subjects.is_empty() {
+            if let Some(v) = &self.subjects {
+                c.subjects = v.clone();
+            }
+        }
+        if c.narrative
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            if let Some(v) = &self.narrative {
+                c.narrative = Some(v.clone());
+            }
         }
     }
 }
@@ -1085,6 +1157,61 @@ mod tests {
         assert_eq!(slugify("already-slug"), "already-slug");
         // No sluggable characters -> short hash fallback (8 hex chars).
         assert_eq!(slugify("!!!").len(), 8);
+    }
+
+    #[test]
+    fn seed_fields_fills_only_empty_and_never_clobbers() {
+        let tmp = TempDir::new().unwrap();
+        let mut m = Manifest::open(&tmp.path().join("index")).unwrap();
+
+        // First seed populates empty fields.
+        m.seed_fields(
+            "SUCHO",
+            &CollectionFields {
+                narrative: Some("first scope".into()),
+                subjects: Some(vec!["ukraine".into()]),
+                ..Default::default()
+            },
+            "2026-01-01T00:00:00Z",
+        );
+        let c = m.collection_by_id("sucho").unwrap();
+        assert_eq!(c.narrative.as_deref(), Some("first scope"));
+        assert_eq!(c.subjects, vec!["ukraine"]);
+
+        // A curator refines the narrative.
+        m.apply_fields(
+            "SUCHO",
+            &CollectionFields {
+                narrative: Some("curator's words".into()),
+                ..Default::default()
+            },
+            "2026-01-01T00:00:00Z",
+        );
+
+        // A later seed fills a still-empty field (creator) but must NOT overwrite
+        // the set ones (narrative, subjects).
+        m.seed_fields(
+            "SUCHO",
+            &CollectionFields {
+                narrative: Some("second scope".into()),
+                subjects: Some(vec!["other".into()]),
+                creator: Some("SUCHO team".into()),
+                ..Default::default()
+            },
+            "2026-02-02T00:00:00Z",
+        );
+        let c = m.collection_by_id("sucho").unwrap();
+        assert_eq!(
+            c.narrative.as_deref(),
+            Some("curator's words"),
+            "edit preserved"
+        );
+        assert_eq!(c.subjects, vec!["ukraine"], "subjects preserved");
+        assert_eq!(
+            c.creator.as_deref(),
+            Some("SUCHO team"),
+            "empty field seeded"
+        );
     }
 
     #[test]

@@ -71,7 +71,16 @@ fn router(base: String) -> Router {
         .route(
             "/api/orgs/{oid}/collections",
             get(|| async {
-                Json(json!({"items": [{"id": "col-uuid", "slug": "news", "name": "News"}], "total": 1}))
+                Json(json!({"items": [{
+                    "id": "col-uuid",
+                    "slug": "news",
+                    "name": "News",
+                    "description": "## Scope\n\nBreaking news crawls.",
+                    "caption": "A news collection",
+                    "tags": ["news", "current-events"],
+                    "dateEarliest": "2022-01-01T00:00:00Z",
+                    "dateLatest": "2023-12-31T00:00:00Z"
+                }], "total": 1}))
             }),
         )
         .route(
@@ -158,14 +167,32 @@ fn import_a_collection_then_skip_on_rerun() {
         news_md.exists(),
         "importing a collection should create a collections/news/README.md finding aid"
     );
+    // ...and its finding aid is seeded from the Browsertrix collection metadata.
+    let aid = std::fs::read_to_string(&news_md).unwrap();
+    assert!(aid.contains("name: News"), "front-matter carries the name");
     assert!(
-        std::fs::read_to_string(&news_md)
-            .unwrap()
-            .contains("name: News"),
-        "the finding aid front-matter should carry the collection name"
+        aid.contains("A news collection"),
+        "caption -> description: {aid}"
+    );
+    assert!(aid.contains("news"), "tags -> subjects: {aid}");
+    assert!(
+        aid.contains("2022\u{2013}2023"),
+        "date range -> dates: {aid}"
+    );
+    assert!(aid.contains("Demo"), "org -> creator: {aid}");
+    assert!(
+        aid.contains("## Scope"),
+        "collection description -> narrative: {aid}"
     );
 
-    // Re-run: the crawl is already imported, so it's skipped (no duplicate).
+    // A curator edits the narrative by hand.
+    let edited = aid.replace(
+        "## Scope\n\nBreaking news crawls.",
+        "## Scope\n\nMY OWN WORDS.",
+    );
+    std::fs::write(&news_md, &edited).unwrap();
+
+    // Re-run: the crawl is already imported, so it's skipped (no duplicate)...
     let out2 = run();
     assert!(out2.status.success());
     let stderr2 = String::from_utf8_lossy(&out2.stderr);
@@ -177,6 +204,12 @@ fn import_a_collection_then_skip_on_rerun() {
         manifest_array(home.path(), "waczs.json").len(),
         1,
         "re-run must not add a duplicate crawl"
+    );
+    // ...and the re-sync's seed does NOT clobber the curator's edit (fill-gaps).
+    let after = std::fs::read_to_string(&news_md).unwrap();
+    assert!(
+        after.contains("MY OWN WORDS."),
+        "re-import must not overwrite a hand-edited narrative: {after}"
     );
 }
 

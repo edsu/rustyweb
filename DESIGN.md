@@ -391,9 +391,18 @@ access conditions. The collection page reads like a finding aid: an "About this 
 front-matter (rendered narrative + a curatorial `Creator`/`Dates`/`Rights`/`Subjects` table)
 above the facets, set apart from the derived aggregates. When those fields are empty the page
 shows a muted nudge naming the DACS single-level *minimum* curatorial elements — Creator, Scope
-& Content, Access — so the prompt carries archival authority. The importer(s) map source
-metadata onto the same model (`CollectionFields`), and the model is the union target for
-Browsertrix and Archive-It so both map cleanly.
+& Content, Access — so the prompt carries archival authority.
+
+**Ingest pre-seeds the finding aid.** So a collection isn't blank on arrival, both ingest paths
+populate `CollectionFields` and apply them *fill-gaps* (`Manifest::seed_fields` — set only
+still-empty fields, so a curator's edit or an earlier seed is never overwritten; distinct from
+the CLI's authoritative `apply_fields`). Sources: the **WACZ `datapackage.json`** on `index`
+(`description`→narrative, `keywords`→subjects, `created`→dates, Frictionless
+`contributors`/`organization`→creator, `licenses`→rights) and the **Browsertrix API** on `import`
+(collection `description`→narrative, `caption`→abstract, `tags`→subjects, `dateEarliest`/
+`dateLatest`→dates, org name+site→creator; `access` is deliberately *not* mapped to rights, since
+replay visibility ≠ a reuse license). The model is the union target for Browsertrix and Archive-It
+(deferred) so both map cleanly.
 
 **Technical/derived** provenance is extracted from the WACZ/WARC and shown in the crawl page's
 provenance panel plus a compact line on collection member listings. Sources used:
