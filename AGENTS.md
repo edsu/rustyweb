@@ -78,6 +78,8 @@ When reviewing a change (ours or a PR), look for:
 - **Complex-but-necessary code that lacks documentation.** If it has to be subtle,
   it needs comments explaining *why* (not what).
 - **Redundant / duplicated code** that could be unified.
+* **Security** audit to check for possible vulnerabilities that could be exploited.
+* Dead code: code that once was used but is no longer.
 - **Test sufficiency.** Do unit *and* integration tests adequately cover the new
   code and its edge cases (error paths, fallbacks, boundaries)?
 - **Docs that need updating** — `README.md`, `DESIGN.md`, `AGENTS.md`, `PRIMER.md`,

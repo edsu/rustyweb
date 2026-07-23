@@ -399,16 +399,6 @@ impl Manifest {
         }
     }
 
-    /// Insert or replace a collection by id (marks its finding aid for writing).
-    pub fn upsert_collection(&mut self, collection: Collection) {
-        self.dirty.insert(collection.id.clone());
-        if let Some(pos) = self.collections.iter().position(|c| c.id == collection.id) {
-            self.collections[pos] = collection;
-        } else {
-            self.collections.push(collection);
-        }
-    }
-
     /// Ensure a collection with `id` exists, creating a default one (named
     /// `name`) if it doesn't. Returns the collection id for convenience.
     pub fn ensure_collection(&mut self, id: &str, name: &str, created: &str) -> String {
@@ -551,11 +541,16 @@ impl CollectionFields {
 /// filename stem (not stored here); the `narrative` is the Markdown body.
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct FrontMatter {
+    // `name` and `created` are `default` so a hand-authored file can omit them:
+    // `name` falls back to the filename stem (see `parse_finding_aid`), and a
+    // missing `created` is tolerated rather than failing the whole manifest load.
+    #[serde(default)]
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     curator: Option<String>,
+    #[serde(default)]
     created: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     creator: Option<String>,
@@ -1138,6 +1133,27 @@ mod tests {
             c.narrative.as_deref(),
             Some("# About\n\nHand-written prose.")
         );
+    }
+
+    #[test]
+    fn minimal_hand_edited_finding_aid_does_not_crash_load() {
+        // A curator may omit `name`/`created`; that must not fail the whole
+        // manifest load. `name` falls back to the filename stem.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("collections");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sucho.md"),
+            "---\ncreator: Someone\n---\n\n## Scope\n\nWhy.\n",
+        )
+        .unwrap();
+
+        let m = Manifest::open(&tmp.path().join("index")).unwrap();
+        let c = m
+            .collection_by_id("sucho")
+            .expect("loads despite missing name/created");
+        assert_eq!(c.name, "sucho", "name falls back to the filename stem");
+        assert_eq!(c.creator.as_deref(), Some("Someone"));
     }
 
     #[test]
