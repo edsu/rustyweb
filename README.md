@@ -124,9 +124,14 @@ directory):
 
 ```
 <home>/
-├── archive/   your WACZ files
-└── index/     search index + metadata (created by `rustyweb index`)
+├── archive/<slug>/     your WACZ files, organized by collection
+├── collections/<slug>/ finding aids you author + commit (README.md, thumbnails, notes)
+└── index/              search index + derived metadata (rebuildable; git-ignore it)
 ```
+
+The `collections/` folder is the part worth keeping in version control - the prose
+and images a curator writes. `index/` is derived from the WACZs and rebuilt by
+`rustyweb reindex`, so a home in git typically `.gitignore`s `/index`.
 
 Keep your WACZ files in `archive/`, then index and serve:
 
@@ -134,9 +139,16 @@ Keep your WACZ files in `archive/`, then index and serve:
 mkdir -p archive
 cp my-archive.wacz archive/
 
-rustyweb index archive/*.wacz   # index the WACZs in your archive folder
-rustyweb serve                  # http://127.0.0.1:8080
+rustyweb index archive/*.wacz --collection "My Web Archive"   # index into a collection
+rustyweb serve                                                # http://127.0.0.1:8080
 ```
+
+Every crawl belongs to a **collection**, so `index` requires `--collection <NAME>`
+(created if new). This is a deliberate nudge to say what a crawl is a part of and
+why you're keeping it — the curatorial context rustyweb is built to surface.
+Describe a collection further (creator, dates, rights, a scope note) with
+[`rustyweb collection set`](#command-line), which writes a git-committable finding
+aid at `collections/<slug>/README.md`.
 
 Local WACZ files must live under `<home>/archive` - rustyweb indexes them in
 place (it does not copy them) and stores each source relative to home, so you
@@ -148,8 +160,8 @@ it).
 index a single file or a remote WACZ:
 
 ```sh
-rustyweb index archive/my-archive.wacz
-rustyweb index https://example.org/site.wacz
+rustyweb index archive/my-archive.wacz --collection "My Web Archive"
+rustyweb index https://example.org/site.wacz --collection "My Web Archive"
 ```
 
 To rebuild the index later from what you've already indexed, use
@@ -168,7 +180,7 @@ refresh collections.
 A WACZ can also live at an `http(s)` URL. For example, this one is hosted on S3:
 
 ```sh
-rustyweb index https://edsu-webarchives.s3.amazonaws.com/docnow.wacz
+rustyweb index https://edsu-webarchives.s3.amazonaws.com/docnow.wacz --collection "DocNow"
 rustyweb serve
 ```
 
@@ -190,7 +202,7 @@ range- and CORS-capable HTTPS URL (public or presigned) and index it.
 If you'd rather keep a **local copy**, add `--download`:
 
 ```sh
-rustyweb index --download https://edsu-webarchives.s3.amazonaws.com/docnow.wacz
+rustyweb index --download https://edsu-webarchives.s3.amazonaws.com/docnow.wacz --collection "DocNow"
 ```
 
 This fetches the WACZ into `<home>/archive`, indexes it as a local file, and
@@ -335,10 +347,10 @@ Notes:
 ## Command line
 
 ```
-rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
+rustyweb index           [--home <DIR>] [--name <NAME>] --collection <NAME> [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
 rustyweb reindex         [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve           [--home <DIR>] [--bind <ADDR>]
-rustyweb collection set  [--home <DIR>] <NAME> [--creator <TEXT>] [--dates <TEXT>] [--rights <TEXT>] [--subject <SUBJECT>]... [--narrative <MD> | --narrative-file <FILE>] [--description <TEXT>] [--curator <TEXT>]
+rustyweb collection set  [--home <DIR>] <NAME> [--creator <TEXT>] [--dates <TEXT>] [--rights <TEXT>] [--subject <SUBJECT>]... [--narrative <MD> | --narrative-file <FILE>] [--thumbnail <FILE>] [--description <TEXT>] [--curator <TEXT>]
 rustyweb collection list [--home <DIR>]
 rustyweb crawl set       [--home <DIR>] <CRAWL_ID> [--image <FILE>] [--note <MD> | --note-file <FILE>]
 rustyweb search-url      [--home <DIR>] <URL>
@@ -364,9 +376,10 @@ derived siblings under it.
   everything in the manifest under `<home>/index/`, including the SHA-256 of each
   local WACZ. Local WACZ paths are stored relative to home so the folder is
   portable. The WACZ name comes from `--name` if given, otherwise the WACZ's
-  `datapackage.json` title, otherwise the filename. `--collection <NAME>` groups
-  the WACZs into a curated collection (created if new); without it each WACZ is its
-  own collection. `--download` fetches a remote WACZ into `<home>/archive` for a
+  `datapackage.json` title, otherwise the filename. **`--collection <NAME>` is
+  required** — every crawl belongs to a curated collection (created if new); there
+  are no auto singletons. `--download` fetches a remote WACZ into
+  `<home>/archive/<collection-slug>/` for a
   durable local copy instead of streaming it in place. To index many at once, pass
   a newline-delimited list of files/URLs with `--from-file <FILE>` (or `-f -` to
   read from stdin); blank lines and `#` comments are ignored, and it combines with
@@ -379,10 +392,12 @@ derived siblings under it.
   detected automatically and its inner crawls indexed too, into one entry.
 - **`collection`** - `collection list` shows collections and their members;
   `collection set <NAME> …` writes a collection's finding-aid metadata (creator,
-  dates, rights, subjects, and a Markdown narrative) to a git-committable
-  `collections/<slug>.md` you can also hand-edit. `crawl set <ID> --note` adds a
-  per-crawl Markdown note (`crawls/<id>.md`). (WACZ→collection membership is set
-  when indexing, via `index --collection <NAME>`.)
+  dates, rights, subjects, a Markdown narrative, and an optional `--thumbnail`) to
+  a git-committable `collections/<slug>/README.md` you can also hand-edit.
+  `crawl set <ID> --note` adds a per-crawl Markdown note
+  (`collections/<slug>/crawls/<id>.md`); `crawl set <ID> --image` pins a crawl
+  thumbnail there too. (WACZ→collection membership is set when indexing, via
+  `index --collection <NAME>`.)
 - **`reindex`** - rebuild the search index from the WACZs already in the
   manifest, preserving collection membership and metadata. Re-fetches remote URL
   sources and recreates the index from scratch, so it's the way to migrate after
