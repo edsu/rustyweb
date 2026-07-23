@@ -39,5 +39,7 @@ version = "3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Generate a valid image in tests that exercise thumbnail pinning/serving.
+image = { workspace = true }
 # Headless-browser replay smoke test (run with `cargo test -- --ignored`).
 thirtyfour = "0.37"

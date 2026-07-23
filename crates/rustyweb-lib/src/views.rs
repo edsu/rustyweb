@@ -648,7 +648,8 @@ pub struct CrawlPage {
     pub crumb: Option<(String, String)>,
     pub name: String,
     pub description: Option<String>,
-    /// The rendered (safe-HTML) Markdown curator note from `crawls/<id>.md`.
+    /// The rendered (safe-HTML) Markdown curator note from
+    /// `collections/<slug>/crawls/<id>.md`.
     pub note: Option<PreEscaped<String>>,
     /// `/thumb/{id}` for this crawl's representative image, if it has one.
     pub thumb: Option<String>,

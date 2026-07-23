@@ -57,11 +57,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index one or more WACZ files (kept in <home>/archive) or http(s) URLs.
+    /// Index one or more WACZ files or http(s) URLs into a collection.
     Index {
-        /// WACZ files or http(s) URLs to index. A local WACZ must live under
-        /// <home>/archive; for several, glob it: `index archive/*.wacz`. Provide
-        /// at least one here or via --from-file.
+        /// WACZ files or http(s) URLs to index. A local WACZ may live anywhere;
+        /// it's filed into <home>/archive/<collection-slug>/. For several, glob
+        /// it. Provide at least one here or via --from-file.
         paths: Vec<String>,
 
         /// Read more WACZ files/URLs from a text file, one per line (blank lines
@@ -253,7 +253,7 @@ enum CrawlCmd {
         image: Option<PathBuf>,
 
         /// A curator note (Markdown) for this crawl — e.g. to document absences
-        /// or context. Written to a committable `crawls/<id>.md`.
+        /// or context. Written to a committable `collections/<slug>/crawls/<id>.md`.
         #[arg(long, conflicts_with = "note_file")]
         note: Option<String>,
 
@@ -613,7 +613,8 @@ async fn main() -> Result<()> {
             // singleton per WACZ, we ask the curator to say what this is part of
             // — the deliberate "stop and think" moment (index a glob into one
             // collection to decide it once).
-            let Some(collection) = collection.as_deref() else {
+            let collection = collection.as_deref().filter(|c| !c.trim().is_empty());
+            let Some(collection) = collection else {
                 eprintln!(
                     "index needs --collection <NAME>: every crawl belongs to a curated\n\
                      collection. For example:\n\
@@ -1487,9 +1488,12 @@ fn resolve_org(
 }
 
 /// A filesystem-safe single path component: any character outside
-/// `[A-Za-z0-9._-]` (including path separators) becomes `_`.
+/// `[A-Za-z0-9._-]` (including path separators) becomes `_`, and a component
+/// that would be `.` or `..` is neutralized to `_`/`__` so a hostile item id
+/// from the API can't escape its per-item subdirectory.
 fn safe_component(s: &str) -> String {
-    s.chars()
+    let mapped: String = s
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
                 c
@@ -1497,14 +1501,35 @@ fn safe_component(s: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    match mapped.as_str() {
+        "" => "_".to_string(),
+        "." => "_".to_string(),
+        ".." => "__".to_string(),
+        _ => mapped,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::parse_source_lines;
-    use super::{passes_review, resolve_collection, resolve_org, safe_wacz_filename};
+    use super::{
+        passes_review, resolve_collection, resolve_org, safe_component, safe_wacz_filename,
+    };
     use rustyweb_lib::browsertrix::{Collection, Item, Org};
+
+    #[test]
+    fn safe_component_neutralizes_traversal_and_separators() {
+        // A hostile/compromised Browsertrix item id must not escape its subdir.
+        assert_eq!(safe_component(".."), "__");
+        assert_eq!(safe_component("."), "_");
+        // Embedded separators are mapped, leaving a single contained component.
+        assert_eq!(safe_component("../../etc"), ".._.._etc");
+        assert_eq!(safe_component("a/b"), "a_b");
+        assert_eq!(safe_component(""), "_");
+        // A normal id is untouched.
+        assert_eq!(safe_component("manual-20250101-abc"), "manual-20250101-abc");
+    }
 
     fn item(review: Option<u8>) -> Item {
         Item {

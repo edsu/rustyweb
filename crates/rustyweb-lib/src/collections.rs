@@ -1260,6 +1260,29 @@ mod tests {
     }
 
     #[test]
+    fn migration_does_not_clobber_an_existing_readme() {
+        // If a flat <slug>.md and an already-migrated <slug>/README.md coexist,
+        // the migration must not overwrite the README (idempotent, safe).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("collections");
+        std::fs::create_dir_all(dir.join("sucho")).unwrap();
+        std::fs::write(
+            dir.join("sucho/README.md"),
+            "---\nname: Kept\ncreated: 2026-01-01T00:00:00Z\n---\n\nThe real one.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sucho.md"), "---\nname: Stale\n---\n\nOld flat.\n").unwrap();
+
+        let m = Manifest::open(&tmp.path().join("index")).unwrap();
+        // The subdir README wins; the flat file is left untouched (not moved over).
+        assert_eq!(m.collection_by_id("sucho").unwrap().name, "Kept");
+        assert!(
+            dir.join("sucho.md").exists(),
+            "flat file not clobbered onto README"
+        );
+    }
+
+    #[test]
     fn crawl_note_roundtrips() {
         let tmp = TempDir::new().unwrap();
         assert!(read_crawl_note(tmp.path(), "sucho", "abc12345").is_none());

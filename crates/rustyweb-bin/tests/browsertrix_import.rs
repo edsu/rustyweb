@@ -179,3 +179,41 @@ fn import_a_collection_then_skip_on_rerun() {
         "re-run must not add a duplicate crawl"
     );
 }
+
+#[test]
+fn whole_org_import_defaults_the_collection_to_the_org_name() {
+    // No --collection and no --into: every crawl still belongs to a collection,
+    // so the import falls back to the org name ("Demo" -> slug "demo") rather
+    // than scattering singletons.
+    let base = start_mock();
+    let home = TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rustyweb"))
+        .args(["import", "browsertrix"])
+        .args(["--host", &base])
+        .args(["--org", "demo"])
+        .arg("--home")
+        .arg(home.path())
+        .env("BROWSERTRIX_USER", "u")
+        .env("BROWSERTRIX_PASSWORD", "p")
+        .env_remove("BROWSERTRIX_TOKEN")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "import failed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Filed under the org-named collection, both on disk and as a finding aid.
+    assert!(
+        home.path().join("archive/demo/item1/simple.wacz").exists(),
+        "WACZ should land under archive/<org-slug>/"
+    );
+    assert!(
+        home.path().join("collections/demo/README.md").exists(),
+        "a finding aid for the org-named collection should be created"
+    );
+    let waczs = manifest_array(home.path(), "waczs.json");
+    assert_eq!(waczs.len(), 1);
+    assert_eq!(waczs[0]["collection"], "demo");
+}

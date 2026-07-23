@@ -60,8 +60,8 @@ pub trait SourceResolver: Send + Sync {
     fn resolve(&self, source: &Source) -> Result<String>;
 }
 
-/// Index a local WACZ file (which must live under `<home>/archive`) into the
-/// given collection. Thin wrapper over [`index_location`].
+/// Index a local WACZ file into the given collection (it's filed into
+/// `<home>/archive/<slug>/`). Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>, collection: &str) -> Result<()> {
     index_location(
         &path.to_string_lossy(),
@@ -75,13 +75,13 @@ pub fn index_path(path: &Path, home: &Path, name: Option<&str>, collection: &str
 }
 
 /// Index a WACZ from a location into the home directory's `index/`. The location
-/// is either a local `.wacz` file that already lives under `<home>/archive`, or
-/// a remote `http(s)://` URL (downloaded to a temp file for indexing).
+/// is either a local `.wacz` file (from anywhere) or a remote `http(s)://` URL.
 ///
-/// Local WACZ paths are stored relative to `home`, so the home folder (archive +
-/// index together) is portable. rustyweb does not copy files for you: a local
-/// WACZ outside the archive folder, a directory, or a non-`.wacz` path is an
-/// error (see [`resolve_sources`]).
+/// A local WACZ is filed into `<home>/archive/<collection-slug>/` — moved if it
+/// already sits under `archive/`, copied otherwise — and its path stored relative
+/// to `home`, so the home folder (archive + collections + index) is portable. A
+/// directory or non-`.wacz` path is an error (see [`resolve_sources`] /
+/// [`place_local_wacz`]).
 ///
 /// Idempotent: re-indexing the same source upserts its manifest entry and
 /// replaces its documents in Tantivy.
@@ -134,20 +134,21 @@ pub fn index_location_with_resolver(
         collection.to_string(),
     );
 
-    // Validate the argument and file local WACZs into the collection's archive
-    // folder (a bad path errors before we touch the index).
-    let sources = resolve_sources(location, home, &group.0)?;
-
     let index_dir = index_dir(home);
     std::fs::create_dir_all(&index_dir)
         .with_context(|| format!("creating index dir {}", index_dir.display()))?;
+
+    let mut manifest = Manifest::open(&index_dir)?;
+
+    // Validate the argument and file local WACZs into the collection's archive
+    // folder (a bad path errors before we touch the index; the manifest lets us
+    // refuse a silent re-collection of an already-registered crawl).
+    let sources = resolve_sources(location, home, &group.0, &manifest)?;
 
     let search = Mutex::new(
         SearchIndex::open(index_dir.join("full_text").as_path())
             .with_context(|| format!("opening search index at {}", index_dir.display()))?,
     );
-
-    let mut manifest = Manifest::open(&index_dir)?;
 
     for source in &sources {
         let (wacz_name, pages) = index_one(
@@ -326,7 +327,7 @@ pub fn reindex(
 
 /// Create or update a collection's curatorial (finding-aid) metadata (its id is
 /// the slug of `name`). Only fields set in `fields` change; the finding aid is
-/// written to `<home>/collections/<id>.md`. Returns the collection id.
+/// written to `<home>/collections/<slug>/README.md`. Returns the collection id.
 pub fn set_collection(
     home: &Path,
     name: &str,
@@ -355,7 +356,7 @@ pub fn set_collection_thumbnail(home: &Path, name: &str, image_file: &Path) -> R
     Ok(())
 }
 
-/// Set (or clear) a crawl's curator note at `<home>/crawls/<id>.md`. Manifest-
+/// Set a crawl's curator note at `<home>/collections/<slug>/crawls/<id>.md`. Manifest-
 /// only side effect (no reindex); errors if the crawl id is unknown.
 pub fn set_crawl_note(home: &Path, crawl_id: &str, note: &str) -> Result<()> {
     let manifest = Manifest::open(&index_dir(home))?;
@@ -441,19 +442,66 @@ pub fn set_browsertrix_provenance_by_id(
 /// own space), **copied** otherwise (the original is left intact) — so the home
 /// directory stays self-contained and portable and the archive is browsable by
 /// collection. Directories and non-`.wacz` paths are errors with guidance.
-fn resolve_sources(location: &str, home: &Path, collection_slug: &str) -> Result<Vec<Source>> {
+fn resolve_sources(
+    location: &str,
+    home: &Path,
+    collection_slug: &str,
+    manifest: &Manifest,
+) -> Result<Vec<Source>> {
     match Source::parse(location) {
         url @ Source::Url(_) => Ok(vec![url]),
         bt @ Source::Browsertrix { .. } => Ok(vec![bt]),
-        Source::File(p) => Ok(vec![place_local_wacz(&p, home, collection_slug)?]),
+        Source::File(p) => Ok(vec![place_local_wacz(&p, home, collection_slug, manifest)?]),
+    }
+}
+
+/// The archive folder for a collection: `<home>/archive/<slug>/`, where local
+/// WACZs for that collection are filed.
+fn collection_archive_dir(home: &Path, slug: &str) -> PathBuf {
+    archive_dir(home).join(slug)
+}
+
+/// Pick a destination for `source` inside `dir` that won't clobber a *different*
+/// WACZ already filed there. A byte-identical file already present is reused (so
+/// re-indexing the same WACZ is idempotent); a name clash with different content
+/// gets a `-2`, `-3`, … suffix. Returns an existing path only when it's
+/// byte-identical to `source`.
+fn pick_archive_dest(
+    dir: &Path,
+    filename: &std::ffi::OsStr,
+    source: &Path,
+) -> Result<std::path::PathBuf> {
+    let first = dir.join(filename);
+    if !first.exists() {
+        return Ok(first);
+    }
+    let source_sha = file_sha256(source)?;
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("wacz");
+    let mut path = first;
+    let mut n = 1u32;
+    loop {
+        if !path.exists() || file_sha256(&path)? == source_sha {
+            return Ok(path);
+        }
+        n += 1;
+        path = dir.join(format!("{stem}-{n}.wacz"));
     }
 }
 
 /// Bring a local WACZ into `<home>/archive/<slug>/` and return it as a
 /// home-relative File [`Source`]. Moves it if it's already under `archive/`
-/// (reorganizing within the managed space); copies it otherwise. A re-index of a
-/// file already in the collection folder is a no-op placement.
-fn place_local_wacz(path: &Path, home: &Path, collection_slug: &str) -> Result<Source> {
+/// (reorganizing within the managed space); copies it otherwise. A file already
+/// in the collection folder is used in place; a byte-identical file already
+/// filed there is reused (idempotent re-index).
+fn place_local_wacz(
+    path: &Path,
+    home: &Path,
+    collection_slug: &str,
+    manifest: &Manifest,
+) -> Result<Source> {
     if path.is_dir() {
         anyhow::bail!(
             "{} is a directory; pass individual .wacz files instead \
@@ -468,7 +516,7 @@ fn place_local_wacz(path: &Path, home: &Path, collection_slug: &str) -> Result<S
         .canonicalize()
         .with_context(|| format!("{} does not exist", path.display()))?;
 
-    let dest_dir = archive_dir(home).join(collection_slug);
+    let dest_dir = collection_archive_dir(home, collection_slug);
 
     // Already inside the collection's archive folder (at any depth — e.g. the
     // importer's archive/<slug>/<item-id>/ subdir)? Use it in place, no move.
@@ -480,27 +528,53 @@ fn place_local_wacz(path: &Path, home: &Path, collection_slug: &str) -> Result<S
         return Ok(Source::for_file(&abs, home));
     }
 
+    // Guard against silent re-collection: if this exact file is already a
+    // registered member of a *different* collection, moving it would change its
+    // id and orphan that membership (and its committed note/thumbnail). Re-homing
+    // a crawl isn't supported yet, so refuse rather than corrupt.
+    if let Some(existing) = manifest.waczs.iter().find(|w| {
+        w.source
+            .resolve(home)
+            .and_then(|p| p.canonicalize().ok())
+            .is_some_and(|p| p == abs)
+    }) {
+        if existing.collection != collection_slug {
+            anyhow::bail!(
+                "{} is already in collection \"{}\"; re-collecting a crawl isn't supported yet \
+                 — remove it from that collection first, or index a separate copy.",
+                abs.display(),
+                existing.collection
+            );
+        }
+    }
+
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("creating archive dir {}", dest_dir.display()))?;
     let filename = abs
         .file_name()
         .with_context(|| format!("{} has no file name", abs.display()))?;
-    let dest = dest_dir.join(filename);
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("creating archive dir {}", dest_dir.display()))?;
-    // A file already under archive/ is on the same filesystem as its destination,
-    // so a rename (move) is cheap and non-duplicating; a file from elsewhere is
-    // copied so the curator's original is left untouched.
-    let under_archive = archive_dir(home)
-        .canonicalize()
-        .map(|a| abs.starts_with(&a))
-        .unwrap_or(false);
-    if under_archive {
-        std::fs::rename(&abs, &dest)
-            .with_context(|| format!("moving {} to {}", abs.display(), dest.display()))?;
-        info!(from = %abs.display(), to = %dest.display(), "moved WACZ into collection archive");
+    let dest = pick_archive_dest(&dest_dir, filename, &abs)?;
+
+    if dest.exists() {
+        // pick_archive_dest returned a byte-identical file already filed here —
+        // reuse it (idempotent re-index), nothing to write.
     } else {
-        std::fs::copy(&abs, &dest)
-            .with_context(|| format!("copying {} to {}", abs.display(), dest.display()))?;
-        info!(from = %abs.display(), to = %dest.display(), "copied WACZ into collection archive");
+        // A file already under archive/ is on the same filesystem as its
+        // destination, so a rename (move) is cheap and non-duplicating; a file
+        // from elsewhere is copied so the curator's original is left untouched.
+        let under_archive = archive_dir(home)
+            .canonicalize()
+            .map(|a| abs.starts_with(&a))
+            .unwrap_or(false);
+        if under_archive {
+            std::fs::rename(&abs, &dest)
+                .with_context(|| format!("moving {} to {}", abs.display(), dest.display()))?;
+            info!(from = %abs.display(), to = %dest.display(), "moved WACZ into collection archive");
+        } else {
+            std::fs::copy(&abs, &dest)
+                .with_context(|| format!("copying {} to {}", abs.display(), dest.display()))?;
+            info!(from = %abs.display(), to = %dest.display(), "copied WACZ into collection archive");
+        }
     }
     let dest_abs = dest.canonicalize().unwrap_or(dest);
     Ok(Source::for_file(&dest_abs, home))
@@ -836,7 +910,9 @@ fn download_to_temp(url: &str) -> Result<tempfile::NamedTempFile> {
 /// Download a remote WACZ into `<home>/archive/<collection-slug>/<name>.wacz` and
 /// return its path relative to `home` (so the manifest stores a portable local
 /// source, and the archive is browsable by collection). The name comes from the
-/// URL's last path segment. Used by `--download`.
+/// URL's last path segment. Downloads to a temp file first, then files it with
+/// [`pick_archive_dest`] so a different WACZ that happens to share the name isn't
+/// clobbered (and a re-download of identical bytes is reused). Used by `--download`.
 fn download_into_archive(url: &str, home: &Path, collection_slug: &str) -> Result<PathBuf> {
     use std::io::{copy, Write};
 
@@ -853,18 +929,33 @@ fn download_into_archive(url: &str, home: &Path, collection_slug: &str) -> Resul
         format!("{stem}.wacz")
     };
 
-    let dir = archive_dir(home).join(collection_slug);
+    let dir = collection_archive_dir(home, collection_slug);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating archive dir {}", dir.display()))?;
-    let dest = dir.join(&name);
 
-    let mut file =
-        std::fs::File::create(&dest).with_context(|| format!("creating {}", dest.display()))?;
-    copy(&mut crate::http_range::get_reader(url)?, &mut file)
-        .with_context(|| format!("writing {url} to {}", dest.display()))?;
-    file.flush()?;
+    // Download into a temp file in the same dir (same filesystem → cheap rename),
+    // then choose a non-clobbering final name.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".download-")
+        .suffix(".wacz")
+        .tempfile_in(&dir)
+        .with_context(|| format!("temp file in {}", dir.display()))?;
+    copy(&mut crate::http_range::get_reader(url)?, &mut tmp)
+        .with_context(|| format!("writing {url} to a temp file"))?;
+    tmp.flush()?;
 
-    Ok(PathBuf::from("archive").join(collection_slug).join(&name))
+    let dest = pick_archive_dest(&dir, std::ffi::OsStr::new(&name), tmp.path())?;
+    if !dest.exists() {
+        // `persist` renames the temp file into place (and drops the temp guard).
+        tmp.persist(&dest)
+            .with_context(|| format!("saving download to {}", dest.display()))?;
+    } // else: byte-identical file already downloaded here; the temp is discarded.
+
+    // Home-relative path (portable), using the possibly-disambiguated file name.
+    let final_name = dest.file_name().unwrap_or(std::ffi::OsStr::new(&name));
+    Ok(PathBuf::from("archive")
+        .join(collection_slug)
+        .join(final_name))
 }
 
 /// Whether a remote WACZ can be stream-indexed: reachable, range-capable, and
@@ -2140,6 +2231,57 @@ mod tests {
     }
 
     #[test]
+    fn index_does_not_clobber_two_different_wacz_with_the_same_basename() {
+        // The `index a/report.wacz b/report.wacz --collection X` workflow: two
+        // DISTINCT files sharing a basename must stay two crawls, not silently
+        // collapse into one (regression guard).
+        let home = TempDir::new().unwrap();
+        let d1 = TempDir::new().unwrap();
+        let d2 = TempDir::new().unwrap();
+        std::fs::copy(fixture("a.wacz"), d1.path().join("report.wacz")).unwrap();
+        std::fs::copy(fixture("simple.wacz"), d2.path().join("report.wacz")).unwrap();
+
+        index_path(&d1.path().join("report.wacz"), home.path(), None, "Reports").unwrap();
+        index_path(&d2.path().join("report.wacz"), home.path(), None, "Reports").unwrap();
+
+        let m = Manifest::open(&home.path().join("index")).unwrap();
+        assert_eq!(
+            m.waczs.len(),
+            2,
+            "two distinct WACZs must remain two crawls"
+        );
+        // The second was disambiguated rather than overwriting the first.
+        assert!(home.path().join("archive/reports/report.wacz").is_file());
+        assert!(home.path().join("archive/reports/report-2.wacz").is_file());
+
+        // Re-indexing the same external file is idempotent (byte-identical → reused).
+        index_path(&d1.path().join("report.wacz"), home.path(), None, "Reports").unwrap();
+        let m = Manifest::open(&home.path().join("index")).unwrap();
+        assert_eq!(
+            m.waczs.len(),
+            2,
+            "re-indexing an identical file must not duplicate"
+        );
+    }
+
+    #[test]
+    fn index_refuses_to_recollect_a_registered_crawl() {
+        // Indexing a WACZ that's already filed in one collection into a different
+        // one is refused (moving it would change its id and orphan its assets).
+        let home = TempDir::new().unwrap();
+        index_fixture("simple.wacz", home.path(), None); // collection "test"
+        let filed = home.path().join("archive/test/simple.wacz");
+        assert!(filed.is_file());
+
+        let err = index_path(&filed, home.path(), None, "Other")
+            .expect_err("re-collecting a filed crawl should be refused");
+        assert!(
+            format!("{err:#}").contains("already in collection"),
+            "error should explain the crawl is already collected: {err:#}"
+        );
+    }
+
+    #[test]
     fn index_rejects_a_directory() {
         let tmp = TempDir::new().unwrap();
         let archive = tmp.path().join("archive");
@@ -2188,10 +2330,14 @@ mod tests {
 
         reindex(tmp.path(), None, None, None).unwrap();
 
-        // The manifest (and the custom name) is preserved...
+        // The manifest (custom name + collection membership) is preserved...
         let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
         assert_eq!(manifest.waczs.len(), 1);
         assert_eq!(manifest.waczs[0].name, "keepname");
+        assert_eq!(
+            manifest.waczs[0].collection, "test",
+            "collection membership must survive a reindex"
+        );
 
         // ...and the content is searchable again.
         let idx = crate::search::SearchIndex::open(full_text.as_path()).unwrap();

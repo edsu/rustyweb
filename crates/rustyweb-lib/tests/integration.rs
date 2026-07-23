@@ -753,6 +753,73 @@ async fn thumb_route_unknown_id_404() {
 }
 
 #[tokio::test]
+async fn collection_thumbnail_is_set_served_and_preferred() {
+    let tmp = make_index(&["simple.wacz"]); // collection "test"
+                                            // A small valid image the curator pins for the whole collection.
+    let pic = tmp.path().join("pic.png");
+    image::RgbImage::from_pixel(8, 8, image::Rgb([10, 20, 30]))
+        .save(&pic)
+        .unwrap();
+    rustyweb_lib::index::set_collection_thumbnail(tmp.path(), "test", &pic).unwrap();
+
+    // Committed under the collection dir (git-trackable).
+    assert!(tmp.path().join("collections/test/thumbnail.jpg").is_file());
+
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    // Served at /collection-thumb/<slug>.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/collection-thumb/test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap(),
+        "image/jpeg"
+    );
+
+    // The homepage card prefers it (links to /collection-thumb/test).
+    let home = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = to_bytes(home.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("/collection-thumb/test"),
+        "homepage card should use the collection thumbnail: {html}"
+    );
+}
+
+#[tokio::test]
+async fn collection_thumb_rejects_traversal_ids() {
+    let tmp = TempDir::new().unwrap();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    for bad in ["..", "a%2Fb", "a.b"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/collection-thumb/{bad}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "id {bad:?} must not resolve a file"
+        );
+    }
+}
+
+#[tokio::test]
 async fn collection_card_shows_placeholder_without_image() {
     // simple.wacz deflates its WARCs (scan path), so no thumbnail is generated —
     // the card should render the image area as a CSS placeholder, not an <img>.
