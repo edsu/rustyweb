@@ -338,9 +338,9 @@ Notes:
 rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
 rustyweb reindex         [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve           [--home <DIR>] [--bind <ADDR>]
-rustyweb collection set  [--home <DIR>] <COLLECTION> <WACZ_ID>...
+rustyweb collection set  [--home <DIR>] <NAME> [--creator <TEXT>] [--dates <TEXT>] [--rights <TEXT>] [--subject <SUBJECT>]... [--narrative <MD> | --narrative-file <FILE>] [--description <TEXT>] [--curator <TEXT>]
 rustyweb collection list [--home <DIR>]
-rustyweb crawl set       [--home <DIR>] <CRAWL_ID> --image <FILE>
+rustyweb crawl set       [--home <DIR>] <CRAWL_ID> [--image <FILE>] [--note <MD> | --note-file <FILE>]
 rustyweb search-url      [--home <DIR>] <URL>
 rustyweb verify          [--home <DIR>]
 rustyweb import browsertrix [--home <DIR>] [--host <URL>] [--org <SLUG>] [--collection <ID|SLUG>] [--crawl <ID>] [--into <NAME>] [--include-unreviewed] [--min-review <N>] [--limit <N>] [--dry-run] [--stream] [--force] [-v]
@@ -378,7 +378,11 @@ derived siblings under it.
   bundles other WACZs, e.g. a Browsertrix combined-collection download) is
   detected automatically and its inner crawls indexed too, into one entry.
 - **`collection`** - `collection list` shows collections and their members;
-  `collection set <COLLECTION> <WACZ_ID>...` moves WACZs into a collection.
+  `collection set <NAME> …` writes a collection's finding-aid metadata (creator,
+  dates, rights, subjects, and a Markdown narrative) to a git-committable
+  `collections/<slug>.md` you can also hand-edit. `crawl set <ID> --note` adds a
+  per-crawl Markdown note (`crawls/<id>.md`). (WACZ→collection membership is set
+  when indexing, via `index --collection <NAME>`.)
 - **`reindex`** - rebuild the search index from the WACZs already in the
   manifest, preserving collection membership and metadata. Re-fetches remote URL
   sources and recreates the index from scratch, so it's the way to migrate after

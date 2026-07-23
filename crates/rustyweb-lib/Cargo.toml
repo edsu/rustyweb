@@ -11,6 +11,8 @@ axum = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
 maud = { workspace = true }
+pulldown-cmark = { workspace = true }
+serde_yaml_ng = { workspace = true }
 tantivy = { workspace = true }
 warc = { workspace = true }
 zip = { workspace = true }

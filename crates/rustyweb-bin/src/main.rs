@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -252,6 +252,15 @@ enum CrawlCmd {
         #[arg(long, value_name = "FILE")]
         image: Option<PathBuf>,
 
+        /// A curator note (Markdown) for this crawl — e.g. to document absences
+        /// or context. Written to a committable `crawls/<id>.md`.
+        #[arg(long, conflicts_with = "note_file")]
+        note: Option<String>,
+
+        /// Read the crawl note (Markdown) from a file (use `-` for stdin).
+        #[arg(long, value_name = "FILE")]
+        note_file: Option<PathBuf>,
+
         /// rustyweb home directory (holds archive/ and index/).
         #[arg(long, default_value = ".")]
         home: PathBuf,
@@ -259,19 +268,51 @@ enum CrawlCmd {
 }
 
 #[derive(Subcommand)]
+// `Set` carries the finding-aid fields, so it's much larger than `List`; a clap
+// command enum is constructed once, so the size difference doesn't matter.
+#[allow(clippy::large_enum_variant)]
 enum CollectionCmd {
-    /// Create or update a collection's metadata (created if it doesn't exist).
+    /// Create or update a collection's finding-aid metadata (created if it
+    /// doesn't exist). Structured fields go to YAML front-matter; the narrative
+    /// prose is the Markdown body of a committable `collections/<slug>.md` — set
+    /// it with --narrative[-file], or just hand-edit that file.
     Set {
         /// Collection name (its id is a slug of this).
         name: String,
 
-        /// A description of the collection.
+        /// A short abstract / caption for the collection (EAD <abstract>).
         #[arg(long)]
         description: Option<String>,
 
-        /// Curator / owner.
+        /// Repository / owner running this rustyweb instance (EAD <repository>).
         #[arg(long)]
         curator: Option<String>,
+
+        /// Collecting org/person responsible for the records (DACS Name of
+        /// Creator, EAD <origination>) — distinct from --curator.
+        #[arg(long)]
+        creator: Option<String>,
+
+        /// Curatorial coverage-date statement (EAD <unitdate>), distinct from
+        /// the auto-derived capture range.
+        #[arg(long)]
+        dates: Option<String>,
+
+        /// Conditions governing access and use / license (EAD <userestrict>).
+        #[arg(long)]
+        rights: Option<String>,
+
+        /// A topical subject / access point (repeat for several).
+        #[arg(long = "subject", value_name = "SUBJECT")]
+        subjects: Vec<String>,
+
+        /// The Scope & Content / provenance narrative (Markdown) inline.
+        #[arg(long, conflicts_with = "narrative_file")]
+        narrative: Option<String>,
+
+        /// Read the narrative (Markdown) from a file (use `-` for stdin).
+        #[arg(long, value_name = "FILE")]
+        narrative_file: Option<PathBuf>,
 
         /// rustyweb home directory (holds archive/ and index/).
         #[arg(long, default_value = ".")]
@@ -283,6 +324,22 @@ enum CollectionCmd {
         #[arg(long, default_value = ".")]
         home: PathBuf,
     },
+}
+
+/// Read a whole text argument from a file, or from stdin when the path is `-`
+/// (for `--narrative-file`/`--note-file`).
+fn read_text_arg(path: &Path) -> Result<String> {
+    if path.as_os_str() == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading text from stdin")?;
+        Ok(buf)
+    } else {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading text from {}", path.display()))
+    }
 }
 
 /// Read a newline-delimited list of WACZ files/URLs from a file, or from stdin
@@ -670,10 +727,35 @@ async fn main() -> Result<()> {
                 name,
                 description,
                 curator,
+                creator,
+                dates,
+                rights,
+                subjects,
+                narrative,
+                narrative_file,
                 home,
             } => {
-                let id = rustyweb_lib::index::set_collection(&home, &name, description, curator)?;
+                let narrative = match narrative_file {
+                    Some(path) => Some(read_text_arg(&path)?),
+                    None => narrative,
+                };
+                let fields = rustyweb_lib::collections::CollectionFields {
+                    description,
+                    curator,
+                    creator,
+                    dates,
+                    rights,
+                    // An empty repeated --subject means "not provided" (leave as
+                    // is); pass Some only when the curator gave at least one.
+                    subjects: (!subjects.is_empty()).then_some(subjects),
+                    narrative,
+                };
+                let id = rustyweb_lib::index::set_collection(&home, &name, &fields)?;
+                let md = home.join("collections").join(format!("{id}.md"));
                 println!("collection \"{name}\" ({id}) updated");
+                if fields.narrative.is_none() {
+                    println!("  add a scope note by editing {}", md.display());
+                }
             }
             CollectionCmd::List { home } => {
                 run_collection_list(&home)?;
@@ -681,12 +763,30 @@ async fn main() -> Result<()> {
         },
 
         Commands::Crawl { action } => match action {
-            CrawlCmd::Set { id, image, home } => {
-                if let Some(file) = image {
-                    rustyweb_lib::index::set_crawl_thumbnail(&home, &id, &file)?;
+            CrawlCmd::Set {
+                id,
+                image,
+                note,
+                note_file,
+                home,
+            } => {
+                let mut did = false;
+                if let Some(file) = &image {
+                    rustyweb_lib::index::set_crawl_thumbnail(&home, &id, file)?;
                     println!("pinned thumbnail for crawl {id} from {}", file.display());
-                } else {
-                    eprintln!("nothing to set — pass --image <FILE> to pin a thumbnail");
+                    did = true;
+                }
+                let note = match note_file {
+                    Some(path) => Some(read_text_arg(&path)?),
+                    None => note,
+                };
+                if let Some(note) = note {
+                    rustyweb_lib::index::set_crawl_note(&home, &id, &note)?;
+                    println!("note updated for crawl {id}");
+                    did = true;
+                }
+                if !did {
+                    eprintln!("nothing to set — pass --image <FILE> or --note <TEXT>");
                     std::process::exit(2);
                 }
             }
@@ -1113,9 +1213,15 @@ fn run_browsertrix(
                 ))
             };
 
-            // Record provenance so a later run can skip this resource.
+            // Record provenance so a later run can skip this resource, and carry
+            // the QA review rating (DACS Appraisal signal) onto the crawl.
             rustyweb_lib::index::set_browsertrix_provenance_by_id(
-                home, &crawl_id, &host, &item.id, &res.hash,
+                home,
+                &crawl_id,
+                &host,
+                &item.id,
+                &res.hash,
+                item.review_status,
             )
             .context("recording provenance")?;
             seen.insert(key);

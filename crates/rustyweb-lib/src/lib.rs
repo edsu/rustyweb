@@ -2,6 +2,7 @@ pub mod browsertrix;
 pub mod collections;
 pub mod http_range;
 pub mod index;
+pub mod markdown;
 pub mod pdf;
 pub mod search;
 pub mod server;

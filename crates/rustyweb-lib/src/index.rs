@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -313,23 +313,37 @@ pub fn reindex(
     Ok(())
 }
 
-/// Create or update a collection's curatorial metadata (its id is the slug of
-/// `name`). Only the provided fields change. Returns the collection id.
+/// Create or update a collection's curatorial (finding-aid) metadata (its id is
+/// the slug of `name`). Only fields set in `fields` change; the finding aid is
+/// written to `<home>/collections/<id>.md`. Returns the collection id.
 pub fn set_collection(
     home: &Path,
     name: &str,
-    description: Option<String>,
-    curator: Option<String>,
+    fields: &crate::collections::CollectionFields,
 ) -> Result<String> {
     let index_dir = index_dir(home);
     std::fs::create_dir_all(&index_dir)
         .with_context(|| format!("creating index dir {}", index_dir.display()))?;
     let mut manifest = Manifest::open(&index_dir)?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let id = manifest.set_collection(name, description, curator, &now);
+    let id = manifest.apply_fields(name, fields, &now);
     manifest.save()?;
     info!(collection = %id, "collection metadata updated");
     Ok(id)
+}
+
+/// Set (or clear) a crawl's curator note at `<home>/crawls/<id>.md`. Manifest-
+/// only side effect (no reindex); errors if the crawl id is unknown.
+pub fn set_crawl_note(home: &Path, crawl_id: &str, note: &str) -> Result<()> {
+    let manifest = Manifest::open(&index_dir(home))?;
+    if manifest.wacz_by_id(crawl_id).is_none() {
+        anyhow::bail!(
+            "no crawl with id \"{crawl_id}\" - it's the id in the crawl's page URL (/crawl/<id>)"
+        );
+    }
+    crate::collections::write_crawl_note(home, crawl_id, note)?;
+    info!(crawl = %crawl_id, "crawl note updated");
+    Ok(())
 }
 
 /// Pin a curator-supplied local image as a crawl's representative thumbnail.
@@ -360,12 +374,13 @@ pub fn set_browsertrix_provenance(
     host: &str,
     item_id: &str,
     resource_hash: &str,
+    review_status: Option<u8>,
 ) -> Result<()> {
     let abs = wacz_file
         .canonicalize()
         .with_context(|| format!("resolving {}", wacz_file.display()))?;
     let id = wacz_id(&Source::for_file(&abs, home));
-    set_browsertrix_provenance_by_id(home, &id, host, item_id, resource_hash)
+    set_browsertrix_provenance_by_id(home, &id, host, item_id, resource_hash, review_status)
 }
 
 /// As [`set_browsertrix_provenance`], but for a crawl identified by its id — used
@@ -377,6 +392,7 @@ pub fn set_browsertrix_provenance_by_id(
     host: &str,
     item_id: &str,
     resource_hash: &str,
+    review_status: Option<u8>,
 ) -> Result<()> {
     let mut manifest = Manifest::open(&index_dir(home))?;
     let wacz = manifest
@@ -388,6 +404,7 @@ pub fn set_browsertrix_provenance_by_id(
         host: host.to_string(),
         item_id: item_id.to_string(),
         resource_hash: resource_hash.to_string(),
+        review_status,
     });
     manifest.save()?;
     Ok(())
@@ -737,6 +754,14 @@ fn index_one(
         capture_end: stats.latest_capture,
         browsertrix,
         nested_waczs: stats.nested_waczs,
+        // Provenance previously parsed-but-dropped / newly read.
+        modified: meta.modified,
+        is_part_of: warcinfo.is_part_of,
+        hostname: warcinfo.hostname,
+        conforms_to: warcinfo.conforms_to,
+        keywords: meta.keywords,
+        licenses: meta.licenses,
+        status_counts: stats.status_counts,
     });
 
     // Note: the spinner/bar is *not* finished here - the Tantivy commit happens
@@ -903,6 +928,21 @@ struct CrawlStats {
     /// For a nested multi-WACZ: how many inner WACZs were flattened into this
     /// crawl. `None` for an ordinary (flat) WACZ.
     nested_waczs: Option<u64>,
+    /// HTTP status-code histogram tallied from the CDX (every capture, including
+    /// the bodyless 4xx/5xx that never become search documents) — the derived
+    /// "capture quality" / Appraisal signal.
+    status_counts: BTreeMap<u16, u64>,
+}
+
+/// Tally HTTP status codes across every CDX record — the capture-quality signal.
+fn tally_status(cdx: &[crate::wacz::CdxjRecord]) -> BTreeMap<u16, u64> {
+    let mut counts = BTreeMap::new();
+    for rec in cdx {
+        if rec.status != 0 {
+            *counts.entry(rec.status).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// Detect + index a **nested multi-WACZ** (a WACZ whose payload is other WACZ
@@ -1000,6 +1040,9 @@ fn index_nested_from<F: RangeFetch + Clone + Send + Sync>(
         merge_max(&mut agg.latest_capture, stats.latest_capture);
         if agg.warcinfo.is_none() {
             agg.warcinfo = stats.warcinfo;
+        }
+        for (code, n) in stats.status_counts {
+            *agg.status_counts.entry(code).or_insert(0) += n;
         }
     }
     agg.nested_waczs = Some(inners.len() as u64);
@@ -1108,7 +1151,10 @@ fn index_wacz(
         raws.extend(r);
     }
     // Fold in pages.jsonl/extraPages.jsonl extracted text (see the streaming
-    // path); some crawls store rendered text only there, not in the WARCs.
+    // path); some crawls store rendered text only there, not in the WARCs. Read
+    // the CDX here too for the capture-quality status tally (every capture,
+    // including bodyless 4xx/5xx that never became RawRecords).
+    let mut status_counts = BTreeMap::new();
     if let Ok(file) = std::fs::File::open(wacz_path) {
         if let Ok(mut zip) = zip::ZipArchive::new(file) {
             raws.extend(
@@ -1121,11 +1167,15 @@ fn index_wacz(
                         title: pt.title,
                     }),
             );
+            if let Ok(cdx) = crate::wacz::cdx_records(&mut zip) {
+                status_counts = tally_status(&cdx);
+            }
         }
     }
     index_merged(
         raws,
         warcinfo,
+        status_counts,
         crawl_id,
         crawl_name,
         collection,
@@ -1152,18 +1202,28 @@ fn index_wacz_streaming<F>(
 where
     F: crate::http_range::RangeFetch + Clone + Send + Sync,
 {
-    let (raws, warcinfo) = collect_page_records_via_cdx(fetch, concurrency, progress)?;
+    let (raws, warcinfo, status_counts) =
+        collect_page_records_via_cdx(fetch, concurrency, progress)?;
     index_merged(
-        raws, warcinfo, crawl_id, crawl_name, collection, search, label,
+        raws,
+        warcinfo,
+        status_counts,
+        crawl_id,
+        crawl_name,
+        collection,
+        search,
+        label,
     )
 }
 
 /// Merge per-record contributions into one document per URL and index them.
 /// Shared by the scan-everything ([`index_wacz`]) and CDX-guided
 /// ([`index_wacz_streaming`]) paths.
+#[allow(clippy::too_many_arguments)]
 fn index_merged(
     raws: Vec<RawRecord>,
     warcinfo: Option<Warcinfo>,
+    status_counts: BTreeMap<u16, u64>,
     crawl_id: &str,
     crawl_name: &str,
     collection: &str,
@@ -1307,6 +1367,7 @@ fn index_merged(
         warcinfo,
         // Set by index_nested for a multi-WACZ; a single WACZ isn't nested.
         nested_waczs: None,
+        status_counts,
     })
 }
 
@@ -1338,6 +1399,10 @@ fn collect_page_records(warc_path: &Path) -> Result<(Vec<RawRecord>, Option<Warc
     Ok((out, warcinfo))
 }
 
+/// Page records read from a WACZ, the crawl-level `warcinfo`, and the HTTP status
+/// tally over the CDX (the capture-quality signal).
+type PageRecords = (Vec<RawRecord>, Option<Warcinfo>, BTreeMap<u16, u64>);
+
 /// CDX-guided extraction over a `Read + Seek` WACZ: read the CDX, fetch only the
 /// page-relevant records (HTML/PDF responses and `urn:text:` rendered text) by
 /// seeking to `data_start + offset`, and transform each with [`record_to_raw`].
@@ -1347,7 +1412,7 @@ fn collect_page_records_via_cdx<F>(
     fetch: F,
     concurrency: usize,
     progress: Option<&dyn IndexProgress>,
-) -> Result<(Vec<RawRecord>, Option<Warcinfo>)>
+) -> Result<PageRecords>
 where
     F: crate::http_range::RangeFetch + Clone + Send + Sync,
 {
@@ -1365,6 +1430,7 @@ where
         .context("opening WACZ ZIP")?;
     wacz::ensure_warcs_stored(&mut zip)?;
     let cdx = wacz::cdx_records(&mut zip)?;
+    let status_counts = tally_status(&cdx);
     let starts = wacz::warc_data_starts(&mut zip)?;
     let warcinfo = wacz::find_warcinfo_streaming(&mut zip)?;
     // Extracted page text from pages.jsonl/extraPages.jsonl (read once, while the
@@ -1453,7 +1519,7 @@ where
     if let Some(p) = progress {
         p.phase("building index");
     }
-    Ok((out, warcinfo))
+    Ok((out, warcinfo, status_counts))
 }
 
 /// Cache a representative thumbnail for a crawl (best-effort). Any failure - no
@@ -1757,6 +1823,21 @@ mod tests {
     }
 
     #[test]
+    fn index_records_capture_status_histogram() {
+        // a.wacz is a real Browsertrix WACZ whose CDX carries HTTP statuses; the
+        // capture-quality tally should populate from it (task .9).
+        let tmp = TempDir::new().unwrap();
+        index_fixture("a.wacz", tmp.path(), None);
+        let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        let counts = &manifest.waczs[0].status_counts;
+        assert!(!counts.is_empty(), "CDX statuses should be tallied");
+        assert!(
+            counts.keys().any(|c| (200..300).contains(c)),
+            "a normal crawl is mostly 2xx; got {counts:?}"
+        );
+    }
+
+    #[test]
     fn index_path_name_defaults_to_stem() {
         // simple.wacz has no title in its datapackage, so the name falls back
         // to the filename stem.
@@ -1809,6 +1890,7 @@ mod tests {
             "https://app.browsertrix.com",
             "item-1",
             "sha256:aa",
+            Some(4),
         )
         .unwrap();
 
@@ -1820,15 +1902,17 @@ mod tests {
         let b = recorded(tmp.path()).expect("provenance recorded");
         assert_eq!(b.item_id, "item-1");
         assert_eq!(b.resource_hash, "sha256:aa");
+        assert_eq!(b.review_status, Some(4));
 
         // A reindex rebuilds each manifest entry from scratch; provenance set
         // out-of-band by the importer must be carried over, not wiped.
         reindex(tmp.path(), None, None, None).unwrap();
+        let after = recorded(tmp.path()).expect("provenance after reindex");
+        assert_eq!(after.item_id, "item-1");
         assert_eq!(
-            recorded(tmp.path())
-                .expect("provenance after reindex")
-                .item_id,
-            "item-1"
+            after.review_status,
+            Some(4),
+            "review rating survives reindex"
         );
     }
 

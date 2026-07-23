@@ -100,8 +100,8 @@ fn router(base: String) -> Router {
         )
 }
 
-/// Read one of the manifest's JSON arrays under `<home>/index` (the manifest is
-/// split into `waczs.json` and `collections.json`, each a top-level array).
+/// Read the derived `waczs.json` array under `<home>/index` (collection
+/// descriptive metadata lives in `<home>/collections/*.md` finding aids).
 fn manifest_array(home: &Path, file: &str) -> Vec<Value> {
     let text = std::fs::read_to_string(home.join("index").join(file)).unwrap();
     serde_json::from_str::<Value>(&text)
@@ -152,12 +152,17 @@ fn import_a_collection_then_skip_on_rerun() {
     assert_eq!(waczs[0]["browsertrix"]["item_id"], "item1");
     assert_eq!(waczs[0]["browsertrix"]["resource_hash"], "sha256:deadbeef");
     // No --into was passed, so importing the Browsertrix "News" collection
-    // should auto-create a matching rustyweb collection (not scatter singletons).
+    // should auto-create a matching rustyweb finding aid (not scatter singletons).
+    let news_md = home.path().join("collections/news.md");
     assert!(
-        manifest_array(home.path(), "collections.json")
-            .iter()
-            .any(|c| c["name"] == "News"),
-        "importing a collection should group its crawls into a same-named rustyweb collection"
+        news_md.exists(),
+        "importing a collection should create a collections/news.md finding aid"
+    );
+    assert!(
+        std::fs::read_to_string(&news_md)
+            .unwrap()
+            .contains("name: News"),
+        "the finding aid front-matter should carry the collection name"
     );
 
     // Re-run: the crawl is already imported, so it's skipped (no duplicate).

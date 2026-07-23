@@ -522,6 +522,9 @@ async fn collection_page(
     if let Some(r) = &range {
         meta.push(views::MetaRow::new("Capture dates", r.clone()));
     }
+    if let Some(q) = capture_quality(&merged_status_counts(&members)) {
+        meta.push(views::MetaRow::new("Capture quality", q));
+    }
     let created = c.created.get(..10).unwrap_or(&c.created);
     meta.push(views::MetaRow::new("Created", created));
 
@@ -545,14 +548,19 @@ async fn collection_page(
         .unwrap_or_default();
     let facets = scoped_facet_sections(&overview, &format!("collection:{id}"));
 
-    views::collection(
-        &c.name,
-        c.description.as_deref(),
-        &meta,
-        &facets,
-        &member_items,
-    )
-    .into_response()
+    let page = views::CollectionPage {
+        name: c.name.clone(),
+        description: c.description.clone(),
+        narrative: c.narrative.as_deref().map(crate::markdown::render),
+        creator: c.creator.clone(),
+        dates: c.dates.clone(),
+        rights: c.rights.clone(),
+        subjects: c.subjects.clone(),
+        meta,
+        facets,
+        members: member_items,
+    };
+    views::collection(&page).into_response()
 }
 
 /// Build the scoped facet sections for a detail page. Each dimension becomes a
@@ -665,6 +673,9 @@ async fn crawl_page(
             "Source",
             format!("Browsertrix ({host})"),
         ));
+        if let Some(rating) = bt.review_status {
+            provenance.push(views::MetaRow::new("Review", review_label(rating)));
+        }
         if !bt.item_id.is_empty() {
             provenance.push(views::MetaRow::mono("Browsertrix item", bt.item_id.clone()));
         }
@@ -681,6 +692,21 @@ async fn crawl_page(
     if let Some(rb) = &c.robots {
         provenance.push(views::MetaRow::new("Robots", rb.clone()));
     }
+    if let Some(h) = &c.hostname {
+        provenance.push(views::MetaRow::mono("Crawl host", h.clone()));
+    }
+    if let Some(p) = &c.is_part_of {
+        provenance.push(views::MetaRow::new("Part of", p.clone()));
+    }
+    if let Some(ct) = &c.conforms_to {
+        provenance.push(views::MetaRow::mono("Conforms to", ct.clone()));
+    }
+    if !c.keywords.is_empty() {
+        provenance.push(views::MetaRow::new("Keywords", c.keywords.join(", ")));
+    }
+    if !c.licenses.is_empty() {
+        provenance.push(views::MetaRow::new("License", c.licenses.join(", ")));
+    }
     if let Some(n) = c.nested_waczs {
         provenance.push(views::MetaRow::new(
             "Multi-WACZ",
@@ -693,14 +719,23 @@ async fn crawl_page(
     if let Some(n) = c.page_count {
         provenance.push(views::MetaRow::new("Pages", n.to_string()));
     }
+    if let Some(q) = capture_quality(&c.status_counts) {
+        provenance.push(views::MetaRow::new("Capture quality", q));
+    }
     if let Some(range) = capture_range(c) {
         provenance.push(views::MetaRow::new("Capture dates", range));
+    }
+    if let Some(m) = &c.modified {
+        let m = m.get(..10).unwrap_or(m);
+        provenance.push(views::MetaRow::new("WACZ modified", m.to_string()));
     }
 
     let page = views::CrawlPage {
         crumb,
         name: c.name.clone(),
         description: c.description.clone(),
+        note: crate::collections::read_crawl_note(&state.home, &id)
+            .map(|n| crate::markdown::render(&n)),
         thumb: thumb_href(&state.index_dir, &id),
         replay_href,
         // Fetched from a remote host at replay time, not stored in <home>/archive.
@@ -1106,6 +1141,66 @@ fn capture_range(c: &Wacz) -> Option<String> {
     }
 }
 
+/// A compact "capture quality" summary of an HTTP status histogram: total
+/// captures, the share that succeeded (2xx/3xx), and the notable failing codes.
+/// The derived DACS Appraisal signal — surfaces the 404/403/504 "absences" that
+/// a clean-looking crawl can hide.
+fn capture_quality(counts: &std::collections::BTreeMap<u16, u64>) -> Option<String> {
+    let total: u64 = counts.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let ok: u64 = counts
+        .iter()
+        .filter(|(c, _)| (200..400).contains(*c))
+        .map(|(_, n)| n)
+        .sum();
+    let ok_pct = (ok as f64 / total as f64 * 100.0).round() as u64;
+    let mut s = format!("{total} captures, {ok_pct}% ok");
+    // Notable failing codes (>= 400), most frequent first.
+    let mut bad: Vec<(u16, u64)> = counts
+        .iter()
+        .filter(|(c, _)| **c >= 400)
+        .map(|(c, n)| (*c, *n))
+        .collect();
+    bad.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    if !bad.is_empty() {
+        let parts: Vec<String> = bad
+            .iter()
+            .take(4)
+            .map(|(c, n)| format!("{c}×{n}"))
+            .collect();
+        s.push_str(" — ");
+        s.push_str(&parts.join(", "));
+    }
+    Some(s)
+}
+
+/// Map a Browsertrix QA review rating (1–5) to its label, with the raw value —
+/// a DACS Appraisal signal ("this crawl was reviewed and judged …").
+fn review_label(rating: u8) -> String {
+    let word = match rating {
+        5 => "Excellent",
+        4 => "Good",
+        3 => "Fair",
+        2 => "Poor",
+        1 => "Bad",
+        _ => "Reviewed",
+    };
+    format!("{word} ({rating}/5)")
+}
+
+/// Merge the per-crawl status histograms across a collection's members.
+fn merged_status_counts(members: &[&Wacz]) -> std::collections::BTreeMap<u16, u64> {
+    let mut agg = std::collections::BTreeMap::new();
+    for w in members {
+        for (code, n) in &w.status_counts {
+            *agg.entry(*code).or_insert(0) += *n;
+        }
+    }
+    agg
+}
+
 /// The deduped union of software across a collection's member WACZs.
 fn collection_software(members: &[&Wacz]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -1202,6 +1297,23 @@ fn format_timestamp(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_quality_summarizes_status_histogram() {
+        use std::collections::BTreeMap;
+        let mut c = BTreeMap::new();
+        c.insert(200u16, 96u64);
+        c.insert(301, 2);
+        c.insert(404, 1);
+        c.insert(504, 1);
+        let s = capture_quality(&c).unwrap();
+        // 2xx+3xx are "ok": (96+2)/100 = 98%.
+        assert!(s.starts_with("100 captures, 98% ok"), "{s}");
+        // Failing codes surfaced, most frequent first.
+        assert!(s.contains("404×1") && s.contains("504×1"), "{s}");
+        // Empty histogram → nothing to show.
+        assert!(capture_quality(&BTreeMap::new()).is_none());
+    }
 
     #[test]
     fn active_filters_extracts_facet_tokens_only() {

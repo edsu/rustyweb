@@ -472,6 +472,7 @@ async fn crawl_page_shows_browsertrix_provenance() {
         "https://app.browsertrix.com",
         "item-xyz",
         "sha256:aa",
+        Some(5),
     )
     .unwrap();
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();

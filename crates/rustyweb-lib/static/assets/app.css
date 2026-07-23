@@ -100,6 +100,21 @@ h2 { font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 0.4rem; }
   display: inline-block;
 }
 
+/* Finding-aid "About this collection" front-matter: curator prose (rendered
+   Markdown) as lead, then the curatorial metadata table, set apart from the
+   derived/technical aggregates that follow. */
+.about { margin: 0 0 1.75rem; }
+.about .narrative { color: #333; font-size: 0.95rem; line-height: 1.55; margin: 0.4rem 0 1rem; }
+.about .narrative > :first-child { margin-top: 0; }
+.about .narrative h2 { font-size: 1.05rem; border: none; padding: 0; margin: 1rem 0 0.3rem; }
+.about .narrative h3 { font-size: 0.95rem; margin: 0.8rem 0 0.3rem; }
+.about .narrative p { margin: 0.5rem 0; }
+.about .narrative ul, .about .narrative ol { margin: 0.5rem 0; padding-left: 1.3rem; }
+.about .narrative blockquote { margin: 0.6rem 0; padding-left: 0.8rem; border-left: 3px solid #e0e4e8; color: #555; }
+.about .narrative code { background: #eef1f4; padding: 0.05rem 0.3rem; border-radius: 3px; font-family: monospace; font-size: 0.85em; }
+.nudge { font-size: 0.9rem; line-height: 1.5; margin: 0.4rem 0 1rem; }
+.nudge code { background: #f2f4f6; padding: 0.05rem 0.3rem; border-radius: 3px; font-family: monospace; font-size: 0.85em; color: #444; }
+
 /* Metadata tables (collection/wacz pages) */
 table.meta { border-collapse: collapse; font-size: 0.9rem; margin-bottom: 2rem; }
 table.meta th { text-align: left; padding: 0.3rem 1rem 0.3rem 0; color: #666; font-weight: 600; vertical-align: top; white-space: nowrap; }

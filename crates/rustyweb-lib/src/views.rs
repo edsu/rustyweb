@@ -516,29 +516,98 @@ fn source_badge(remote: bool) -> Markup {
     }
 }
 
-/// The collection detail page: metadata + facets, then a grid of the member
+/// Everything the collection detail page renders. Read like a finding aid: the
+/// curatorial front-matter (`narrative` prose + the structured `creator`/`dates`
+/// /`rights`/`subjects`) leads, visually separated from the derived/technical
+/// aggregates in `meta`. The handler resolves the data; the view lays it out.
+pub struct CollectionPage {
+    pub name: String,
+    /// Short abstract/caption shown under the title.
+    pub description: Option<String>,
+    /// The rendered (safe-HTML) Markdown narrative — Scope & Content / Custodial
+    /// history / Appraisal.
+    pub narrative: Option<PreEscaped<String>>,
+    pub creator: Option<String>,
+    pub dates: Option<String>,
+    pub rights: Option<String>,
+    pub subjects: Vec<String>,
+    /// Derived/technical aggregates (Crawls / Size / Software / Capture dates /
+    /// Created).
+    pub meta: Vec<MetaRow>,
+    pub facets: Vec<FacetSection>,
+    pub members: Vec<MemberItem>,
+}
+
+impl CollectionPage {
+    /// Whether any curatorial finding-aid field is populated (drives the About
+    /// block vs. the empty-state nudge).
+    fn has_curatorial(&self) -> bool {
+        self.narrative.is_some()
+            || self.creator.is_some()
+            || self.dates.is_some()
+            || self.rights.is_some()
+            || !self.subjects.is_empty()
+    }
+
+    /// The curatorial (finding-aid) metadata table, with DACS-labelled rows.
+    fn curatorial_rows(&self) -> Vec<MetaRow> {
+        let mut rows = Vec::new();
+        if let Some(v) = &self.creator {
+            rows.push(MetaRow::new("Creator", v.clone()));
+        }
+        if let Some(v) = &self.dates {
+            rows.push(MetaRow::new("Dates", v.clone()));
+        }
+        if let Some(v) = &self.rights {
+            rows.push(MetaRow::new("Rights", v.clone()));
+        }
+        if !self.subjects.is_empty() {
+            rows.push(MetaRow::new("Subjects", self.subjects.join(", ")));
+        }
+        rows
+    }
+}
+
+/// The collection detail page: a finding-aid front-matter (narrative + curatorial
+/// table) above the derived aggregates and facets, then a grid of the member
 /// crawls, each with its own representative image (a collection spans multiple
 /// crawls of multiple sites, so the grid conveys that breadth better than one
 /// hero image would).
-pub fn collection(
-    name: &str,
-    description: Option<&str>,
-    meta: &[MetaRow],
-    facets: &[FacetSection],
-    members: &[MemberItem],
-) -> Markup {
+pub fn collection(p: &CollectionPage) -> Markup {
+    let curatorial = p.curatorial_rows();
     let body = html! {
         (top_bar(None))
-        h1.page-title { (name) }
-        @if let Some(d) = description { p.desc { (d) } }
-        (meta_table(meta))
-        (facet_browse(facets))
+        h1.page-title { (p.name) }
+        @if let Some(d) = &p.description { p.desc { (d) } }
+
+        section.about {
+            h2 { "About this collection" }
+            @if p.has_curatorial() {
+                @if let Some(n) = &p.narrative { div.narrative { (n) } }
+                @if !curatorial.is_empty() { (meta_table(&curatorial)) }
+            } @else {
+                // Empty-state nudge: name the DACS single-level minimum
+                // curatorial elements that are missing, with archival authority.
+                p.muted.nudge {
+                    "No finding-aid description yet. Add the essentials a reader needs — "
+                    "who gathered it (Creator), why it was archived (Scope & Content), and "
+                    "who may use it (Access): "
+                    code { "rustyweb collection set \"" (p.name) "\" --creator \"…\"" }
+                    " — or edit "
+                    code { "collections/" (crate::collections::slugify(&p.name)) ".md" }
+                    "."
+                }
+            }
+        }
+
+        @if !p.meta.is_empty() { (meta_table(&p.meta)) }
+        (facet_browse(&p.facets))
         h2 { "Crawls" }
-        @if members.is_empty() {
+        @if p.members.is_empty() {
             p.muted { "No crawls in this collection." }
         } @else {
             div.cards {
-                @for m in members {
+                @for m in &p.members {
                     div.card {
                         a.card-thumb href=(format!("/crawl/{}", m.id)) {
                             (thumb_area(m.thumb.as_deref(), &m.name))
@@ -554,13 +623,13 @@ pub fn collection(
                                 span.status.missing { "✗" }
                             }
                         }
-                        @if let Some(p) = &m.provenance { div.prov { (p) } }
+                        @if let Some(pr) = &m.provenance { div.prov { (pr) } }
                     }
                 }
             }
         }
     };
-    layout(&format!("{name} - rustyweb"), body)
+    layout(&format!("{} - rustyweb", p.name), body)
 }
 
 // ── Crawl detail ─────────────────────────────────────────────────────────────
@@ -579,6 +648,8 @@ pub struct CrawlPage {
     pub crumb: Option<(String, String)>,
     pub name: String,
     pub description: Option<String>,
+    /// The rendered (safe-HTML) Markdown curator note from `crawls/<id>.md`.
+    pub note: Option<PreEscaped<String>>,
     /// `/thumb/{id}` for this crawl's representative image, if it has one.
     pub thumb: Option<String>,
     pub replay_href: String,
@@ -612,6 +683,13 @@ pub fn crawl(p: &CrawlPage) -> Markup {
         }
         @if let Some(d) = &p.description { p.desc { (d) } }
         a.replay-btn href=(p.replay_href) { "Replay →" }
+
+        @if let Some(n) = &p.note {
+            section.about {
+                h2 { "Curator's note" }
+                div.narrative { (n) }
+            }
+        }
 
         @if !p.provenance.is_empty() {
             h2 { "Provenance" }

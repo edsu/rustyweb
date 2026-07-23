@@ -62,24 +62,26 @@ rustyweb/
 rustyweb index          [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
 rustyweb reindex        [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve          [--home <DIR>] [--bind <ADDR>]
-rustyweb collection set [--home <DIR>] <COLLECTION> <WACZ_ID>...
+rustyweb collection set [--home <DIR>] <NAME> [--description <TEXT>] [--curator <TEXT>] [--creator <TEXT>] [--dates <TEXT>] [--rights <TEXT>] [--subject <SUBJECT>]... [--narrative <MD> | --narrative-file <FILE>]
 rustyweb collection list[--home <DIR>]
-rustyweb crawl set      [--home <DIR>] <CRAWL_ID> --image <FILE>
+rustyweb crawl set      [--home <DIR>] <CRAWL_ID> [--image <FILE>] [--note <MD> | --note-file <FILE>]
 rustyweb search-url     [--home <DIR>] <URL>
 rustyweb verify         [--home <DIR>]
 rustyweb import browsertrix [--home <DIR>] [--host <URL>] [--org <SLUG>] [--collection <ID|SLUG>] [--crawl <ID>] [--into <NAME>] [--include-unreviewed] [--min-review <N>] [--limit <N>] [--dry-run] [--stream] [--force] [-v]
 ```
 
-Every command takes `--home <DIR>` (default `.`). The home directory holds two
-derived siblings: `<home>/archive/` (WACZ files) and `<home>/index/` (Tantivy
-index + the JSON manifest, see *Collection Management*). Keeping them together
-makes a home folder portable - move it to another disk or machine and it still
-resolves.
+Every command takes `--home <DIR>` (default `.`). The home directory holds
+`<home>/archive/` (WACZ files) and the derived `<home>/index/` (Tantivy index +
+`waczs.json`), alongside the git-committable curatorial `<home>/collections/`
+and `<home>/crawls/` finding aids (see *Collection Management*). Keeping them
+together makes a home folder portable - move it to another disk or machine and
+it still resolves.
 
 - `index`: indexes one or more `.wacz` files or `http(s)://` URLs - at least one argument is required. **CDX-guided extraction is the default** for every WACZ (local or remote), reading only the records the CDX lists; a remote URL is read over HTTP range requests with no download, a local file straight from disk (see *Indexing Pipeline*). It falls back to a full WARC scan only when a WACZ can't be CDX-guided (deflated WARCs, or no readable CDX). `--download` fetches a remote WACZ into `<home>/archive` for a durable local copy instead of streaming it in place. A local WACZ must already live under `<home>/archive`; rustyweb indexes it in place (it does *not* copy files for you) and stores the source relative to home. A path outside the archive folder, a directory, or a non-`.wacz` file is an error with guidance; index several at once with a shell glob (`rustyweb index archive/*.wacz`). Extracts searchable page text (HTML, rendered `urn:text` or `pages/*.jsonl` text, PDFs), reads `datapackage.json` + `warcinfo` for provenance, records the SHA-256 of each local WACZ, and updates the manifest. `--collection <NAME>` groups the given WACZs under a curated collection (created if new); without it, each WACZ is its own singleton collection. `--from-file <FILE>` (or `-f -` for stdin) reads a newline-delimited list of files/URLs, ignoring blank lines and `#` comments, and combines with any positional args. Progress is shown as a bar on an interactive terminal; `-v`/`--verbose` replaces it with `DEBUG` logs (see *Indexing Pipeline → Progress reporting*). (A bare `index` with no arguments prints guidance pointing to `index archive/*.wacz` and `reindex`.)
 - `reindex`: rebuild the full-text index from the sources already recorded in the manifest, preserving collection membership and metadata. Unlike `index`, this re-indexes every registered source - including remote URLs, which are re-fetched - and recreates the Tantivy index from scratch, so a schema change is picked up. It is *resilient*: a source that can't be indexed - a missing local file, or a remote source still failing after the retry budget - is skipped with a warning rather than aborting the whole rebuild, so one bad source can't torch a long reindex over many. The skipped source's manifest entry is preserved, the mostly-rebuilt index is still committed (usable), and if anything was skipped the command exits non-zero with a summary count - so a partial rebuild is visible to a human *and* to cron/CI, and re-running once the cause is fixed picks the skipped sources back up. Like `index`, it takes `--concurrency <N>` (records fetched at once per source) and shows the same per-WACZ progress bar on an interactive terminal (`-v`/`--verbose` swaps it for `DEBUG` logs) - welcome here since a full reindex re-streams every source. This is the intended way to migrate the index after a schema change (see below).
 - `serve`: opens Tantivy read-only (so `index` can run concurrently), starts Axum. Defaults: `127.0.0.1:8080`.
-- `collection set` / `collection list`: reassign WACZs to a collection (by WACZ id) / list collections and their members. Metadata like description and curator is edited in `collections.json` directly.
+- `collection set` / `collection list`: create/update a collection's finding-aid metadata / list collections and their members. `collection set` writes the structured front-matter fields (`--creator`/`--dates`/`--rights`/`--subject`, plus `--description`/`--curator`) and the narrative body (`--narrative[-file]`) to a committable `collections/<slug>.md`; a curator can also just hand-edit that file (see *Collection Management*). (WACZ→collection membership is set at index/import time via `index --collection`.)
+- `crawl set`: set curator-controlled crawl properties — `--image` pins a representative thumbnail, `--note[-file]` writes a committable Markdown note to `crawls/<id>.md`.
 - `search-url`: opens each indexed WACZ, reads its internal `indexes/index.cdx.gz`, and prints all CDX records matching the given URL. Useful for debugging - does not require the CDX to be separately indexed.
 - `verify`: re-hashes every WACZ in the manifest and compares against the stored SHA-256, reporting each as `OK`, `MODIFIED`, or `MISSING`. Exits non-zero on any failure so it can run unattended (cron/CI). This is the fixity check for the archive.
 - `import <source>`: a group of importers that pull content from external web-archiving services (each source is its own subcommand, since their auth and selection differ; grouped so future sources — Archive-It, a WARC→WACZ builder — are siblings rather than new top-level verbs). `import browsertrix` authenticates to a [Browsertrix](https://browsertrix.com/) instance (credentials from `BROWSERTRIX_USER`/`BROWSERTRIX_PASSWORD` or `BROWSERTRIX_TOKEN` in the environment, never argv), resolves the org, and for each selected archived item **downloads** the WACZ into `<home>/archive/<item-id>/` (a per-item subfolder, so two items can't clash on a shared resource filename) via its presigned `replay.json` URL and indexes it as a durable local (File) source. Downloading (rather than streaming in place) is the default because Browsertrix presigned URLs expire in ~48h, so a naive streamed source would break replay. **`--stream`** opts into an index-only footprint instead: the manifest stores a `Source::Browsertrix { host, org, item, resource }` (stable identity, encoded `browsertrix|…`), not a URL, and a fresh presigned URL is re-resolved on demand — at index/reindex time, and at replay time by the server (`serve_file` 302-redirects to a freshly-resolved URL, cached under its expiry). Resolution is done by a bin-provided `index::SourceResolver` (the library never touches credentials); `serve` builds one from the same `BROWSERTRIX_*` env vars, so streamed crawls replay only when the server has credentials (503 otherwise). Selection: `--collection <ID|SLUG|NAME>` (resolved to the collection UUID the API requires) or `--crawl <ID>`; default is the whole org. **QA filter:** by default only crawls a reviewer has QA'd in Browsertrix (`reviewStatus` set) are imported; `--include-unreviewed` / `--min-review <1-5>` adjust this, and a single named `--crawl` is always included. **Incremental:** provenance recorded on each crawl (`browsertrix` field in the manifest: host, item id, resource hash) lets a re-run skip already-imported items unless `--force`. Importing a `--collection` groups its crawls into a rustyweb collection of the same name (`--into <NAME>` overrides, and groups org-wide/single-crawl imports); `--dry-run` lists without downloading. The HTTP client (`browsertrix.rs`) is transport-abstracted for testing (mirrors `http_range::RangeFetch`). See *Indexing Pipeline*.
@@ -194,31 +196,90 @@ WACZ's manifest entry.
 Fields extracted:
 - `title` - WACZ display name (falls back to filename stem)
 - `description` - free-text description
-- `created` - ISO 8601 crawl date
+- `created` / `modified` - ISO 8601 crawl / packaging dates
 - `software` - crawler/packager software (also enriched from the WARC `warcinfo`)
+- `keywords` / `licenses` - Frictionless Data Package extension fields (WACZ spec-blessed),
+  surfaced as crawl keywords and a license/rights signal
+- `warcinfo` `isPartOf` / `hostname` / `conformsTo` - previously parsed but dropped; now stored
 - Seed pages - first entries from the `pages` array (url, title, timestamp)
+- **Capture-quality histogram** - HTTP status codes tallied from the CDX at index time (every
+  capture, including the bodyless 4xx/5xx that never become search documents), stored compactly
+  as `status_counts` on the crawl. Surfaces the 404/403/504 "absences" a clean-looking crawl can
+  hide (a derived DACS *Appraisal* signal); no per-capture index bloat.
 
 The crawl detail page shows this per crawl; the collection page aggregates it across members.
+All fields are conditional, and the crawl-level ones populate on **reindex**.
 
 ---
 
 ## Collection Management
 
-The manifest is **two files** under `<home>/index/`, written by `rustyweb index` and read by
-`rustyweb serve` - collections (curated groups) and the WACZs that belong to them:
+The manifest splits into a **git-committable curatorial layer** (the finding aids) and a
+**derived index** (rebuildable from the WACZs). The line is: *curatorial = committed prose;
+derived = rebuildable index.*
+
+```
+<home>/
+  collections/            # curator source of truth — commit this
+    demo.md               #   one Markdown finding aid per collection
+  crawls/                 # commit this
+    e02536ec.md           #   an optional per-crawl curator note
+  index/                  # derived — add to .gitignore
+    waczs.json            #   WACZ membership + extracted/derived provenance
+    full_text/            #   the Tantivy index
+    thumbs/               #   representative-image cache
+```
+
+Recommended for a curator keeping their home in git: `echo '/index' >> .gitignore` and
+`git add collections/ crawls/`.
+
+### Finding aids (`collections/<id>.md`)
+
+Each collection's descriptive metadata is a Markdown file with YAML **front-matter** (the short
+structured fields) and a Markdown **body** (the narrative). The file is the source of truth:
+`rustyweb collection set …` writes it, and a curator can equally hand-edit and commit it; the id
+is the filename stem.
+
+```markdown
+---
+name: SUCHO Ukraine
+created: 2026-07-01T00:00:00Z
+creator: Saving Ukrainian Cultural Heritage Online   # DACS Name of Creator / EAD <origination>
+dates: 2022–2023                                      # coverage statement / EAD <unitdate>
+rights: See individual sites; archived for research  # access & use / EAD <userestrict>
+subjects: [ukraine, cultural heritage]               # access points / EAD <controlaccess>
+---
+## Scope and Content
+Why this was archived… (EAD <scopecontent>)
+
+## Custodial History and Appraisal
+How it was acquired, why these seeds, and what is *absent* (EAD <custodhist>/<appraisal>).
+```
+
+The fields are framed against **DACS** / **EAD** (see *Discovery, Provenance & Collections*
+below) rather than flat Dublin Core: the collection is described richly once (the `archdesc`),
+and Scope & Content / Custodial history / Appraisal collapse into the one narrative body (a
+finding aid is a prose document with sections, not a set of columns). The body is rendered to a
+**safe HTML subset** (`markdown.rs`: raw HTML escaped, link/image schemes restricted to
+http/https/mailto, images neutralized to alt text) since curator- and importer-supplied content
+is untrusted. Curator/importer edits merge with a *fill gaps, curator wins* policy
+(`CollectionFields`): an importer sets a field only when it is still empty, so hand edits survive
+re-sync. A legacy `index/collections.json` is read once and migrated to `.md` on the next save.
+
+Per-crawl notes live in `crawls/<id>.md` (plain Markdown), for documenting a single crawl's
+context or absences without repeating the collection-level description (DACS multilevel
+inheritance).
+
+### Derived index (`index/waczs.json`)
+
+WACZ membership and extracted/derived provenance stay in the derived index, rebuilt on reindex:
 
 ```jsonc
-// collections.json - one entry per curated collection
-[
-  { "id": "demo", "name": "Demo", "description": "A test set", "curator": null,
-    "created": "2026-07-01T00:00:00Z" }
-]
-
 // waczs.json - one entry per WACZ member
 [
   {
     "id": "e02536ec",
-    "collection": "demo",                       // -> collections.json id
+    "collection": "demo",                       // -> a collections/<id>.md finding aid
     "source": "archive/attar.wacz",
     "name": "Attar Silas",
     "date_indexed": "2026-07-01T00:00:00Z",
@@ -234,7 +295,7 @@ The manifest is **two files** under `<home>/index/`, written by `rustyweb index`
 - `source`: a local file path (stored relative to `<home>` when under it, e.g. `archive/attar.wacz`; absolute otherwise) or an `http(s)://` URL. Relative paths resolve against `<home>` at serve time, so the whole home folder is portable.
 - `id`: first 8 hex chars of SHA-256 of the source string - relative sources give IDs that are stable across moves. Collection ids are slugs of the collection name.
 - Re-indexing the same source upserts its WACZ entry; a WACZ with no `--collection` gets a singleton collection of its own.
-- An older single-file `collections.json` (flat, per-WACZ with a `source` key) is detected and **migrated** on open into the two-file form.
+- Collection descriptive metadata lives in `collections/<id>.md` (above), not in the index. An older single-file `collections.json` (flat, per-WACZ with a `source` key) or a `collections.json` groups file is detected and **migrated** to `waczs.json` + `collections/*.md` on the next save.
 - For a **file** source, `GET /files/{id}` streams the registered file with byte-range support; only registered files are served, so arbitrary filesystem access is not possible.
 - For a **URL** source, replay points wabac.js directly at the remote URL (the host must provide range + CORS); `GET /files/{id}` just redirects there. rustyweb never proxies remote bytes.
 
@@ -294,14 +355,35 @@ item's actual type.)
 
 ### Provenance
 
-rustyweb extracts provenance from the WACZ/WARC and presents it **prominently** - a
-provenance panel on the WACZ detail page and a compact provenance line on collection member
-listings - rather than tucking it away. Sources used:
+rustyweb distinguishes **curatorial** provenance (who/why/scope, at the collection level) from
+**technical/derived** provenance (how it was captured, at the crawl level), and presents both
+**prominently** rather than tucking them away.
 
-- **`datapackage.json`** (WACZ 1.1.1): `title`, `description`, `created`, `software`.
+**Curatorial** provenance is the finding aid (*Collection Management* above), framed against
+**DACS** and its EAD encoding rather than flat Dublin Core — because DACS supplies the *shape*
+archivists expect: multilevel description with inheritance (describe the collection richly once;
+a crawl adds only a differentiating note), and an emphasis on Creator, Scope & Content, and
+access conditions. The collection page reads like a finding aid: an "About this collection"
+front-matter (rendered narrative + a curatorial `Creator`/`Dates`/`Rights`/`Subjects` table)
+above the facets, set apart from the derived aggregates. When those fields are empty the page
+shows a muted nudge naming the DACS single-level *minimum* curatorial elements — Creator, Scope
+& Content, Access — so the prompt carries archival authority. The importer(s) map source
+metadata onto the same model (`CollectionFields`), and the model is the union target for
+Browsertrix and Archive-It so both map cleanly.
+
+**Technical/derived** provenance is extracted from the WACZ/WARC and shown in the crawl page's
+provenance panel plus a compact line on collection member listings. Sources used:
+
+- **`datapackage.json`** (WACZ 1.1.1): `title`, `description`, `created`, `modified`, `software`,
+  and the Frictionless extension fields `keywords` / `licenses`.
 - **WARC `warcinfo` record** (`application/warc-fields`, one per WARC, read by `warc.rs`):
-  `software`, `operator`, `http-header-user-agent`, `robots`.
+  `software`, `operator`, `http-header-user-agent`, `robots`, `isPartOf`, `hostname`,
+  `conformsTo`.
 - **Timestamps**: capture date range (earliest/latest) and page counts.
+- **Capture quality** (a derived DACS *Appraisal* signal): the HTTP status histogram tallied
+  from the CDX (see *Collection Metadata*), surfacing failed/blocked captures. Plus the
+  Browsertrix QA `reviewStatus` (1–5, Excellent→Bad) carried onto imported crawls — the machine
+  and human sides of "documenting absences".
 
 Fixity is verifiable with `rustyweb verify` (re-hashing each WACZ against the stored
 SHA-256). Signature-based authenticity (`datapackage-digest.json`, the WACZ auth spec) is
