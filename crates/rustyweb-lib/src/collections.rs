@@ -335,6 +335,11 @@ impl Manifest {
         let collections_dir = home.join("collections");
         let mut dirty = HashSet::new();
 
+        // Migrate an earlier flat layout (`collections/<slug>.md`) into the
+        // per-collection dir form (`collections/<slug>/README.md`), preserving
+        // curator-authored prose. Best-effort; harmless once already migrated.
+        migrate_flat_finding_aids(&collections_dir);
+
         // ── WACZ members (derived index) ──
         let waczs: Vec<Wacz> = if waczs_path.exists() {
             read_json(&waczs_path)?.unwrap_or_default()
@@ -569,6 +574,29 @@ struct FrontMatter {
 /// notes, pinned/collection thumbnails).
 pub fn collection_dir(home: &Path, slug: &str) -> PathBuf {
     home.join("collections").join(slug)
+}
+
+/// Migrate any flat `collections/<slug>.md` finding aids into the per-collection
+/// directory form `collections/<slug>/README.md`. Best-effort and idempotent: a
+/// flat file is moved only when its target `README.md` doesn't already exist.
+fn migrate_flat_finding_aids(collections_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(collections_dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().is_some_and(|x| x == "md") && path.is_file() {
+            let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let target = collections_dir.join(slug).join("README.md");
+            if !target.exists() {
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::rename(&path, &target);
+            }
+        }
+    }
 }
 
 /// Whether `collections_dir` holds at least one `<slug>/README.md` finding aid.
@@ -1205,6 +1233,30 @@ mod tests {
         );
         m.save().unwrap();
         assert!(tmp.path().join("collections/old/README.md").exists());
+    }
+
+    #[test]
+    fn flat_finding_aid_migrates_to_subdir_on_open() {
+        // A home from the earlier flat layout (collections/<slug>.md) is migrated
+        // to collections/<slug>/README.md, preserving the curator's prose.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("collections");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sucho.md"),
+            "---\nname: SUCHO\ncreated: 2026-01-01T00:00:00Z\n---\n\n## Scope\n\nWhy.\n",
+        )
+        .unwrap();
+
+        let m = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert!(
+            dir.join("sucho/README.md").is_file(),
+            "flat file migrated into the collection dir"
+        );
+        assert!(!dir.join("sucho.md").exists(), "flat file removed");
+        let c = m.collection_by_id("sucho").unwrap();
+        assert_eq!(c.name, "SUCHO");
+        assert_eq!(c.narrative.as_deref(), Some("## Scope\n\nWhy."));
     }
 
     #[test]
