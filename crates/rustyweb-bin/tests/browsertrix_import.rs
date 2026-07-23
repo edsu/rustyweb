@@ -242,10 +242,10 @@ fn whole_org_import_defaults_the_collection_to_the_org_name() {
         home.path().join("archive/demo/item1/simple.wacz").exists(),
         "WACZ should land under archive/<org-slug>/"
     );
-    assert!(
-        home.path().join("collections/demo/README.md").exists(),
-        "a finding aid for the org-named collection should be created"
-    );
+    let aid = std::fs::read_to_string(home.path().join("collections/demo/README.md"))
+        .expect("a finding aid for the org-named collection should be created");
+    // With no --collection, the org name seeds `creator` (its display name "Demo").
+    assert!(aid.contains("creator: Demo"), "org name -> creator: {aid}");
     let waczs = manifest_array(home.path(), "waczs.json");
     assert_eq!(waczs.len(), 1);
     assert_eq!(waczs[0]["collection"], "demo");

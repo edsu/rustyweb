@@ -1322,11 +1322,7 @@ fn browsertrix_collection_fields(
 /// A human coverage-date string from a Browsertrix collection's ISO date range:
 /// the years, e.g. `2022–2023` (or just `2022` when they match / only one is set).
 fn date_range(earliest: Option<&str>, latest: Option<&str>) -> Option<String> {
-    let year = |d: Option<&str>| -> Option<String> {
-        d.and_then(|s| s.get(..4))
-            .filter(|y| y.chars().all(|c| c.is_ascii_digit()))
-            .map(str::to_string)
-    };
+    let year = |d: Option<&str>| d.and_then(rustyweb_lib::index::year_prefix);
     match (year(earliest), year(latest)) {
         (Some(a), Some(b)) if a == b => Some(a),
         (Some(a), Some(b)) => Some(format!("{a}\u{2013}{b}")),
@@ -1580,6 +1576,29 @@ mod tests {
         passes_review, resolve_collection, resolve_org, safe_component, safe_wacz_filename,
     };
     use rustyweb_lib::browsertrix::{Collection, Item, Org};
+
+    #[test]
+    fn date_range_years() {
+        use super::date_range;
+        assert_eq!(
+            date_range(Some("2022-01-01"), Some("2023-12-31")).as_deref(),
+            Some("2022\u{2013}2023")
+        );
+        assert_eq!(
+            date_range(Some("2022-01-01"), Some("2022-06-01")).as_deref(),
+            Some("2022")
+        );
+        assert_eq!(
+            date_range(Some("2022-01-01"), None).as_deref(),
+            Some("2022")
+        );
+        assert_eq!(
+            date_range(None, Some("2023-01-01")).as_deref(),
+            Some("2023")
+        );
+        assert_eq!(date_range(None, None), None);
+        assert_eq!(date_range(Some("garbage"), None), None);
+    }
 
     #[test]
     fn safe_component_neutralizes_traversal_and_separators() {

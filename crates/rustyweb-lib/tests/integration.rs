@@ -693,6 +693,38 @@ async fn collection_page_flags_missing_minimum_fields() {
 }
 
 #[tokio::test]
+async fn collection_page_nudge_lists_only_still_missing_minimum() {
+    // With a creator supplied, the "still needed" prompt names only the remaining
+    // DACS-minimum gaps (Scope & Content, Access & Use) — not Creator.
+    let tmp = make_index(&["a.wacz"]); // collection "test"
+    rustyweb_lib::index::set_collection(
+        tmp.path(),
+        "test",
+        &rustyweb_lib::collections::CollectionFields {
+            creator: Some("Someone".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    let resp = app
+        .oneshot(
+            Request::get("/collection/test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    // `&` renders escaped; the exact joined list proves Creator isn't included.
+    assert!(
+        html.contains("Still needed: Scope &amp; Content, Access &amp; Use"),
+        "nudge should list only the missing minimum fields: {html}"
+    );
+}
+
+#[tokio::test]
 async fn collection_page_shows_scoped_facets() {
     // The collection page carries a scoped facet overview: each value links into
     // a search restricted to this collection (`collection:<id>`), turning the page
