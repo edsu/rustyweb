@@ -75,6 +75,7 @@ pub fn router_with_resolver(
         .route("/collection/{id}", get(collection_page))
         .route("/crawl/{id}", get(crawl_page))
         .route("/thumb/{id}", get(thumb_handler))
+        .route("/collection-thumb/{id}", get(collection_thumb_handler))
         .route("/files/{id}", get(serve_file))
         .route("/replay/viewer", get(replay_viewer))
         .route("/api/search", get(search_api))
@@ -164,10 +165,13 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 // Capture date range (temporal span is meaningful at the
                 // collection level; per-tool software lives on the WACZ page).
                 date_range: members_capture_range(&members),
-                // Representative image: the first member crawl that has one.
-                thumb: members
-                    .iter()
-                    .find_map(|w| thumb_href(&state.index_dir, &w.id)),
+                // Representative image: a curator-set collection thumbnail if
+                // present, else the first member crawl that has one.
+                thumb: collection_thumb_href(&state.home, &c.id).or_else(|| {
+                    members
+                        .iter()
+                        .find_map(|w| thumb_href(&state.home, &state.index_dir, &w.collection, &w.id))
+                }),
                 // Which source kinds the members span — both true = mixed.
                 has_local: members.iter().any(|w| !w.source.is_remote()),
                 has_remote: members.iter().any(|w| w.source.is_remote()),
@@ -536,7 +540,7 @@ async fn collection_page(
             present: w.is_present(&state.home),
             remote: w.source.is_remote(),
             provenance: provenance_summary(w),
-            thumb: thumb_href(&state.index_dir, &w.id),
+            thumb: thumb_href(&state.home, &state.index_dir, &w.collection, &w.id),
         })
         .collect();
 
@@ -736,7 +740,7 @@ async fn crawl_page(
         description: c.description.clone(),
         note: crate::collections::read_crawl_note(&state.home, &c.collection, &id)
             .map(|n| crate::markdown::render(&n)),
-        thumb: thumb_href(&state.index_dir, &id),
+        thumb: thumb_href(&state.home, &state.index_dir, &c.collection, &id),
         replay_href,
         // Fetched from a remote host at replay time, not stored in <home>/archive.
         remote: c.source.is_remote(),
@@ -983,21 +987,26 @@ async fn asset_handler(
     serve_embedded_asset(SiteAssets::get(&path), &path, &headers)
 }
 
-/// The path to a crawl's cached thumbnail, if one was generated at index time.
-fn thumb_path(index_dir: &Path, crawl_id: &str) -> PathBuf {
-    index_dir.join("thumbs").join(format!("{crawl_id}.jpg"))
+/// The on-disk path to a crawl's thumbnail, preferring a curator's committed
+/// pinned image (`collections/<slug>/crawls/<id>.jpg`) over the auto-selected
+/// cache (`index/thumbs/<id>.jpg`). `None` if neither exists.
+fn thumb_path(home: &Path, index_dir: &Path, collection: &str, crawl_id: &str) -> Option<PathBuf> {
+    let pinned = crate::collections::pinned_thumb_path(home, collection, crawl_id);
+    if pinned.is_file() {
+        return Some(pinned);
+    }
+    let auto = index_dir.join("thumbs").join(format!("{crawl_id}.jpg"));
+    auto.is_file().then_some(auto)
 }
 
-/// The `/thumb/{id}` href for a crawl, or `None` if it has no cached thumbnail
-/// (the UI then shows a CSS placeholder). `id` is a crawl id.
-fn thumb_href(index_dir: &Path, crawl_id: &str) -> Option<String> {
-    thumb_path(index_dir, crawl_id)
-        .exists()
-        .then(|| format!("/thumb/{crawl_id}"))
+/// The `/thumb/{id}` href for a crawl, or `None` if it has no thumbnail (the UI
+/// then shows a CSS placeholder). `id` is a crawl id.
+fn thumb_href(home: &Path, index_dir: &Path, collection: &str, crawl_id: &str) -> Option<String> {
+    thumb_path(home, index_dir, collection, crawl_id).map(|_| format!("/thumb/{crawl_id}"))
 }
 
-/// Serve a crawl's cached representative thumbnail (a small JPEG under
-/// `<home>/index/thumbs`). 404 when the crawl has none.
+/// Serve a crawl's representative thumbnail (a committed pinned image under the
+/// collection, else the auto cache under `index/thumbs`). 404 when it has none.
 async fn thumb_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1007,7 +1016,44 @@ async fn thumb_handler(
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match std::fs::read(thumb_path(&state.index_dir, &id)) {
+    // Resolve the crawl's collection (needed for the committed pinned path).
+    let collection = Manifest::open(&state.index_dir)
+        .ok()
+        .and_then(|m| m.wacz_by_id(&id).map(|w| w.collection.clone()))
+        .unwrap_or_default();
+    let Some(path) = thumb_path(&state.home, &state.index_dir, &collection, &id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "image/jpeg"),
+                (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// The `/collection-thumb/{slug}` href for a collection, if a curator committed
+/// one at `collections/<slug>/thumbnail.jpg`.
+fn collection_thumb_href(home: &Path, slug: &str) -> Option<String> {
+    crate::collections::collection_thumb_path(home, slug)
+        .is_file()
+        .then(|| format!("/collection-thumb/{slug}"))
+}
+
+/// Serve a collection's curator-set representative thumbnail. 404 when unset.
+async fn collection_thumb_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match std::fs::read(crate::collections::collection_thumb_path(&state.home, &id)) {
         Ok(bytes) => (
             [
                 (axum::http::header::CONTENT_TYPE, "image/jpeg"),

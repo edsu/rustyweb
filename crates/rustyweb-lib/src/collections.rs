@@ -716,6 +716,22 @@ pub fn crawl_note_path(home: &Path, collection: &str, id: &str) -> PathBuf {
         .join(format!("{id}.md"))
 }
 
+/// Path to a crawl's curator-pinned thumbnail (committable, downscaled JPEG):
+/// `<home>/collections/<slug>/crawls/<id>.jpg`. Its *presence* is the pin marker
+/// — a pinned image lives with the finding aid and is never overwritten by
+/// (re)indexing (which only writes the auto cache under `index/thumbs/`).
+pub fn pinned_thumb_path(home: &Path, collection: &str, id: &str) -> PathBuf {
+    collection_dir(home, collection)
+        .join("crawls")
+        .join(format!("{id}.jpg"))
+}
+
+/// Path to a collection's curator-set representative thumbnail (committable):
+/// `<home>/collections/<slug>/thumbnail.jpg`.
+pub fn collection_thumb_path(home: &Path, collection: &str) -> PathBuf {
+    collection_dir(home, collection).join("thumbnail.jpg")
+}
+
 /// Read a crawl's Markdown note, if present and non-empty.
 pub fn read_crawl_note(home: &Path, collection: &str, id: &str) -> Option<String> {
     let text = std::fs::read_to_string(crawl_note_path(home, collection, id)).ok()?;

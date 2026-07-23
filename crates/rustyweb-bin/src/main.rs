@@ -306,6 +306,11 @@ enum CollectionCmd {
         #[arg(long = "subject", value_name = "SUBJECT")]
         subjects: Vec<String>,
 
+        /// Pin a representative image for the whole collection from a local
+        /// image file (PNG/JPEG/WebP/GIF), committed under the collection.
+        #[arg(long, value_name = "FILE")]
+        thumbnail: Option<PathBuf>,
+
         /// The Scope & Content / provenance narrative (Markdown) inline.
         #[arg(long, conflicts_with = "narrative_file")]
         narrative: Option<String>,
@@ -751,6 +756,7 @@ async fn main() -> Result<()> {
                 subjects,
                 narrative,
                 narrative_file,
+                thumbnail,
                 home,
             } => {
                 let narrative = match narrative_file {
@@ -769,10 +775,13 @@ async fn main() -> Result<()> {
                     narrative,
                 };
                 let id = rustyweb_lib::index::set_collection(&home, &name, &fields)?;
-                let md = home.join("collections").join(format!("{id}.md"));
+                if let Some(file) = &thumbnail {
+                    rustyweb_lib::index::set_collection_thumbnail(&home, &name, file)?;
+                }
+                let readme = home.join("collections").join(&id).join("README.md");
                 println!("collection \"{name}\" ({id}) updated");
                 if fields.narrative.is_none() {
-                    println!("  add a scope note by editing {}", md.display());
+                    println!("  add a scope note by editing {}", readme.display());
                 }
             }
             CollectionCmd::List { home } => {

@@ -331,6 +331,18 @@ pub fn set_collection(
     Ok(id)
 }
 
+/// Pin a curator-supplied local image as a collection's representative
+/// thumbnail, committed at `collections/<slug>/thumbnail.jpg`. The collection is
+/// identified by name (its slug); create it first with `collection set`.
+pub fn set_collection_thumbnail(home: &Path, name: &str, image_file: &Path) -> Result<()> {
+    let slug = crate::collections::slugify(name);
+    let dest = crate::collections::collection_thumb_path(home, &slug);
+    crate::thumbnail::set_manual(&dest, image_file)
+        .with_context(|| format!("setting thumbnail for collection {slug}"))?;
+    info!(collection = %slug, image = %image_file.display(), "pinned collection thumbnail");
+    Ok(())
+}
+
 /// Set (or clear) a crawl's curator note at `<home>/crawls/<id>.md`. Manifest-
 /// only side effect (no reindex); errors if the crawl id is unknown.
 pub fn set_crawl_note(home: &Path, crawl_id: &str, note: &str) -> Result<()> {
@@ -345,18 +357,19 @@ pub fn set_crawl_note(home: &Path, crawl_id: &str, note: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pin a curator-supplied local image as a crawl's representative thumbnail.
-/// Downscales + caches it and marks it pinned, so a later (re)index won't
-/// overwrite the choice. Manifest-only side effect (no reindex).
+/// Pin a curator-supplied local image as a crawl's representative thumbnail,
+/// committed under the collection (`collections/<slug>/crawls/<id>.jpg`) so it's
+/// git-trackable and a later (re)index won't overwrite it. Manifest-only side
+/// effect (no reindex).
 pub fn set_crawl_thumbnail(home: &Path, crawl_id: &str, image_file: &Path) -> Result<()> {
-    let index_dir = index_dir(home);
-    let manifest = Manifest::open(&index_dir)?;
-    if manifest.wacz_by_id(crawl_id).is_none() {
+    let manifest = Manifest::open(&index_dir(home))?;
+    let Some(wacz) = manifest.wacz_by_id(crawl_id) else {
         anyhow::bail!(
             "no crawl with id \"{crawl_id}\" - it's the id in the crawl's page URL (/crawl/<id>)"
         );
-    }
-    crate::thumbnail::set_manual(&index_dir.join("thumbs"), crawl_id, image_file)
+    };
+    let dest = crate::collections::pinned_thumb_path(home, &wacz.collection, crawl_id);
+    crate::thumbnail::set_manual(&dest, image_file)
         .with_context(|| format!("setting thumbnail for crawl {crawl_id}"))?;
     info!(crawl = %crawl_id, image = %image_file.display(), "pinned crawl thumbnail");
     Ok(())
@@ -638,7 +651,13 @@ fn index_one(
                     workers,
                     progress,
                 )?;
-                cache_thumbnail(fetch, &thumbs_dir, &id, main_page_url.as_deref());
+                cache_thumbnail(
+                    fetch,
+                    &thumbs_dir,
+                    &id,
+                    main_page_url.as_deref(),
+                    &crate::collections::pinned_thumb_path(home, &collection_id, &id),
+                );
                 stats
             }
             None => {
@@ -659,7 +678,13 @@ fn index_one(
                         workers,
                         progress,
                     )?;
-                    cache_thumbnail(fetch, &thumbs_dir, &id, main_page_url.as_deref());
+                    cache_thumbnail(
+                        fetch,
+                        &thumbs_dir,
+                        &id,
+                        main_page_url.as_deref(),
+                        &crate::collections::pinned_thumb_path(home, &collection_id, &id),
+                    );
                     stats
                 } else {
                     // The scan path has no cheap up-front record total, so it stays on
@@ -1520,14 +1545,19 @@ where
 /// Cache a representative thumbnail for a crawl (best-effort). Any failure - no
 /// main page, no `og:image`, or an image we can't fetch/decode - is logged at
 /// debug and ignored; the UI falls back to a CSS placeholder.
-fn cache_thumbnail<F>(fetch: F, thumbs_dir: &Path, crawl_id: &str, main_page_url: Option<&str>)
-where
+fn cache_thumbnail<F>(
+    fetch: F,
+    thumbs_dir: &Path,
+    crawl_id: &str,
+    main_page_url: Option<&str>,
+    pinned_dest: &Path,
+) where
     F: crate::http_range::RangeFetch + Clone + Send + Sync,
 {
     let Some(url) = main_page_url else {
         return;
     };
-    match crate::thumbnail::generate(fetch, thumbs_dir, crawl_id, url) {
+    match crate::thumbnail::generate(fetch, thumbs_dir, crawl_id, url, pinned_dest) {
         Ok(true) => debug!(crawl_id, "cached representative thumbnail"),
         Ok(false) => {}
         Err(e) => debug!(crawl_id, "thumbnail generation failed: {e:#}"),
