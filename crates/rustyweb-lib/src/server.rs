@@ -734,7 +734,7 @@ async fn crawl_page(
         crumb,
         name: c.name.clone(),
         description: c.description.clone(),
-        note: crate::collections::read_crawl_note(&state.home, &id)
+        note: crate::collections::read_crawl_note(&state.home, &c.collection, &id)
             .map(|n| crate::markdown::render(&n)),
         thumb: thumb_href(&state.index_dir, &id),
         replay_href,

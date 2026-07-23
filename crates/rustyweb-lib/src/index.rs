@@ -335,12 +335,12 @@ pub fn set_collection(
 /// only side effect (no reindex); errors if the crawl id is unknown.
 pub fn set_crawl_note(home: &Path, crawl_id: &str, note: &str) -> Result<()> {
     let manifest = Manifest::open(&index_dir(home))?;
-    if manifest.wacz_by_id(crawl_id).is_none() {
+    let Some(wacz) = manifest.wacz_by_id(crawl_id) else {
         anyhow::bail!(
             "no crawl with id \"{crawl_id}\" - it's the id in the crawl's page URL (/crawl/<id>)"
         );
-    }
-    crate::collections::write_crawl_note(home, crawl_id, note)?;
+    };
+    crate::collections::write_crawl_note(home, &wacz.collection, crawl_id, note)?;
     info!(crawl = %crawl_id, "crawl note updated");
     Ok(())
 }

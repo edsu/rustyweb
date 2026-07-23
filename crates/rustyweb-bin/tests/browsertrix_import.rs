@@ -153,10 +153,10 @@ fn import_a_collection_then_skip_on_rerun() {
     assert_eq!(waczs[0]["browsertrix"]["resource_hash"], "sha256:deadbeef");
     // No --into was passed, so importing the Browsertrix "News" collection
     // should auto-create a matching rustyweb finding aid (not scatter singletons).
-    let news_md = home.path().join("collections/news.md");
+    let news_md = home.path().join("collections/news/README.md");
     assert!(
         news_md.exists(),
-        "importing a collection should create a collections/news.md finding aid"
+        "importing a collection should create a collections/news/README.md finding aid"
     );
     assert!(
         std::fs::read_to_string(&news_md)

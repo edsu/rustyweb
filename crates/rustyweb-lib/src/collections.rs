@@ -139,8 +139,10 @@ impl std::fmt::Display for Source {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Wacz {
     pub id: String,
-    /// Id of the [`Collection`] this WACZ belongs to. Defaults to the WACZ's own
-    /// id (a singleton collection) when not explicitly grouped.
+    /// Id (slug) of the [`Collection`] this WACZ belongs to. Every crawl belongs
+    /// to a collection — supplied at index/import time, held here in the manifest
+    /// (the authoritative membership record, incl. for remote sources with no
+    /// local file).
     #[serde(default)]
     pub collection: String,
     /// The WACZ location. Older manifests used the key `path`.
@@ -260,7 +262,7 @@ pub struct BrowsertrixRef {
 /// range, software) are derived from members at read time, not stored here.
 ///
 /// The descriptive metadata is the *source of truth* in a git-committable
-/// Markdown finding aid at `<home>/collections/<id>.md` — YAML front-matter for
+/// Markdown finding aid at `<home>/collections/<slug>/README.md` — YAML front-matter for
 /// the short structured fields, and a Markdown body for the `narrative` (Scope
 /// & Content / Custodial history / Appraisal prose). See [`load_finding_aids`]
 /// / [`write_finding_aid`]. Fields are framed against DACS / EAD.
@@ -308,7 +310,7 @@ pub struct Collection {
 /// The on-disk manifest. WACZ members (membership + derived provenance) live in
 /// the *derived* `<home>/index/waczs.json`; collection descriptive metadata is
 /// the *source of truth* in git-committable Markdown finding aids at
-/// `<home>/collections/<id>.md` (see [`load_finding_aids`]). A legacy
+/// `<home>/collections/<slug>/README.md` (see [`load_finding_aids`]). A legacy
 /// `index/collections.json` is read once and migrated to `.md` on the next save.
 pub struct Manifest {
     index_dir: PathBuf,
@@ -537,7 +539,7 @@ impl CollectionFields {
     }
 }
 
-/// The YAML front-matter of a `collections/<id>.md` finding aid. The `id` is the
+/// The YAML front-matter of a `collections/<slug>/README.md` finding aid. The `id` is the
 /// filename stem (not stored here); the `narrative` is the Markdown body.
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct FrontMatter {
@@ -562,13 +564,17 @@ struct FrontMatter {
     subjects: Vec<String>,
 }
 
-/// Whether `dir` holds at least one `*.md` finding aid.
-fn dir_has_findingaid(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten()
-                .any(|e| e.path().extension().is_some_and(|x| x == "md"))
-        })
+/// The committable directory for a collection: `<home>/collections/<slug>/`,
+/// holding its `README.md` finding aid plus any committable assets (per-crawl
+/// notes, pinned/collection thumbnails).
+pub fn collection_dir(home: &Path, slug: &str) -> PathBuf {
+    home.join("collections").join(slug)
+}
+
+/// Whether `collections_dir` holds at least one `<slug>/README.md` finding aid.
+fn dir_has_findingaid(collections_dir: &Path) -> bool {
+    std::fs::read_dir(collections_dir)
+        .map(|rd| rd.flatten().any(|e| e.path().join("README.md").is_file()))
         .unwrap_or(false)
 }
 
@@ -583,34 +589,35 @@ fn legacy_json_holds_waczs(path: &Path) -> Result<bool> {
         .unwrap_or(false))
 }
 
-/// Load every `collections/*.md` finding aid (the descriptive source of truth),
-/// sorted by id for a stable order.
-pub fn load_finding_aids(dir: &Path) -> Result<Vec<Collection>> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+/// Load every `collections/<slug>/README.md` finding aid (the descriptive source
+/// of truth), sorted by id for a stable order.
+pub fn load_finding_aids(collections_dir: &Path) -> Result<Vec<Collection>> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(collections_dir)?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .filter(|p| p.join("README.md").is_file())
         .collect();
-    paths.sort();
-    let mut out = Vec::with_capacity(paths.len());
-    for path in paths {
-        let id = path
-            .file_stem()
+    dirs.sort();
+    let mut out = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let id = dir
+            .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading finding aid {}", path.display()))?;
+        let readme = dir.join("README.md");
+        let text = std::fs::read_to_string(&readme)
+            .with_context(|| format!("reading finding aid {}", readme.display()))?;
         out.push(
             parse_finding_aid(&id, &text)
-                .with_context(|| format!("parsing finding aid {}", path.display()))?,
+                .with_context(|| format!("parsing finding aid {}", readme.display()))?,
         );
     }
     Ok(out)
 }
 
 /// Parse a finding aid's text (YAML front-matter + Markdown body) into a
-/// [`Collection`] with the given `id` (the filename stem).
+/// [`Collection`] with the given `id` (the collection directory name).
 fn parse_finding_aid(id: &str, text: &str) -> Result<Collection> {
     let (fm_src, body) = split_front_matter(text);
     let fm: FrontMatter = if fm_src.trim().is_empty() {
@@ -662,10 +669,11 @@ fn split_front_matter(text: &str) -> (&str, &str) {
     ("", t) // unterminated front matter → treat the whole file as body
 }
 
-/// Write a collection's finding aid to `<home>/collections/<id>.md`: YAML
-/// front-matter for the structured fields, then the Markdown `narrative` body.
+/// Write a collection's finding aid to `<home>/collections/<slug>/README.md`:
+/// YAML front-matter for the structured fields, then the Markdown `narrative`
+/// body.
 pub fn write_finding_aid(home: &Path, c: &Collection) -> Result<()> {
-    let dir = home.join("collections");
+    let dir = collection_dir(home, &c.id);
     std::fs::create_dir_all(&dir)?;
     let fm = FrontMatter {
         name: c.name.clone(),
@@ -694,27 +702,30 @@ pub fn write_finding_aid(home: &Path, c: &Collection) -> Result<()> {
         out.push_str(body);
         out.push('\n');
     }
-    let path = dir.join(format!("{}.md", c.id));
+    let path = dir.join("README.md");
     std::fs::write(&path, out)
         .with_context(|| format!("writing finding aid {}", path.display()))?;
     Ok(())
 }
 
-/// Path to a crawl's committable Markdown note, `<home>/crawls/<id>.md`.
-pub fn crawl_note_path(home: &Path, id: &str) -> PathBuf {
-    home.join("crawls").join(format!("{id}.md"))
+/// Path to a crawl's committable Markdown note, under its collection:
+/// `<home>/collections/<slug>/crawls/<id>.md`.
+pub fn crawl_note_path(home: &Path, collection: &str, id: &str) -> PathBuf {
+    collection_dir(home, collection)
+        .join("crawls")
+        .join(format!("{id}.md"))
 }
 
 /// Read a crawl's Markdown note, if present and non-empty.
-pub fn read_crawl_note(home: &Path, id: &str) -> Option<String> {
-    let text = std::fs::read_to_string(crawl_note_path(home, id)).ok()?;
+pub fn read_crawl_note(home: &Path, collection: &str, id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crawl_note_path(home, collection, id)).ok()?;
     let t = text.trim();
     (!t.is_empty()).then(|| t.to_string())
 }
 
-/// Write a crawl's Markdown note to `<home>/crawls/<id>.md`.
-pub fn write_crawl_note(home: &Path, id: &str, note: &str) -> Result<()> {
-    let path = crawl_note_path(home, id);
+/// Write a crawl's Markdown note to `<home>/collections/<slug>/crawls/<id>.md`.
+pub fn write_crawl_note(home: &Path, collection: &str, id: &str, note: &str) -> Result<()> {
+    let path = crawl_note_path(home, collection, id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1090,8 +1101,8 @@ mod tests {
         );
         m.save().unwrap();
 
-        // A finding-aid Markdown file is written under <home>/collections/.
-        let md = tmp.path().join("collections").join("sucho.md");
+        // A finding-aid Markdown file is written under <home>/collections/<slug>/.
+        let md = tmp.path().join("collections/sucho/README.md");
         assert!(md.exists(), "finding aid should be written to {md:?}");
         let text = std::fs::read_to_string(&md).unwrap();
         assert!(text.starts_with("---\n"), "has YAML front-matter");
@@ -1117,10 +1128,10 @@ mod tests {
     fn hand_edited_finding_aid_loads() {
         // A curator can author the Markdown by hand; rustyweb reads it verbatim.
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("collections");
+        let dir = tmp.path().join("collections/my-coll");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("my-coll.md"),
+            dir.join("README.md"),
             "---\nname: My Collection\ncreated: 2026-03-01T00:00:00Z\nsubjects:\n  - a\n  - b\n---\n\n# About\n\nHand-written prose.\n",
         )
         .unwrap();
@@ -1140,10 +1151,10 @@ mod tests {
         // A curator may omit `name`/`created`; that must not fail the whole
         // manifest load. `name` falls back to the filename stem.
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("collections");
+        let dir = tmp.path().join("collections/sucho");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("sucho.md"),
+            dir.join("README.md"),
             "---\ncreator: Someone\n---\n\n## Scope\n\nWhy.\n",
         )
         .unwrap();
@@ -1152,7 +1163,7 @@ mod tests {
         let c = m
             .collection_by_id("sucho")
             .expect("loads despite missing name/created");
-        assert_eq!(c.name, "sucho", "name falls back to the filename stem");
+        assert_eq!(c.name, "sucho", "name falls back to the directory name");
         assert_eq!(c.creator.as_deref(), Some("Someone"));
     }
 
@@ -1177,16 +1188,21 @@ mod tests {
             Some("legacy")
         );
         m.save().unwrap();
-        assert!(tmp.path().join("collections").join("old.md").exists());
+        assert!(tmp.path().join("collections/old/README.md").exists());
     }
 
     #[test]
     fn crawl_note_roundtrips() {
         let tmp = TempDir::new().unwrap();
-        assert!(read_crawl_note(tmp.path(), "abc12345").is_none());
-        write_crawl_note(tmp.path(), "abc12345", "  A note about absences.  ").unwrap();
+        assert!(read_crawl_note(tmp.path(), "sucho", "abc12345").is_none());
+        write_crawl_note(tmp.path(), "sucho", "abc12345", "  A note about absences.  ").unwrap();
+        // Stored under the collection dir, committable alongside the finding aid.
+        assert!(tmp
+            .path()
+            .join("collections/sucho/crawls/abc12345.md")
+            .is_file());
         assert_eq!(
-            read_crawl_note(tmp.path(), "abc12345").as_deref(),
+            read_crawl_note(tmp.path(), "sucho", "abc12345").as_deref(),
             Some("A note about absences.")
         );
     }
