@@ -4,8 +4,14 @@
 # Local search index created by `rustyweb index`
 /index
 
+# Curator finding aids / per-crawl notes when the repo root is used as a test
+# home (real curator data in a real home is committed; here it's just scratch)
+/collections
+/crawls
+
 # Local test archives and unpacked WACZ scratch (large, not part of the repo)
 /archive
+/archive-old
 /a
 
 # Node / Playwright tooling (not used)

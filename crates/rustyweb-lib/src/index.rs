@@ -128,8 +128,15 @@ pub fn index_location_with_resolver(
     // Optional progress sink for indexing (the binary renders a bar).
     progress: Option<&dyn IndexProgress>,
 ) -> Result<()> {
-    // Validate the argument first (a bad path errors before we touch the index).
-    let sources = resolve_sources(location, home)?;
+    // Every crawl belongs to a collection (its id is the slug of the name).
+    let group = (
+        crate::collections::slugify(collection),
+        collection.to_string(),
+    );
+
+    // Validate the argument and file local WACZs into the collection's archive
+    // folder (a bad path errors before we touch the index).
+    let sources = resolve_sources(location, home, &group.0)?;
 
     let index_dir = index_dir(home);
     std::fs::create_dir_all(&index_dir)
@@ -141,12 +148,6 @@ pub fn index_location_with_resolver(
     );
 
     let mut manifest = Manifest::open(&index_dir)?;
-
-    // Every crawl belongs to a collection (its id is the slug of the name).
-    let group = (
-        crate::collections::slugify(collection),
-        collection.to_string(),
-    );
 
     for source in &sources {
         let (wacz_name, pages) = index_one(
@@ -433,22 +434,26 @@ pub fn set_browsertrix_provenance_by_id(
     Ok(())
 }
 
-/// Turn one `index` argument into a source to index. An `http(s)://` URL yields
-/// a URL source. Otherwise the argument must be a `.wacz` file that already lives
-/// under `<home>/archive` - rustyweb keeps local archives there so the home
-/// directory is self-contained and portable, and does not copy files for you.
-/// Directories, non-`.wacz` paths, and files outside the archive folder are
-/// errors with guidance.
-fn resolve_sources(location: &str, home: &Path) -> Result<Vec<Source>> {
+/// Turn one `index` argument into a source to index, filing local WACZs into the
+/// collection's archive folder. An `http(s)://` URL yields a URL source. A local
+/// `.wacz` file may live anywhere: it's brought into `<home>/archive/<slug>/` —
+/// **moved** if it already sits under `archive/` (reorganized within rustyweb's
+/// own space), **copied** otherwise (the original is left intact) — so the home
+/// directory stays self-contained and portable and the archive is browsable by
+/// collection. Directories and non-`.wacz` paths are errors with guidance.
+fn resolve_sources(location: &str, home: &Path, collection_slug: &str) -> Result<Vec<Source>> {
     match Source::parse(location) {
         url @ Source::Url(_) => Ok(vec![url]),
         bt @ Source::Browsertrix { .. } => Ok(vec![bt]),
-        Source::File(p) => Ok(vec![resolve_archive_file(&p, home)?]),
+        Source::File(p) => Ok(vec![place_local_wacz(&p, home, collection_slug)?]),
     }
 }
 
-/// Validate a local WACZ argument and return it as a home-relative [`Source`].
-fn resolve_archive_file(path: &Path, home: &Path) -> Result<Source> {
+/// Bring a local WACZ into `<home>/archive/<slug>/` and return it as a
+/// home-relative File [`Source`]. Moves it if it's already under `archive/`
+/// (reorganizing within the managed space); copies it otherwise. A re-index of a
+/// file already in the collection folder is a no-op placement.
+fn place_local_wacz(path: &Path, home: &Path, collection_slug: &str) -> Result<Source> {
     if path.is_dir() {
         anyhow::bail!(
             "{} is a directory; pass individual .wacz files instead \
@@ -459,31 +464,46 @@ fn resolve_archive_file(path: &Path, home: &Path) -> Result<Source> {
     if path.extension().and_then(|e| e.to_str()) != Some("wacz") {
         anyhow::bail!("{} is not a .wacz file or an http(s) URL", path.display());
     }
-    if !path.exists() {
-        anyhow::bail!("{} does not exist", path.display());
-    }
-
     let abs = path
         .canonicalize()
-        .with_context(|| format!("resolving {}", path.display()))?;
-    let archive = archive_dir(home);
-    let in_archive = archive
+        .with_context(|| format!("{} does not exist", path.display()))?;
+
+    let dest_dir = archive_dir(home).join(collection_slug);
+
+    // Already inside the collection's archive folder (at any depth — e.g. the
+    // importer's archive/<slug>/<item-id>/ subdir)? Use it in place, no move.
+    if dest_dir
+        .canonicalize()
+        .map(|d| abs.starts_with(&d))
+        .unwrap_or(false)
+    {
+        return Ok(Source::for_file(&abs, home));
+    }
+
+    let filename = abs
+        .file_name()
+        .with_context(|| format!("{} has no file name", abs.display()))?;
+    let dest = dest_dir.join(filename);
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("creating archive dir {}", dest_dir.display()))?;
+    // A file already under archive/ is on the same filesystem as its destination,
+    // so a rename (move) is cheap and non-duplicating; a file from elsewhere is
+    // copied so the curator's original is left untouched.
+    let under_archive = archive_dir(home)
         .canonicalize()
         .map(|a| abs.starts_with(&a))
         .unwrap_or(false);
-    if !in_archive {
-        anyhow::bail!(
-            "{} is not inside the archive folder {}\n\
-             rustyweb only indexes local WACZ files kept in the archive folder, so the \
-             home directory stays self-contained. Move the file into {} and index it \
-             from there, or pass an http(s) URL instead.",
-            abs.display(),
-            archive.display(),
-            archive.display()
-        );
+    if under_archive {
+        std::fs::rename(&abs, &dest)
+            .with_context(|| format!("moving {} to {}", abs.display(), dest.display()))?;
+        info!(from = %abs.display(), to = %dest.display(), "moved WACZ into collection archive");
+    } else {
+        std::fs::copy(&abs, &dest)
+            .with_context(|| format!("copying {} to {}", abs.display(), dest.display()))?;
+        info!(from = %abs.display(), to = %dest.display(), "copied WACZ into collection archive");
     }
-
-    Ok(Source::for_file(&abs, home))
+    let dest_abs = dest.canonicalize().unwrap_or(dest);
+    Ok(Source::for_file(&dest_abs, home))
 }
 
 /// Index a single WACZ source: obtain a local readable copy (downloading a URL
@@ -1840,10 +1860,12 @@ mod tests {
     fn index_fixture(name: &str, home: &Path, display: Option<&str>) -> std::path::PathBuf {
         let archive = home.join("archive");
         std::fs::create_dir_all(&archive).unwrap();
-        let dest = archive.join(name);
-        std::fs::copy(fixture(name), &dest).unwrap();
-        index_path(&dest, home, display, "test").unwrap();
-        dest
+        let staged = archive.join(name);
+        std::fs::copy(fixture(name), &staged).unwrap();
+        index_path(&staged, home, display, "test").unwrap();
+        // index files the WACZ into the collection's folder (collection "test"),
+        // so its resting place is archive/test/<name>.
+        archive.join("test").join(name)
     }
 
     #[test]
@@ -1886,14 +1908,19 @@ mod tests {
     }
 
     #[test]
-    fn indexed_local_wacz_is_stored_relative_to_home() {
+    fn indexed_local_wacz_is_filed_under_its_collection_relative_to_home() {
         let tmp = TempDir::new().unwrap();
         index_fixture("simple.wacz", tmp.path(), None);
         let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
+        // `index` files the WACZ into archive/<collection-slug>/ and stores the
+        // source relative to home (so the home dir stays portable).
         assert_eq!(
             manifest.waczs[0].source,
-            Source::File(PathBuf::from("archive/simple.wacz")),
-            "a local WACZ under archive/ should be stored relative to home"
+            Source::File(PathBuf::from("archive/test/simple.wacz")),
+        );
+        assert!(
+            tmp.path().join("archive/test/simple.wacz").is_file(),
+            "the WACZ was moved into its collection folder"
         );
     }
 
@@ -2087,19 +2114,28 @@ mod tests {
     }
 
     #[test]
-    fn index_rejects_wacz_outside_archive() {
-        // A valid WACZ that is not under <home>/archive is refused with guidance.
+    fn index_copies_external_wacz_into_the_collection_archive() {
+        // A WACZ from anywhere is brought into archive/<slug>/ — copied when it's
+        // outside the home, leaving the curator's original intact.
         let home = TempDir::new().unwrap();
         let elsewhere = TempDir::new().unwrap();
         let stray = elsewhere.path().join("simple.wacz");
         std::fs::copy(fixture("simple.wacz"), &stray).unwrap();
 
-        let err = index_path(&stray, home.path(), None, "test")
-            .expect_err("indexing a WACZ outside the archive folder should fail");
-        let msg = format!("{err:#}");
+        index_path(&stray, home.path(), None, "My Coll").unwrap();
+
         assert!(
-            msg.contains("archive"),
-            "error should mention the archive folder: {msg}"
+            stray.is_file(),
+            "the external original is left in place (copied, not moved)"
+        );
+        assert!(
+            home.path().join("archive/my-coll/simple.wacz").is_file(),
+            "the WACZ is copied into archive/<slug>/"
+        );
+        let m = Manifest::open(&home.path().join("index")).unwrap();
+        assert_eq!(
+            m.waczs[0].source,
+            Source::File(PathBuf::from("archive/my-coll/simple.wacz"))
         );
     }
 

@@ -470,7 +470,7 @@ async fn crawl_page_shows_browsertrix_provenance() {
     // Mark the crawl as imported from Browsertrix, as `import browsertrix` does.
     rustyweb_lib::index::set_browsertrix_provenance(
         tmp.path(),
-        &tmp.path().join("archive/a.wacz"),
+        &tmp.path().join("archive/test/a.wacz"),
         "https://app.browsertrix.com",
         "item-xyz",
         "sha256:aa",
@@ -787,13 +787,14 @@ async fn home_directory_is_portable() {
     std::fs::copy(fixture("simple.wacz"), archive.join("simple.wacz")).unwrap();
     rustyweb_lib::index::index_path(&archive.join("simple.wacz"), &home_a, None, "test").unwrap();
 
-    // The source is stored relative to home (portable), not absolute.
+    // The source is stored relative to home (portable), filed under its
+    // collection folder, not absolute.
     let manifest = Manifest::open(&home_a.join("index")).unwrap();
     let id = manifest.waczs[0].id.clone();
     assert_eq!(
         manifest.waczs[0].source,
-        Source::File(Path::new("archive/simple.wacz").to_path_buf()),
-        "local WACZ should be stored relative to home"
+        Source::File(Path::new("archive/test/simple.wacz").to_path_buf()),
+        "local WACZ should be stored relative to home, under its collection"
     );
 
     // Move the whole home dir to a new path, then serve from there.
