@@ -549,6 +549,24 @@ impl CollectionPage {
             || !self.subjects.is_empty()
     }
 
+    /// The DACS single-level *minimum* curatorial elements that are still empty
+    /// — Scope & Content (narrative), Name of Creator, Conditions Governing
+    /// Access/Use (rights). Drives the "still needed" prompt when ingest seeded
+    /// some fields but left these gaps (the fields no source fills reliably).
+    fn missing_minimum(&self) -> Vec<&'static str> {
+        let mut m = Vec::new();
+        if self.narrative.is_none() {
+            m.push("Scope & Content");
+        }
+        if self.creator.is_none() {
+            m.push("Creator");
+        }
+        if self.rights.is_none() {
+            m.push("Access & Use");
+        }
+        m
+    }
+
     /// The curatorial (finding-aid) metadata table, with DACS-labelled rows.
     fn curatorial_rows(&self) -> Vec<MetaRow> {
         let mut rows = Vec::new();
@@ -575,6 +593,8 @@ impl CollectionPage {
 /// hero image would).
 pub fn collection(p: &CollectionPage) -> Markup {
     let curatorial = p.curatorial_rows();
+    let slug = crate::collections::slugify(&p.name);
+    let missing = p.missing_minimum();
     let body = html! {
         (top_bar(None))
         h1.page-title { (p.name) }
@@ -585,6 +605,19 @@ pub fn collection(p: &CollectionPage) -> Markup {
             @if p.has_curatorial() {
                 @if let Some(n) = &p.narrative { div.narrative { (n) } }
                 @if !curatorial.is_empty() { (meta_table(&curatorial)) }
+                // Even partly-filled, name the DACS-minimum elements still
+                // missing — the fields ingest can't supply reliably (a real
+                // creator, the scope rationale, use conditions).
+                @if !missing.is_empty() {
+                    p.muted.nudge {
+                        "Still needed: " (missing.join(", "))
+                        " (the finding-aid minimum). Add with "
+                        code { "rustyweb collection set \"" (p.name) "\" …" }
+                        " or edit "
+                        code { "collections/" (slug) "/README.md" }
+                        "."
+                    }
+                }
             } @else {
                 // Empty-state nudge: name the DACS single-level minimum
                 // curatorial elements that are missing, with archival authority.
@@ -594,7 +627,7 @@ pub fn collection(p: &CollectionPage) -> Markup {
                     "who may use it (Access): "
                     code { "rustyweb collection set \"" (p.name) "\" --creator \"…\"" }
                     " — or edit "
-                    code { "collections/" (crate::collections::slugify(&p.name)) ".md" }
+                    code { "collections/" (slug) "/README.md" }
                     "."
                 }
             }
