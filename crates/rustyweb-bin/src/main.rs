@@ -1147,7 +1147,8 @@ fn run_browsertrix(
 
     // Downloads land under the collection's archive subdir so the filesystem is
     // browsable by collection (archive/<slug>/<item-id>/…).
-    let archive = rustyweb_lib::index::archive_dir(home).join(rustyweb_lib::collections::slugify(into));
+    let archive =
+        rustyweb_lib::index::archive_dir(home).join(rustyweb_lib::collections::slugify(into));
     std::fs::create_dir_all(&archive)
         .with_context(|| format!("creating archive dir {}", archive.display()))?;
 

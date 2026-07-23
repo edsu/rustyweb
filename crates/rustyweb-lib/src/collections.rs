@@ -1263,7 +1263,13 @@ mod tests {
     fn crawl_note_roundtrips() {
         let tmp = TempDir::new().unwrap();
         assert!(read_crawl_note(tmp.path(), "sucho", "abc12345").is_none());
-        write_crawl_note(tmp.path(), "sucho", "abc12345", "  A note about absences.  ").unwrap();
+        write_crawl_note(
+            tmp.path(),
+            "sucho",
+            "abc12345",
+            "  A note about absences.  ",
+        )
+        .unwrap();
         // Stored under the collection dir, committable alongside the finding aid.
         assert!(tmp
             .path()

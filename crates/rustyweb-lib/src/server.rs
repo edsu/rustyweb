@@ -168,9 +168,9 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 // Representative image: a curator-set collection thumbnail if
                 // present, else the first member crawl that has one.
                 thumb: collection_thumb_href(&state.home, &c.id).or_else(|| {
-                    members
-                        .iter()
-                        .find_map(|w| thumb_href(&state.home, &state.index_dir, &w.collection, &w.id))
+                    members.iter().find_map(|w| {
+                        thumb_href(&state.home, &state.index_dir, &w.collection, &w.id)
+                    })
                 }),
                 // Which source kinds the members span — both true = mixed.
                 has_local: members.iter().any(|w| !w.source.is_remote()),

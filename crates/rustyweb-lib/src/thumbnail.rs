@@ -45,7 +45,8 @@ fn write_thumbnail(dest: &Path, bytes: &[u8]) -> Result<()> {
         .write_to(&mut out, image::ImageFormat::Jpeg)
         .context("encoding thumbnail")?;
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::write(dest, out.into_inner())
         .with_context(|| format!("writing {}", dest.display()))?;
@@ -307,7 +308,10 @@ mod tests {
         std::fs::write(&src, png_bytes(30, 20)).unwrap();
 
         set_manual(&dest, &src).unwrap();
-        assert!(dest.exists(), "pinned thumbnail written (parent dir created)");
+        assert!(
+            dest.exists(),
+            "pinned thumbnail written (parent dir created)"
+        );
 
         // it's a valid, downscaled JPEG
         let out = image::load_from_memory(&std::fs::read(&dest).unwrap()).unwrap();
@@ -347,7 +351,10 @@ mod tests {
         let fetch = crate::http_range::FileFetch::open(&dummy).unwrap();
         let wrote = generate(fetch, &thumbs, "pinned1", "https://ex.com/", &pinned).unwrap();
 
-        assert!(!wrote, "generate() should skip a crawl with a committed pin");
+        assert!(
+            !wrote,
+            "generate() should skip a crawl with a committed pin"
+        );
         assert!(
             !thumb_file(&thumbs, "pinned1").exists(),
             "no auto cache written for a pinned crawl"

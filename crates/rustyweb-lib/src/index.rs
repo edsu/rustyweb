@@ -63,7 +63,15 @@ pub trait SourceResolver: Send + Sync {
 /// Index a local WACZ file (which must live under `<home>/archive`) into the
 /// given collection. Thin wrapper over [`index_location`].
 pub fn index_path(path: &Path, home: &Path, name: Option<&str>, collection: &str) -> Result<()> {
-    index_location(&path.to_string_lossy(), home, name, collection, false, None, None)
+    index_location(
+        &path.to_string_lossy(),
+        home,
+        name,
+        collection,
+        false,
+        None,
+        None,
+    )
 }
 
 /// Index a WACZ from a location into the home directory's `index/`. The location
@@ -135,7 +143,10 @@ pub fn index_location_with_resolver(
     let mut manifest = Manifest::open(&index_dir)?;
 
     // Every crawl belongs to a collection (its id is the slug of the name).
-    let group = (crate::collections::slugify(collection), collection.to_string());
+    let group = (
+        crate::collections::slugify(collection),
+        collection.to_string(),
+    );
 
     for source in &sources {
         let (wacz_name, pages) = index_one(
@@ -2098,9 +2109,8 @@ mod tests {
         let archive = tmp.path().join("archive");
         std::fs::create_dir_all(&archive).unwrap();
 
-        let err =
-            index_path(&archive, tmp.path(), None, "test")
-                .expect_err("indexing a directory should fail");
+        let err = index_path(&archive, tmp.path(), None, "test")
+            .expect_err("indexing a directory should fail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("directory"),

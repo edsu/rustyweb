@@ -878,7 +878,8 @@ async fn index_from_http_url_and_link_directly() {
     // index_location uses a blocking HTTP client; run it off the async runtime.
     let (url_c, dir_c) = (url.clone(), tmp.path().to_path_buf());
     tokio::task::spawn_blocking(move || {
-        rustyweb_lib::index::index_location(&url_c, &dir_c, None, "test", false, None, None).unwrap();
+        rustyweb_lib::index::index_location(&url_c, &dir_c, None, "test", false, None, None)
+            .unwrap();
     })
     .await
     .unwrap();
