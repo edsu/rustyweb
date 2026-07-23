@@ -14,6 +14,12 @@
 /archive-old
 /a
 
+# Loose scratch / working-data files (ad-hoc URL lists, exports, one-off scripts)
+/waczs.csv
+/waczs.tsv
+/sucho-wacz-urls*.txt
+/scripts/browsertrix-wacz-urls.py
+
 # Node / Playwright tooling (not used)
 /node_modules
 /package.json
