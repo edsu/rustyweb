@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -57,11 +57,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index one or more WACZ files (kept in <home>/archive) or http(s) URLs.
+    /// Index one or more WACZ files or http(s) URLs into a collection.
     Index {
-        /// WACZ files or http(s) URLs to index. A local WACZ must live under
-        /// <home>/archive; for several, glob it: `index archive/*.wacz`. Provide
-        /// at least one here or via --from-file.
+        /// WACZ files or http(s) URLs to index. A local WACZ may live anywhere;
+        /// it's filed into <home>/archive/<collection-slug>/. For several, glob
+        /// it. Provide at least one here or via --from-file.
         paths: Vec<String>,
 
         /// Read more WACZ files/URLs from a text file, one per line (blank lines
@@ -252,6 +252,15 @@ enum CrawlCmd {
         #[arg(long, value_name = "FILE")]
         image: Option<PathBuf>,
 
+        /// A curator note (Markdown) for this crawl — e.g. to document absences
+        /// or context. Written to a committable `collections/<slug>/crawls/<id>.md`.
+        #[arg(long, conflicts_with = "note_file")]
+        note: Option<String>,
+
+        /// Read the crawl note (Markdown) from a file (use `-` for stdin).
+        #[arg(long, value_name = "FILE")]
+        note_file: Option<PathBuf>,
+
         /// rustyweb home directory (holds archive/ and index/).
         #[arg(long, default_value = ".")]
         home: PathBuf,
@@ -259,19 +268,56 @@ enum CrawlCmd {
 }
 
 #[derive(Subcommand)]
+// `Set` carries the finding-aid fields, so it's much larger than `List`; a clap
+// command enum is constructed once, so the size difference doesn't matter.
+#[allow(clippy::large_enum_variant)]
 enum CollectionCmd {
-    /// Create or update a collection's metadata (created if it doesn't exist).
+    /// Create or update a collection's finding-aid metadata (created if it
+    /// doesn't exist). Structured fields go to YAML front-matter; the narrative
+    /// prose is the Markdown body of a committable `collections/<slug>.md` — set
+    /// it with --narrative[-file], or just hand-edit that file.
     Set {
         /// Collection name (its id is a slug of this).
         name: String,
 
-        /// A description of the collection.
+        /// A short abstract / caption for the collection (EAD <abstract>).
         #[arg(long)]
         description: Option<String>,
 
-        /// Curator / owner.
+        /// Repository / owner running this rustyweb instance (EAD <repository>).
         #[arg(long)]
         curator: Option<String>,
+
+        /// Collecting org/person responsible for the records (DACS Name of
+        /// Creator, EAD <origination>) — distinct from --curator.
+        #[arg(long)]
+        creator: Option<String>,
+
+        /// Curatorial coverage-date statement (EAD <unitdate>), distinct from
+        /// the auto-derived capture range.
+        #[arg(long)]
+        dates: Option<String>,
+
+        /// Conditions governing access and use / license (EAD <userestrict>).
+        #[arg(long)]
+        rights: Option<String>,
+
+        /// A topical subject / access point (repeat for several).
+        #[arg(long = "subject", value_name = "SUBJECT")]
+        subjects: Vec<String>,
+
+        /// Pin a representative image for the whole collection from a local
+        /// image file (PNG/JPEG/WebP/GIF), committed under the collection.
+        #[arg(long, value_name = "FILE")]
+        thumbnail: Option<PathBuf>,
+
+        /// The Scope & Content / provenance narrative (Markdown) inline.
+        #[arg(long, conflicts_with = "narrative_file")]
+        narrative: Option<String>,
+
+        /// Read the narrative (Markdown) from a file (use `-` for stdin).
+        #[arg(long, value_name = "FILE")]
+        narrative_file: Option<PathBuf>,
 
         /// rustyweb home directory (holds archive/ and index/).
         #[arg(long, default_value = ".")]
@@ -283,6 +329,22 @@ enum CollectionCmd {
         #[arg(long, default_value = ".")]
         home: PathBuf,
     },
+}
+
+/// Read a whole text argument from a file, or from stdin when the path is `-`
+/// (for `--narrative-file`/`--note-file`).
+fn read_text_arg(path: &Path) -> Result<String> {
+    if path.as_os_str() == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading text from stdin")?;
+        Ok(buf)
+    } else {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading text from {}", path.display()))
+    }
 }
 
 /// Read a newline-delimited list of WACZ files/URLs from a file, or from stdin
@@ -546,6 +608,25 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(2);
             }
+
+            // Every crawl belongs to a collection. Rather than invent a
+            // singleton per WACZ, we ask the curator to say what this is part of
+            // — the deliberate "stop and think" moment (index a glob into one
+            // collection to decide it once).
+            let collection = collection.as_deref().filter(|c| !c.trim().is_empty());
+            let Some(collection) = collection else {
+                eprintln!(
+                    "index needs --collection <NAME>: every crawl belongs to a curated\n\
+                     collection. For example:\n\
+                     \n\
+                     \x20 rustyweb index archive/*.wacz --collection \"Ukraine Cultural Heritage\"\n\
+                     \n\
+                     Pick a name that says what these crawls are a part of and why you're\n\
+                     keeping them; you can describe it further with: rustyweb collection set"
+                );
+                std::process::exit(2);
+            };
+
             // A progress bar makes a slow streaming index (each remote page
             // record is a separate HTTP range request) visible. Shown only on an
             // interactive stderr and not under -v (see `show_bar` above).
@@ -572,7 +653,7 @@ async fn main() -> Result<()> {
                     location,
                     &home,
                     name.as_deref(),
-                    collection.as_deref(),
+                    collection,
                     download,
                     concurrency,
                     progress,
@@ -670,10 +751,39 @@ async fn main() -> Result<()> {
                 name,
                 description,
                 curator,
+                creator,
+                dates,
+                rights,
+                subjects,
+                narrative,
+                narrative_file,
+                thumbnail,
                 home,
             } => {
-                let id = rustyweb_lib::index::set_collection(&home, &name, description, curator)?;
+                let narrative = match narrative_file {
+                    Some(path) => Some(read_text_arg(&path)?),
+                    None => narrative,
+                };
+                let fields = rustyweb_lib::collections::CollectionFields {
+                    description,
+                    curator,
+                    creator,
+                    dates,
+                    rights,
+                    // An empty repeated --subject means "not provided" (leave as
+                    // is); pass Some only when the curator gave at least one.
+                    subjects: (!subjects.is_empty()).then_some(subjects),
+                    narrative,
+                };
+                let id = rustyweb_lib::index::set_collection(&home, &name, &fields)?;
+                if let Some(file) = &thumbnail {
+                    rustyweb_lib::index::set_collection_thumbnail(&home, &name, file)?;
+                }
+                let readme = home.join("collections").join(&id).join("README.md");
                 println!("collection \"{name}\" ({id}) updated");
+                if fields.narrative.is_none() {
+                    println!("  add a scope note by editing {}", readme.display());
+                }
             }
             CollectionCmd::List { home } => {
                 run_collection_list(&home)?;
@@ -681,12 +791,30 @@ async fn main() -> Result<()> {
         },
 
         Commands::Crawl { action } => match action {
-            CrawlCmd::Set { id, image, home } => {
-                if let Some(file) = image {
-                    rustyweb_lib::index::set_crawl_thumbnail(&home, &id, &file)?;
+            CrawlCmd::Set {
+                id,
+                image,
+                note,
+                note_file,
+                home,
+            } => {
+                let mut did = false;
+                if let Some(file) = &image {
+                    rustyweb_lib::index::set_crawl_thumbnail(&home, &id, file)?;
                     println!("pinned thumbnail for crawl {id} from {}", file.display());
-                } else {
-                    eprintln!("nothing to set — pass --image <FILE> to pin a thumbnail");
+                    did = true;
+                }
+                let note = match note_file {
+                    Some(path) => Some(read_text_arg(&path)?),
+                    None => note,
+                };
+                if let Some(note) = note {
+                    rustyweb_lib::index::set_crawl_note(&home, &id, &note)?;
+                    println!("note updated for crawl {id}");
+                    did = true;
+                }
+                if !did {
+                    eprintln!("nothing to set — pass --image <FILE> or --note <TEXT>");
                     std::process::exit(2);
                 }
             }
@@ -937,13 +1065,15 @@ fn run_browsertrix(
         None => None,
     };
 
-    // Where imports land as a rustyweb collection: an explicit --into wins;
-    // otherwise, importing a Browsertrix collection yields a rustyweb collection
-    // of the same name (so a collection import isn't scattered into singletons);
-    // otherwise each crawl is its own collection.
-    let into = opts
+    // Where imports land as a rustyweb collection (every crawl belongs to one):
+    // an explicit --into wins; otherwise importing a Browsertrix collection
+    // yields a rustyweb collection of the same name; otherwise (a whole-org or
+    // single-crawl import) fall back to the org name — a meaningful collecting
+    // body — rather than scattering singletons.
+    let into: &str = opts
         .into
-        .or(selected_collection.as_ref().map(|c| c.name.as_str()));
+        .or(selected_collection.as_ref().map(|c| c.name.as_str()))
+        .unwrap_or(&org.name);
 
     // Selection is server-side (a collection or a single item); the review
     // filter is applied client-side so we can report what was skipped.
@@ -1016,7 +1146,10 @@ fn run_browsertrix(
         home.display()
     );
 
-    let archive = rustyweb_lib::index::archive_dir(home);
+    // Downloads land under the collection's archive subdir so the filesystem is
+    // browsable by collection (archive/<slug>/<item-id>/…).
+    let archive =
+        rustyweb_lib::index::archive_dir(home).join(rustyweb_lib::collections::slugify(into));
     std::fs::create_dir_all(&archive)
         .with_context(|| format!("creating archive dir {}", archive.display()))?;
 
@@ -1113,9 +1246,15 @@ fn run_browsertrix(
                 ))
             };
 
-            // Record provenance so a later run can skip this resource.
+            // Record provenance so a later run can skip this resource, and carry
+            // the QA review rating (DACS Appraisal signal) onto the crawl.
             rustyweb_lib::index::set_browsertrix_provenance_by_id(
-                home, &crawl_id, &host, &item.id, &res.hash,
+                home,
+                &crawl_id,
+                &host,
+                &item.id,
+                &res.hash,
+                item.review_status,
             )
             .context("recording provenance")?;
             seen.insert(key);
@@ -1349,9 +1488,12 @@ fn resolve_org(
 }
 
 /// A filesystem-safe single path component: any character outside
-/// `[A-Za-z0-9._-]` (including path separators) becomes `_`.
+/// `[A-Za-z0-9._-]` (including path separators) becomes `_`, and a component
+/// that would be `.` or `..` is neutralized to `_`/`__` so a hostile item id
+/// from the API can't escape its per-item subdirectory.
 fn safe_component(s: &str) -> String {
-    s.chars()
+    let mapped: String = s
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
                 c
@@ -1359,14 +1501,35 @@ fn safe_component(s: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    match mapped.as_str() {
+        "" => "_".to_string(),
+        "." => "_".to_string(),
+        ".." => "__".to_string(),
+        _ => mapped,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::parse_source_lines;
-    use super::{passes_review, resolve_collection, resolve_org, safe_wacz_filename};
+    use super::{
+        passes_review, resolve_collection, resolve_org, safe_component, safe_wacz_filename,
+    };
     use rustyweb_lib::browsertrix::{Collection, Item, Org};
+
+    #[test]
+    fn safe_component_neutralizes_traversal_and_separators() {
+        // A hostile/compromised Browsertrix item id must not escape its subdir.
+        assert_eq!(safe_component(".."), "__");
+        assert_eq!(safe_component("."), "_");
+        // Embedded separators are mapped, leaving a single contained component.
+        assert_eq!(safe_component("../../etc"), ".._.._etc");
+        assert_eq!(safe_component("a/b"), "a_b");
+        assert_eq!(safe_component(""), "_");
+        // A normal id is untouched.
+        assert_eq!(safe_component("manual-20250101-abc"), "manual-20250101-abc");
+    }
 
     fn item(review: Option<u8>) -> Item {
         Item {

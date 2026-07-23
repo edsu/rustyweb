@@ -35,7 +35,7 @@ async fn browser_renders_archived_page() {
     //    fixture, because wabac.js requires a standard CDXJ index; the minimal
     //    simple.wacz fixture uses a non-standard CDX that wabac can't read.
     let tmp = tempfile::TempDir::new().unwrap();
-    rustyweb_lib::index::index_path(&fixture("a.wacz"), tmp.path(), None).unwrap();
+    rustyweb_lib::index::index_path(&fixture("a.wacz"), tmp.path(), None, "test").unwrap();
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
     let id = manifest.waczs[0].id.clone();
 

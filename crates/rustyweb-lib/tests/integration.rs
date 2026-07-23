@@ -26,7 +26,7 @@ fn index_into(home: &Path, name: &str) {
     std::fs::create_dir_all(&archive).unwrap();
     let dest = archive.join(name);
     std::fs::copy(fixture(name), &dest).unwrap();
-    rustyweb_lib::index::index_path(&dest, home, None).unwrap();
+    rustyweb_lib::index::index_path(&dest, home, None, "test").unwrap();
 }
 
 // ── Indexing ──────────────────────────────────────────────────────────────────
@@ -400,9 +400,11 @@ async fn homepage_shows_collection_name() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let cname = manifest.collections[0].name.clone();
     assert!(
-        text.contains("simple"),
-        "homepage should show collection name: {text}"
+        text.contains(&cname),
+        "homepage should show the collection name {cname:?}: {text}"
     );
     assert!(
         text.contains("aria-label=\"Local\""),
@@ -414,7 +416,7 @@ async fn homepage_shows_collection_name() {
 async fn homepage_card_links_to_collection_page() {
     let tmp = make_index(&["simple.wacz"]);
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
-    let id = manifest.waczs[0].id.clone();
+    let cid = manifest.collections[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
     let resp = app
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
@@ -423,8 +425,8 @@ async fn homepage_card_links_to_collection_page() {
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(
-        html.contains(&format!("href=\"/collection/{id}\"")),
-        "homepage card title should link to the collection page"
+        html.contains(&format!("href=\"/collection/{cid}\"")),
+        "homepage card title should link to the collection page (/collection/{cid})"
     );
 }
 
@@ -468,10 +470,11 @@ async fn crawl_page_shows_browsertrix_provenance() {
     // Mark the crawl as imported from Browsertrix, as `import browsertrix` does.
     rustyweb_lib::index::set_browsertrix_provenance(
         tmp.path(),
-        &tmp.path().join("archive/a.wacz"),
+        &tmp.path().join("archive/test/a.wacz"),
         "https://app.browsertrix.com",
         "item-xyz",
         "sha256:aa",
+        Some(5),
     )
     .unwrap();
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
@@ -750,6 +753,73 @@ async fn thumb_route_unknown_id_404() {
 }
 
 #[tokio::test]
+async fn collection_thumbnail_is_set_served_and_preferred() {
+    let tmp = make_index(&["simple.wacz"]); // collection "test"
+                                            // A small valid image the curator pins for the whole collection.
+    let pic = tmp.path().join("pic.png");
+    image::RgbImage::from_pixel(8, 8, image::Rgb([10, 20, 30]))
+        .save(&pic)
+        .unwrap();
+    rustyweb_lib::index::set_collection_thumbnail(tmp.path(), "test", &pic).unwrap();
+
+    // Committed under the collection dir (git-trackable).
+    assert!(tmp.path().join("collections/test/thumbnail.jpg").is_file());
+
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    // Served at /collection-thumb/<slug>.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/collection-thumb/test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap(),
+        "image/jpeg"
+    );
+
+    // The homepage card prefers it (links to /collection-thumb/test).
+    let home = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = to_bytes(home.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("/collection-thumb/test"),
+        "homepage card should use the collection thumbnail: {html}"
+    );
+}
+
+#[tokio::test]
+async fn collection_thumb_rejects_traversal_ids() {
+    let tmp = TempDir::new().unwrap();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    for bad in ["..", "a%2Fb", "a.b"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/collection-thumb/{bad}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "id {bad:?} must not resolve a file"
+        );
+    }
+}
+
+#[tokio::test]
 async fn collection_card_shows_placeholder_without_image() {
     // simple.wacz deflates its WARCs (scan path), so no thumbnail is generated —
     // the card should render the image area as a CSS placeholder, not an <img>.
@@ -782,15 +852,16 @@ async fn home_directory_is_portable() {
     let archive = home_a.join("archive");
     std::fs::create_dir_all(&archive).unwrap();
     std::fs::copy(fixture("simple.wacz"), archive.join("simple.wacz")).unwrap();
-    rustyweb_lib::index::index_path(&archive.join("simple.wacz"), &home_a, None).unwrap();
+    rustyweb_lib::index::index_path(&archive.join("simple.wacz"), &home_a, None, "test").unwrap();
 
-    // The source is stored relative to home (portable), not absolute.
+    // The source is stored relative to home (portable), filed under its
+    // collection folder, not absolute.
     let manifest = Manifest::open(&home_a.join("index")).unwrap();
     let id = manifest.waczs[0].id.clone();
     assert_eq!(
         manifest.waczs[0].source,
-        Source::File(Path::new("archive/simple.wacz").to_path_buf()),
-        "local WACZ should be stored relative to home"
+        Source::File(Path::new("archive/test/simple.wacz").to_path_buf()),
+        "local WACZ should be stored relative to home, under its collection"
     );
 
     // Move the whole home dir to a new path, then serve from there.
@@ -875,7 +946,8 @@ async fn index_from_http_url_and_link_directly() {
     // index_location uses a blocking HTTP client; run it off the async runtime.
     let (url_c, dir_c) = (url.clone(), tmp.path().to_path_buf());
     tokio::task::spawn_blocking(move || {
-        rustyweb_lib::index::index_location(&url_c, &dir_c, None, None, false, None, None).unwrap();
+        rustyweb_lib::index::index_location(&url_c, &dir_c, None, "test", false, None, None)
+            .unwrap();
     })
     .await
     .unwrap();

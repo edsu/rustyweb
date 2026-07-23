@@ -1,6 +1,7 @@
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -138,8 +139,10 @@ impl std::fmt::Display for Source {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Wacz {
     pub id: String,
-    /// Id of the [`Collection`] this WACZ belongs to. Defaults to the WACZ's own
-    /// id (a singleton collection) when not explicitly grouped.
+    /// Id (slug) of the [`Collection`] this WACZ belongs to. Every crawl belongs
+    /// to a collection — supplied at index/import time, held here in the manifest
+    /// (the authoritative membership record, incl. for remote sources with no
+    /// local file).
     #[serde(default)]
     pub collection: String,
     /// The WACZ location. Older manifests used the key `path`.
@@ -196,6 +199,31 @@ pub struct Wacz {
     /// WACZs flattened into this crawl. `None` for an ordinary (flat) WACZ.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested_waczs: Option<u64>,
+
+    // ── Provenance fields previously parsed-but-dropped, or newly read (populate
+    //    on reindex; all conditional so un-reindexed crawls just show less) ──
+    /// WACZ last-modified time (datapackage `modified`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+    /// Collection/crawl this WARC declares membership in (warcinfo `isPartOf`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_part_of: Option<String>,
+    /// Host the crawl ran on (warcinfo `hostname`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// WARC spec the crawl conforms to (warcinfo `conformsTo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conforms_to: Option<String>,
+    /// Topical keywords (datapackage `keywords`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
+    /// License labels (datapackage `licenses`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub licenses: Vec<String>,
+    /// HTTP status-code histogram across all captures (from the CDX) — the
+    /// derived "capture quality" / DACS Appraisal signal. Empty until reindex.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub status_counts: BTreeMap<u16, u64>,
 }
 
 impl Wacz {
@@ -222,89 +250,150 @@ pub struct BrowsertrixRef {
     /// present — the strongest signal that content is unchanged.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub resource_hash: String,
+    /// Browsertrix QA review rating (1–5, Excellent→Bad), if a human reviewed the
+    /// crawl. A DACS Appraisal signal surfaced on the crawl page. `None` if
+    /// unreviewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_status: Option<u8>,
 }
 
 /// A curated collection: a named group of [`Wacz`] members with its own
-/// (curatorial) metadata. Aggregates (member count, size, capture range,
-/// software) are derived from members at read time, not stored here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// curatorial (finding-aid) metadata. Aggregates (member count, size, capture
+/// range, software) are derived from members at read time, not stored here.
+///
+/// The descriptive metadata is the *source of truth* in a git-committable
+/// Markdown finding aid at `<home>/collections/<slug>/README.md` — YAML front-matter for
+/// the short structured fields, and a Markdown body for the `narrative` (Scope
+/// & Content / Custodial history / Appraisal prose). See [`load_finding_aids`]
+/// / [`write_finding_aid`]. Fields are framed against DACS / EAD.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Collection {
     pub id: String,
     pub name: String,
+    /// A short abstract / caption (EAD `<abstract>`), distinct from the longer
+    /// `narrative`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// When the collection was first created (RFC 3339).
     pub created: String,
-    /// Optional curator / owner.
+    /// Who runs this rustyweb instance / holds the collection (EAD
+    /// `<repository>`), distinct from `creator`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curator: Option<String>,
+
+    // ── Finding-aid front-matter (DACS / EAD) ──
+    /// Collecting org/person responsible for the records (EAD `<origination>`,
+    /// DACS Name of Creator) — distinct from `curator`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+    /// Curatorial coverage statement (EAD `<unitdate>`, DACS Date), distinct
+    /// from the auto-derived capture range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dates: Option<String>,
+    /// Conditions governing access and use (EAD `<accessrestrict>` +
+    /// `<userestrict>`, DACS 4.1/4.4) — one field labelled to cover both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rights: Option<String>,
+    /// Topical access points (EAD `<controlaccess>`, DACS Subject).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+
+    // ── Finding-aid body ──
+    /// The Markdown narrative: Scope & Content plus Custodial history /
+    /// Appraisal, written as the curator sees fit (EAD `<scopecontent>` /
+    /// `<custodhist>` / `<appraisal>`). Stored as the Markdown body of the
+    /// finding-aid file, not in front-matter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narrative: Option<String>,
 }
 
-/// The on-disk manifest: curated collections (`collections.json`) plus their
-/// WACZ members (`waczs.json`), both under `<home>/index`.
+/// The on-disk manifest. WACZ members (membership + derived provenance) live in
+/// the *derived* `<home>/index/waczs.json`; collection descriptive metadata is
+/// the *source of truth* in git-committable Markdown finding aids at
+/// `<home>/collections/<slug>/README.md` (see [`load_finding_aids`]). A legacy
+/// `index/collections.json` is read once and migrated to `.md` on the next save.
 pub struct Manifest {
     index_dir: PathBuf,
+    /// Rustyweb home (`index_dir`'s parent); holds `collections/` + `crawls/`.
+    home: PathBuf,
     pub collections: Vec<Collection>,
     pub waczs: Vec<Wacz>,
+    /// Collection ids whose finding aid needs (re)writing on `save` — the set
+    /// created/modified this session, or migrated from legacy JSON. Untouched
+    /// finding aids are never rewritten, so hand edits keep their formatting.
+    dirty: HashSet<String>,
 }
 
 impl Manifest {
     pub fn open(index_dir: &Path) -> Result<Self> {
+        let home = index_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| index_dir.to_path_buf());
         let collections_path = index_dir.join("collections.json");
         let waczs_path = index_dir.join("waczs.json");
+        let collections_dir = home.join("collections");
+        let mut dirty = HashSet::new();
 
-        // New two-file layout.
-        if waczs_path.exists() {
-            return Ok(Self {
-                index_dir: index_dir.to_path_buf(),
-                collections: read_json(&collections_path)?.unwrap_or_default(),
-                waczs: read_json(&waczs_path)?.unwrap_or_default(),
-            });
-        }
+        // Migrate an earlier flat layout (`collections/<slug>.md`) into the
+        // per-collection dir form (`collections/<slug>/README.md`), preserving
+        // curator-authored prose. Best-effort; harmless once already migrated.
+        migrate_flat_finding_aids(&collections_dir);
 
-        // Migrate an older single-file `collections.json` that held WACZ
-        // records: each becomes a member of its own singleton collection.
-        if collections_path.exists() {
-            let data = std::fs::read_to_string(&collections_path)?;
-            let value: serde_json::Value = serde_json::from_str(&data)?;
-            let looks_like_waczs = value
-                .as_array()
-                .and_then(|a| a.first())
-                .map(|e| e.get("source").is_some() || e.get("path").is_some())
-                .unwrap_or(false);
-            if looks_like_waczs {
-                let mut waczs: Vec<Wacz> = serde_json::from_value(value)?;
-                let mut collections = Vec::new();
-                for w in &mut waczs {
-                    if w.collection.is_empty() {
-                        w.collection = w.id.clone();
-                    }
-                    collections.push(Collection {
+        // ── WACZ members (derived index) ──
+        let waczs: Vec<Wacz> = if waczs_path.exists() {
+            read_json(&waczs_path)?.unwrap_or_default()
+        } else if collections_path.exists() && legacy_json_holds_waczs(&collections_path)? {
+            // Oldest layout: `collections.json` held the WACZ records directly.
+            let value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&collections_path)?)?;
+            let mut waczs: Vec<Wacz> = serde_json::from_value(value)?;
+            for w in &mut waczs {
+                if w.collection.is_empty() {
+                    w.collection = w.id.clone();
+                }
+            }
+            waczs
+        } else {
+            Vec::new()
+        };
+
+        // ── Collection descriptive metadata (finding aids, source of truth) ──
+        let collections: Vec<Collection> = if dir_has_findingaid(&collections_dir) {
+            load_finding_aids(&collections_dir)?
+        } else if collections_path.exists() {
+            // Migrate from legacy `collections.json`, then write `.md` on save.
+            let value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&collections_path)?)?;
+            let cols: Vec<Collection> = if legacy_json_holds_waczs(&collections_path)? {
+                // Synthesize a singleton collection per legacy WACZ.
+                waczs
+                    .iter()
+                    .map(|w| Collection {
                         id: w.id.clone(),
                         name: w.name.clone(),
                         description: w.description.clone(),
                         created: w.date_indexed.clone(),
-                        curator: None,
-                    });
-                }
-                return Ok(Self {
-                    index_dir: index_dir.to_path_buf(),
-                    collections,
-                    waczs,
-                });
+                        ..Default::default()
+                    })
+                    .collect()
+            } else {
+                serde_json::from_value(value).unwrap_or_default()
+            };
+            for c in &cols {
+                dirty.insert(c.id.clone());
             }
-            // Otherwise collections.json already holds groups (waczs.json just missing).
-            return Ok(Self {
-                index_dir: index_dir.to_path_buf(),
-                collections: serde_json::from_value(value).unwrap_or_default(),
-                waczs: Vec::new(),
-            });
-        }
+            cols
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             index_dir: index_dir.to_path_buf(),
-            collections: Vec::new(),
-            waczs: Vec::new(),
+            home,
+            collections,
+            waczs,
+            dirty,
         })
     }
 
@@ -317,15 +406,6 @@ impl Manifest {
         }
     }
 
-    /// Insert or replace a collection by id.
-    pub fn upsert_collection(&mut self, collection: Collection) {
-        if let Some(pos) = self.collections.iter().position(|c| c.id == collection.id) {
-            self.collections[pos] = collection;
-        } else {
-            self.collections.push(collection);
-        }
-    }
-
     /// Ensure a collection with `id` exists, creating a default one (named
     /// `name`) if it doesn't. Returns the collection id for convenience.
     pub fn ensure_collection(&mut self, id: &str, name: &str, created: &str) -> String {
@@ -333,54 +413,52 @@ impl Manifest {
             self.collections.push(Collection {
                 id: id.to_string(),
                 name: name.to_string(),
-                description: None,
                 created: created.to_string(),
-                curator: None,
+                ..Default::default()
             });
+            self.dirty.insert(id.to_string());
         }
         id.to_string()
     }
 
-    /// Create or update a collection's metadata by name (its id is the slug of
-    /// the name). Only provided fields are changed; `created` is set on first
-    /// creation. Returns the collection id.
-    pub fn set_collection(
-        &mut self,
-        name: &str,
-        description: Option<String>,
-        curator: Option<String>,
-        created: &str,
-    ) -> String {
+    /// Create or update a collection's curatorial metadata by name (its id is
+    /// the slug of the name). Only fields set in `fields` change; `created` is
+    /// set on first creation. Merge policy is "fill gaps, curator wins": the
+    /// caller decides what to pass (the CLI passes what the curator typed; an
+    /// importer passes only fields that are still empty). Returns the id.
+    pub fn apply_fields(&mut self, name: &str, fields: &CollectionFields, created: &str) -> String {
         let id = slugify(name);
+        self.dirty.insert(id.clone());
         if let Some(c) = self.collections.iter_mut().find(|c| c.id == id) {
             c.name = name.to_string();
-            if description.is_some() {
-                c.description = description;
-            }
-            if curator.is_some() {
-                c.curator = curator;
-            }
+            fields.apply_to(c);
         } else {
-            self.collections.push(Collection {
+            let mut c = Collection {
                 id: id.clone(),
                 name: name.to_string(),
-                description,
                 created: created.to_string(),
-                curator,
-            });
+                ..Default::default()
+            };
+            fields.apply_to(&mut c);
+            self.collections.push(c);
         }
         id
     }
 
+    /// Persist the manifest: the derived `waczs.json`, plus a Markdown finding
+    /// aid for every collection created/modified this session. Untouched finding
+    /// aids are left on disk as-is (so hand edits keep their formatting).
     pub fn save(&self) -> Result<()> {
-        std::fs::write(
-            self.index_dir.join("collections.json"),
-            serde_json::to_string_pretty(&self.collections)?,
-        )?;
+        std::fs::create_dir_all(&self.index_dir)?;
         std::fs::write(
             self.index_dir.join("waczs.json"),
             serde_json::to_string_pretty(&self.waczs)?,
         )?;
+        for c in &self.collections {
+            if self.dirty.contains(&c.id) {
+                write_finding_aid(&self.home, c)?;
+            }
+        }
         Ok(())
     }
 
@@ -407,6 +485,297 @@ fn read_json<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Result<Option<
     }
     let data = std::fs::read_to_string(path)?;
     Ok(Some(serde_json::from_str(&data)?))
+}
+
+// ── Finding-aid files (git-committable curator source of truth) ────────────────
+
+/// A partial update to a collection's curatorial metadata. Every field is
+/// optional so callers change only what they mean to; `subjects` is
+/// `Option<Vec>` so "not provided" (`None`) differs from "clear to empty"
+/// (`Some(vec![])`). Shared by the `collection set` CLI and the importer, with a
+/// "fill gaps, curator wins" policy applied by the *caller* (see
+/// [`Manifest::apply_fields`]).
+#[derive(Debug, Clone, Default)]
+pub struct CollectionFields {
+    pub description: Option<String>,
+    pub curator: Option<String>,
+    pub creator: Option<String>,
+    pub dates: Option<String>,
+    pub rights: Option<String>,
+    pub subjects: Option<Vec<String>>,
+    pub narrative: Option<String>,
+}
+
+impl CollectionFields {
+    /// Whether nothing is set (nothing to apply).
+    pub fn is_empty(&self) -> bool {
+        self.description.is_none()
+            && self.curator.is_none()
+            && self.creator.is_none()
+            && self.dates.is_none()
+            && self.rights.is_none()
+            && self.subjects.is_none()
+            && self.narrative.is_none()
+    }
+
+    /// Overwrite `c`'s fields for each value that is `Some` (leave the rest).
+    fn apply_to(&self, c: &mut Collection) {
+        if self.description.is_some() {
+            c.description = self.description.clone();
+        }
+        if self.curator.is_some() {
+            c.curator = self.curator.clone();
+        }
+        if self.creator.is_some() {
+            c.creator = self.creator.clone();
+        }
+        if self.dates.is_some() {
+            c.dates = self.dates.clone();
+        }
+        if self.rights.is_some() {
+            c.rights = self.rights.clone();
+        }
+        if let Some(s) = &self.subjects {
+            c.subjects = s.clone();
+        }
+        if self.narrative.is_some() {
+            c.narrative = self.narrative.clone();
+        }
+    }
+}
+
+/// The YAML front-matter of a `collections/<slug>/README.md` finding aid. The `id` is the
+/// filename stem (not stored here); the `narrative` is the Markdown body.
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct FrontMatter {
+    // `name` and `created` are `default` so a hand-authored file can omit them:
+    // `name` falls back to the filename stem (see `parse_finding_aid`), and a
+    // missing `created` is tolerated rather than failing the whole manifest load.
+    #[serde(default)]
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    curator: Option<String>,
+    #[serde(default)]
+    created: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dates: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rights: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    subjects: Vec<String>,
+}
+
+/// The committable directory for a collection: `<home>/collections/<slug>/`,
+/// holding its `README.md` finding aid plus any committable assets (per-crawl
+/// notes, pinned/collection thumbnails).
+pub fn collection_dir(home: &Path, slug: &str) -> PathBuf {
+    home.join("collections").join(slug)
+}
+
+/// Migrate any flat `collections/<slug>.md` finding aids into the per-collection
+/// directory form `collections/<slug>/README.md`. Best-effort and idempotent: a
+/// flat file is moved only when its target `README.md` doesn't already exist.
+fn migrate_flat_finding_aids(collections_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(collections_dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().is_some_and(|x| x == "md") && path.is_file() {
+            let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let target = collections_dir.join(slug).join("README.md");
+            if !target.exists() {
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::rename(&path, &target);
+            }
+        }
+    }
+}
+
+/// Whether `collections_dir` holds at least one `<slug>/README.md` finding aid.
+fn dir_has_findingaid(collections_dir: &Path) -> bool {
+    std::fs::read_dir(collections_dir)
+        .map(|rd| rd.flatten().any(|e| e.path().join("README.md").is_file()))
+        .unwrap_or(false)
+}
+
+/// Whether a legacy `collections.json` array's first element looks like a WACZ
+/// record (has `source`/`path`) rather than a collection group.
+fn legacy_json_holds_waczs(path: &Path) -> Result<bool> {
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    Ok(value
+        .as_array()
+        .and_then(|a| a.first())
+        .map(|e| e.get("source").is_some() || e.get("path").is_some())
+        .unwrap_or(false))
+}
+
+/// Load every `collections/<slug>/README.md` finding aid (the descriptive source
+/// of truth), sorted by id for a stable order.
+pub fn load_finding_aids(collections_dir: &Path) -> Result<Vec<Collection>> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(collections_dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("README.md").is_file())
+        .collect();
+    dirs.sort();
+    let mut out = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let id = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let readme = dir.join("README.md");
+        let text = std::fs::read_to_string(&readme)
+            .with_context(|| format!("reading finding aid {}", readme.display()))?;
+        out.push(
+            parse_finding_aid(&id, &text)
+                .with_context(|| format!("parsing finding aid {}", readme.display()))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Parse a finding aid's text (YAML front-matter + Markdown body) into a
+/// [`Collection`] with the given `id` (the collection directory name).
+fn parse_finding_aid(id: &str, text: &str) -> Result<Collection> {
+    let (fm_src, body) = split_front_matter(text);
+    let fm: FrontMatter = if fm_src.trim().is_empty() {
+        FrontMatter::default()
+    } else {
+        serde_yaml_ng::from_str(fm_src).context("parsing YAML front-matter")?
+    };
+    let narrative = {
+        let b = body.trim();
+        (!b.is_empty()).then(|| b.to_string())
+    };
+    Ok(Collection {
+        id: id.to_string(),
+        name: if fm.name.is_empty() {
+            id.to_string()
+        } else {
+            fm.name
+        },
+        description: fm.description,
+        created: fm.created,
+        curator: fm.curator,
+        creator: fm.creator,
+        dates: fm.dates,
+        rights: fm.rights,
+        subjects: fm.subjects,
+        narrative,
+    })
+}
+
+/// Split leading `---`-delimited YAML front-matter from the Markdown body,
+/// returning `(front_matter_yaml, body)`. Front matter is `""` when absent (or
+/// when the opening fence has no matching close).
+fn split_front_matter(text: &str) -> (&str, &str) {
+    let t = text.strip_prefix('\u{feff}').unwrap_or(text); // tolerate a BOM
+    let after_open = match t
+        .strip_prefix("---\n")
+        .or_else(|| t.strip_prefix("---\r\n"))
+    {
+        Some(r) => r,
+        None => return ("", t),
+    };
+    let mut idx = 0;
+    for line in after_open.split_inclusive('\n') {
+        if line.trim_end_matches(['\n', '\r']) == "---" {
+            return (&after_open[..idx], &after_open[idx + line.len()..]);
+        }
+        idx += line.len();
+    }
+    ("", t) // unterminated front matter → treat the whole file as body
+}
+
+/// Write a collection's finding aid to `<home>/collections/<slug>/README.md`:
+/// YAML front-matter for the structured fields, then the Markdown `narrative`
+/// body.
+pub fn write_finding_aid(home: &Path, c: &Collection) -> Result<()> {
+    let dir = collection_dir(home, &c.id);
+    std::fs::create_dir_all(&dir)?;
+    let fm = FrontMatter {
+        name: c.name.clone(),
+        description: c.description.clone(),
+        curator: c.curator.clone(),
+        created: c.created.clone(),
+        creator: c.creator.clone(),
+        dates: c.dates.clone(),
+        rights: c.rights.clone(),
+        subjects: c.subjects.clone(),
+    };
+    let yaml = serde_yaml_ng::to_string(&fm).context("serializing YAML front-matter")?;
+    let mut out = String::from("---\n");
+    out.push_str(&yaml);
+    if !yaml.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("---\n");
+    if let Some(body) = c
+        .narrative
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        out.push('\n');
+        out.push_str(body);
+        out.push('\n');
+    }
+    let path = dir.join("README.md");
+    std::fs::write(&path, out)
+        .with_context(|| format!("writing finding aid {}", path.display()))?;
+    Ok(())
+}
+
+/// Path to a crawl's committable Markdown note, under its collection:
+/// `<home>/collections/<slug>/crawls/<id>.md`.
+pub fn crawl_note_path(home: &Path, collection: &str, id: &str) -> PathBuf {
+    collection_dir(home, collection)
+        .join("crawls")
+        .join(format!("{id}.md"))
+}
+
+/// Path to a crawl's curator-pinned thumbnail (committable, downscaled JPEG):
+/// `<home>/collections/<slug>/crawls/<id>.jpg`. Its *presence* is the pin marker
+/// — a pinned image lives with the finding aid and is never overwritten by
+/// (re)indexing (which only writes the auto cache under `index/thumbs/`).
+pub fn pinned_thumb_path(home: &Path, collection: &str, id: &str) -> PathBuf {
+    collection_dir(home, collection)
+        .join("crawls")
+        .join(format!("{id}.jpg"))
+}
+
+/// Path to a collection's curator-set representative thumbnail (committable):
+/// `<home>/collections/<slug>/thumbnail.jpg`.
+pub fn collection_thumb_path(home: &Path, collection: &str) -> PathBuf {
+    collection_dir(home, collection).join("thumbnail.jpg")
+}
+
+/// Read a crawl's Markdown note, if present and non-empty.
+pub fn read_crawl_note(home: &Path, collection: &str, id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crawl_note_path(home, collection, id)).ok()?;
+    let t = text.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Write a crawl's Markdown note to `<home>/collections/<slug>/crawls/<id>.md`.
+pub fn write_crawl_note(home: &Path, collection: &str, id: &str, note: &str) -> Result<()> {
+    let path = crawl_note_path(home, collection, id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, format!("{}\n", note.trim()))
+        .with_context(|| format!("writing crawl note {}", path.display()))?;
+    Ok(())
 }
 
 /// Deserialize `software` as either a single string (older manifests wrote one)
@@ -634,6 +1003,13 @@ mod tests {
             capture_end: None,
             browsertrix: None,
             nested_waczs: None,
+            modified: None,
+            is_part_of: None,
+            hostname: None,
+            conforms_to: None,
+            keywords: Vec::new(),
+            licenses: Vec::new(),
+            status_counts: BTreeMap::new(),
         }
     }
 
@@ -661,6 +1037,7 @@ mod tests {
                 host: "https://app.browsertrix.com".to_string(),
                 item_id: "item-1".to_string(),
                 resource_hash: "sha256:aa".to_string(),
+                review_status: Some(4),
             });
             w
         };
@@ -711,30 +1088,219 @@ mod tests {
     }
 
     #[test]
-    fn set_collection_creates_then_updates_preserving_created() {
+    fn apply_fields_creates_then_updates_preserving_created() {
         let tmp = TempDir::new().unwrap();
-        let mut m = Manifest::open(tmp.path()).unwrap();
+        let mut m = Manifest::open(&tmp.path().join("index")).unwrap();
 
-        let id = m.set_collection(
+        let id = m.apply_fields(
             "Bay Area Transit",
-            Some("desc".into()),
-            None,
+            &CollectionFields {
+                description: Some("desc".into()),
+                ..Default::default()
+            },
             "2026-01-01T00:00:00Z",
         );
         assert_eq!(id, "bay-area-transit");
         assert_eq!(m.collections.len(), 1);
         assert_eq!(m.collections[0].description.as_deref(), Some("desc"));
 
-        // Re-setting updates fields but keeps the original created timestamp.
-        m.set_collection(
+        // Re-applying updates only the Some fields, keeps `created`, and — "fill
+        // gaps, curator wins" — a None leaves the existing value untouched.
+        m.apply_fields(
             "Bay Area Transit",
-            Some("new".into()),
-            Some("Ed".into()),
+            &CollectionFields {
+                description: None, // not provided → keep "desc"
+                curator: Some("Ed".into()),
+                creator: Some("BART".into()),
+                subjects: Some(vec!["transit".into(), "bay-area".into()]),
+                ..Default::default()
+            },
             "2026-02-02T00:00:00Z",
         );
         assert_eq!(m.collections.len(), 1);
-        assert_eq!(m.collections[0].description.as_deref(), Some("new"));
+        assert_eq!(m.collections[0].description.as_deref(), Some("desc"));
         assert_eq!(m.collections[0].curator.as_deref(), Some("Ed"));
+        assert_eq!(m.collections[0].creator.as_deref(), Some("BART"));
+        assert_eq!(m.collections[0].subjects, vec!["transit", "bay-area"]);
         assert_eq!(m.collections[0].created, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn finding_aid_roundtrips_through_files() {
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index");
+
+        let mut m = Manifest::open(&index_dir).unwrap();
+        m.apply_fields(
+            "SUCHO",
+            &CollectionFields {
+                creator: Some("Saving Ukrainian Cultural Heritage Online".into()),
+                dates: Some("2022–2023".into()),
+                rights: Some("See individual sites; archived for research".into()),
+                subjects: Some(vec!["ukraine".into(), "cultural heritage".into()]),
+                narrative: Some("## Scope and Content\n\nWhy this was archived.".into()),
+                ..Default::default()
+            },
+            "2026-01-01T00:00:00Z",
+        );
+        m.save().unwrap();
+
+        // A finding-aid Markdown file is written under <home>/collections/<slug>/.
+        let md = tmp.path().join("collections/sucho/README.md");
+        assert!(md.exists(), "finding aid should be written to {md:?}");
+        let text = std::fs::read_to_string(&md).unwrap();
+        assert!(text.starts_with("---\n"), "has YAML front-matter");
+        assert!(text.contains("creator: Saving Ukrainian"));
+        assert!(text.contains("## Scope and Content"));
+
+        // Re-opening reads the file back as the source of truth.
+        let m2 = Manifest::open(&index_dir).unwrap();
+        let c = m2.collection_by_id("sucho").unwrap();
+        assert_eq!(
+            c.creator.as_deref(),
+            Some("Saving Ukrainian Cultural Heritage Online")
+        );
+        assert_eq!(c.subjects, vec!["ukraine", "cultural heritage"]);
+        assert_eq!(
+            c.narrative.as_deref(),
+            Some("## Scope and Content\n\nWhy this was archived.")
+        );
+        assert_eq!(c.created, "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn hand_edited_finding_aid_loads() {
+        // A curator can author the Markdown by hand; rustyweb reads it verbatim.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("collections/my-coll");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("README.md"),
+            "---\nname: My Collection\ncreated: 2026-03-01T00:00:00Z\nsubjects:\n  - a\n  - b\n---\n\n# About\n\nHand-written prose.\n",
+        )
+        .unwrap();
+
+        let m = Manifest::open(&tmp.path().join("index")).unwrap();
+        let c = m.collection_by_id("my-coll").unwrap();
+        assert_eq!(c.name, "My Collection");
+        assert_eq!(c.subjects, vec!["a", "b"]);
+        assert_eq!(
+            c.narrative.as_deref(),
+            Some("# About\n\nHand-written prose.")
+        );
+    }
+
+    #[test]
+    fn minimal_hand_edited_finding_aid_does_not_crash_load() {
+        // A curator may omit `name`/`created`; that must not fail the whole
+        // manifest load. `name` falls back to the filename stem.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("collections/sucho");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("README.md"),
+            "---\ncreator: Someone\n---\n\n## Scope\n\nWhy.\n",
+        )
+        .unwrap();
+
+        let m = Manifest::open(&tmp.path().join("index")).unwrap();
+        let c = m
+            .collection_by_id("sucho")
+            .expect("loads despite missing name/created");
+        assert_eq!(c.name, "sucho", "name falls back to the directory name");
+        assert_eq!(c.creator.as_deref(), Some("Someone"));
+    }
+
+    #[test]
+    fn legacy_collections_json_migrates_to_markdown() {
+        // A pre-existing index/collections.json (groups, no collections/ dir)
+        // loads and is migrated to a Markdown finding aid on save.
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(
+            index_dir.join("collections.json"),
+            r#"[{"id":"old","name":"Old Coll","description":"legacy","created":"2025-01-01T00:00:00Z"}]"#,
+        )
+        .unwrap();
+        // waczs.json present (so this isn't the waczs-in-collections layout).
+        std::fs::write(index_dir.join("waczs.json"), "[]").unwrap();
+
+        let m = Manifest::open(&index_dir).unwrap();
+        assert_eq!(
+            m.collection_by_id("old").unwrap().description.as_deref(),
+            Some("legacy")
+        );
+        m.save().unwrap();
+        assert!(tmp.path().join("collections/old/README.md").exists());
+    }
+
+    #[test]
+    fn flat_finding_aid_migrates_to_subdir_on_open() {
+        // A home from the earlier flat layout (collections/<slug>.md) is migrated
+        // to collections/<slug>/README.md, preserving the curator's prose.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("collections");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sucho.md"),
+            "---\nname: SUCHO\ncreated: 2026-01-01T00:00:00Z\n---\n\n## Scope\n\nWhy.\n",
+        )
+        .unwrap();
+
+        let m = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert!(
+            dir.join("sucho/README.md").is_file(),
+            "flat file migrated into the collection dir"
+        );
+        assert!(!dir.join("sucho.md").exists(), "flat file removed");
+        let c = m.collection_by_id("sucho").unwrap();
+        assert_eq!(c.name, "SUCHO");
+        assert_eq!(c.narrative.as_deref(), Some("## Scope\n\nWhy."));
+    }
+
+    #[test]
+    fn migration_does_not_clobber_an_existing_readme() {
+        // If a flat <slug>.md and an already-migrated <slug>/README.md coexist,
+        // the migration must not overwrite the README (idempotent, safe).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("collections");
+        std::fs::create_dir_all(dir.join("sucho")).unwrap();
+        std::fs::write(
+            dir.join("sucho/README.md"),
+            "---\nname: Kept\ncreated: 2026-01-01T00:00:00Z\n---\n\nThe real one.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sucho.md"), "---\nname: Stale\n---\n\nOld flat.\n").unwrap();
+
+        let m = Manifest::open(&tmp.path().join("index")).unwrap();
+        // The subdir README wins; the flat file is left untouched (not moved over).
+        assert_eq!(m.collection_by_id("sucho").unwrap().name, "Kept");
+        assert!(
+            dir.join("sucho.md").exists(),
+            "flat file not clobbered onto README"
+        );
+    }
+
+    #[test]
+    fn crawl_note_roundtrips() {
+        let tmp = TempDir::new().unwrap();
+        assert!(read_crawl_note(tmp.path(), "sucho", "abc12345").is_none());
+        write_crawl_note(
+            tmp.path(),
+            "sucho",
+            "abc12345",
+            "  A note about absences.  ",
+        )
+        .unwrap();
+        // Stored under the collection dir, committable alongside the finding aid.
+        assert!(tmp
+            .path()
+            .join("collections/sucho/crawls/abc12345.md")
+            .is_file());
+        assert_eq!(
+            read_crawl_note(tmp.path(), "sucho", "abc12345").as_deref(),
+            Some("A note about absences.")
+        );
     }
 }

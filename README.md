@@ -124,32 +124,42 @@ directory):
 
 ```
 <home>/
-├── archive/   your WACZ files
-└── index/     search index + metadata (created by `rustyweb index`)
+├── archive/<slug>/     your WACZ files, organized by collection
+├── collections/<slug>/ finding aids you author + commit (README.md, thumbnails, notes)
+└── index/              search index + derived metadata (rebuildable; git-ignore it)
 ```
 
-Keep your WACZ files in `archive/`, then index and serve:
+The `collections/` folder is the part worth keeping in version control - the prose
+and images a curator writes. `index/` is derived from the WACZs and rebuilt by
+`rustyweb reindex`, so a home in git typically `.gitignore`s `/index`.
+
+Index one or more WACZ files into a collection, then serve:
 
 ```sh
-mkdir -p archive
-cp my-archive.wacz archive/
-
-rustyweb index archive/*.wacz   # index the WACZs in your archive folder
-rustyweb serve                  # http://127.0.0.1:8080
+rustyweb index my-archive.wacz --collection "My Web Archive"   # files it into archive/my-web-archive/
+rustyweb serve                                                 # http://127.0.0.1:8080
 ```
 
-Local WACZ files must live under `<home>/archive` - rustyweb indexes them in
-place (it does not copy them) and stores each source relative to home, so you
-can move or copy the whole `<home>` directory to another disk or machine and it
-still works. Point at a different home with `--home <DIR>` (every command takes
-it).
+Every crawl belongs to a **collection**, so `index` requires `--collection <NAME>`
+(created if new). This is a deliberate nudge to say what a crawl is a part of and
+why you're keeping it — the curatorial context rustyweb is built to surface.
+Describe a collection further (creator, dates, rights, a scope note) with
+[`rustyweb collection set`](#command-line), which writes a git-committable finding
+aid at `collections/<slug>/README.md`.
+
+A local WACZ can live anywhere - `rustyweb index path/to/foo.wacz --collection
+"Bar"` files it into `<home>/archive/bar/` for you (**moving** it if it's already
+under `archive/`, **copying** it otherwise, so your original is left intact). The
+source is stored relative to home, so you can move or copy the whole `<home>`
+directory to another disk or machine and it still works. Point at a different home
+with `--home <DIR>` (every command takes it).
 
 `index` takes one or more archived WACZ files or `http(s)` URLs, so you can also
 index a single file or a remote WACZ:
 
 ```sh
-rustyweb index archive/my-archive.wacz
-rustyweb index https://example.org/site.wacz
+rustyweb index archive/my-archive.wacz --collection "My Web Archive"
+rustyweb index https://example.org/site.wacz --collection "My Web Archive"
 ```
 
 To rebuild the index later from what you've already indexed, use
@@ -168,7 +178,7 @@ refresh collections.
 A WACZ can also live at an `http(s)` URL. For example, this one is hosted on S3:
 
 ```sh
-rustyweb index https://edsu-webarchives.s3.amazonaws.com/docnow.wacz
+rustyweb index https://edsu-webarchives.s3.amazonaws.com/docnow.wacz --collection "DocNow"
 rustyweb serve
 ```
 
@@ -190,7 +200,7 @@ range- and CORS-capable HTTPS URL (public or presigned) and index it.
 If you'd rather keep a **local copy**, add `--download`:
 
 ```sh
-rustyweb index --download https://edsu-webarchives.s3.amazonaws.com/docnow.wacz
+rustyweb index --download https://edsu-webarchives.s3.amazonaws.com/docnow.wacz --collection "DocNow"
 ```
 
 This fetches the WACZ into `<home>/archive`, indexes it as a local file, and
@@ -335,12 +345,12 @@ Notes:
 ## Command line
 
 ```
-rustyweb index           [--home <DIR>] [--name <NAME>] [--collection <NAME>] [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
+rustyweb index           [--home <DIR>] [--name <NAME>] --collection <NAME> [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
 rustyweb reindex         [--home <DIR>] [--concurrency <N>] [-v|--verbose]
 rustyweb serve           [--home <DIR>] [--bind <ADDR>]
-rustyweb collection set  [--home <DIR>] <COLLECTION> <WACZ_ID>...
+rustyweb collection set  [--home <DIR>] <NAME> [--creator <TEXT>] [--dates <TEXT>] [--rights <TEXT>] [--subject <SUBJECT>]... [--narrative <MD> | --narrative-file <FILE>] [--thumbnail <FILE>] [--description <TEXT>] [--curator <TEXT>]
 rustyweb collection list [--home <DIR>]
-rustyweb crawl set       [--home <DIR>] <CRAWL_ID> --image <FILE>
+rustyweb crawl set       [--home <DIR>] <CRAWL_ID> [--image <FILE>] [--note <MD> | --note-file <FILE>]
 rustyweb search-url      [--home <DIR>] <URL>
 rustyweb verify          [--home <DIR>]
 rustyweb import browsertrix [--home <DIR>] [--host <URL>] [--org <SLUG>] [--collection <ID|SLUG>] [--crawl <ID>] [--into <NAME>] [--include-unreviewed] [--min-review <N>] [--limit <N>] [--dry-run] [--stream] [--force] [-v]
@@ -355,18 +365,19 @@ derived siblings under it.
   a WACZ can't be read that way - see [How indexing reads a
   WACZ](#how-indexing-reads-a-wacz)). A remote URL is **streamed** over HTTP range
   requests, no download (see [Remote WACZ files](#remote-wacz-files)). A local
-  WACZ must live under `<home>/archive`; rustyweb indexes it in place rather than
-  copying it, and a path outside the archive folder (or a directory) is an error.
-  Index several with a shell glob: `rustyweb index archive/*.wacz`. Extracts
+  WACZ may live anywhere - rustyweb files it into `<home>/archive/<slug>/`
+  (moving it if already under `archive/`, else copying it), and a directory or
+  non-`.wacz` path is an error. Index several with a shell glob. Extracts
   searchable text from each page (HTML, Browsertrix's rendered `urn:text` records
   or `pages/*.jsonl` text, and PDFs), reads `datapackage.json` for collection
   metadata, and records
   everything in the manifest under `<home>/index/`, including the SHA-256 of each
   local WACZ. Local WACZ paths are stored relative to home so the folder is
   portable. The WACZ name comes from `--name` if given, otherwise the WACZ's
-  `datapackage.json` title, otherwise the filename. `--collection <NAME>` groups
-  the WACZs into a curated collection (created if new); without it each WACZ is its
-  own collection. `--download` fetches a remote WACZ into `<home>/archive` for a
+  `datapackage.json` title, otherwise the filename. **`--collection <NAME>` is
+  required** — every crawl belongs to a curated collection (created if new); there
+  are no auto singletons. `--download` fetches a remote WACZ into
+  `<home>/archive/<collection-slug>/` for a
   durable local copy instead of streaming it in place. To index many at once, pass
   a newline-delimited list of files/URLs with `--from-file <FILE>` (or `-f -` to
   read from stdin); blank lines and `#` comments are ignored, and it combines with
@@ -378,7 +389,13 @@ derived siblings under it.
   bundles other WACZs, e.g. a Browsertrix combined-collection download) is
   detected automatically and its inner crawls indexed too, into one entry.
 - **`collection`** - `collection list` shows collections and their members;
-  `collection set <COLLECTION> <WACZ_ID>...` moves WACZs into a collection.
+  `collection set <NAME> …` writes a collection's finding-aid metadata (creator,
+  dates, rights, subjects, a Markdown narrative, and an optional `--thumbnail`) to
+  a git-committable `collections/<slug>/README.md` you can also hand-edit.
+  `crawl set <ID> --note` adds a per-crawl Markdown note
+  (`collections/<slug>/crawls/<id>.md`); `crawl set <ID> --image` pins a crawl
+  thumbnail there too. (WACZ→collection membership is set when indexing, via
+  `index --collection <NAME>`.)
 - **`reindex`** - rebuild the search index from the WACZs already in the
   manifest, preserving collection membership and metadata. Re-fetches remote URL
   sources and recreates the index from scratch, so it's the way to migrate after

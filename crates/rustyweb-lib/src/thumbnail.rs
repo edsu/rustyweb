@@ -30,47 +30,37 @@ const MIN_IMAGE_BYTES: u64 = 5_000;
 /// pin a bigger one with `crawl set --image`.
 const MAX_IMAGE_BYTES: u64 = 3_000_000;
 
-/// Path of a crawl's cached thumbnail.
+/// Path of a crawl's cached (auto-selected) thumbnail.
 fn thumb_file(thumbs_dir: &Path, crawl_id: &str) -> PathBuf {
     thumbs_dir.join(format!("{crawl_id}.jpg"))
 }
 
-/// Marker next to a thumbnail: present when a curator pinned it, so (re)indexing
-/// won't overwrite their choice.
-fn pin_file(thumbs_dir: &Path, crawl_id: &str) -> PathBuf {
-    thumbs_dir.join(format!("{crawl_id}.pinned"))
-}
-
-/// Whether a crawl's thumbnail was pinned by a curator.
-pub(crate) fn is_pinned(thumbs_dir: &Path, crawl_id: &str) -> bool {
-    pin_file(thumbs_dir, crawl_id).exists()
-}
-
 /// Decode `bytes`, downscale to fit `THUMB_MAX_EDGE` (aspect preserved), and
-/// write the JPEG to `<thumbs_dir>/<crawl_id>.jpg`.
-fn write_thumbnail(thumbs_dir: &Path, crawl_id: &str, bytes: &[u8]) -> Result<()> {
+/// write the JPEG to `dest`, creating its parent directory.
+fn write_thumbnail(dest: &Path, bytes: &[u8]) -> Result<()> {
     let img = image::load_from_memory(bytes).context("decoding image")?;
     let rgb = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE).into_rgb8();
     let mut out = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(rgb)
         .write_to(&mut out, image::ImageFormat::Jpeg)
         .context("encoding thumbnail")?;
-    std::fs::create_dir_all(thumbs_dir)
-        .with_context(|| format!("creating {}", thumbs_dir.display()))?;
-    let path = thumb_file(thumbs_dir, crawl_id);
-    std::fs::write(&path, out.into_inner())
-        .with_context(|| format!("writing {}", path.display()))?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(dest, out.into_inner())
+        .with_context(|| format!("writing {}", dest.display()))?;
     Ok(())
 }
 
-/// Pin a curator-supplied local image as a crawl's thumbnail. Downscales it like
-/// any other thumbnail and marks it pinned so indexing won't replace it.
-pub(crate) fn set_manual(thumbs_dir: &Path, crawl_id: &str, image_file: &Path) -> Result<()> {
+/// Pin a curator-supplied local image at `dest` (a committable path under the
+/// collection). Downscales it like any other thumbnail; its presence is the pin
+/// marker, so (re)indexing won't replace it. Shared by crawl and collection
+/// thumbnails.
+pub(crate) fn set_manual(dest: &Path, image_file: &Path) -> Result<()> {
     let bytes =
         std::fs::read(image_file).with_context(|| format!("reading {}", image_file.display()))?;
-    write_thumbnail(thumbs_dir, crawl_id, &bytes)?;
-    std::fs::write(pin_file(thumbs_dir, crawl_id), b"").context("writing pin marker")?;
-    Ok(())
+    write_thumbnail(dest, &bytes)
 }
 
 /// Generate and cache a crawl's representative thumbnail from its WACZ: prefer a
@@ -85,12 +75,13 @@ pub(crate) fn generate<F>(
     thumbs_dir: &Path,
     crawl_id: &str,
     main_page_url: &str,
+    pinned_dest: &Path,
 ) -> Result<bool>
 where
     F: RangeFetch + Clone + Send + Sync,
 {
-    if is_pinned(thumbs_dir, crawl_id) {
-        return Ok(false); // a curator's pinned image stands
+    if pinned_dest.exists() {
+        return Ok(false); // a curator's committed pinned image stands
     }
 
     let mut zip = zip::ZipArchive::new(RangeReader::new(fetch.clone()))
@@ -104,7 +95,7 @@ where
     //    for JS-rendered sites where the saved HTML lists no usable image. Checked
     //    first, before the HTML is even fetched.
     if let Some(bytes) = screenshot_bytes(&fetch, &cdx, &starts, main_page_url)? {
-        write_thumbnail(thumbs_dir, crawl_id, &bytes)?;
+        write_thumbnail(&thumb_file(thumbs_dir, crawl_id), &bytes)?;
         return Ok(true);
     }
 
@@ -118,7 +109,7 @@ where
     if let Some(src) = og_image {
         if let Some(abs) = resolve(main_page_url, &src) {
             if let Some(bytes) = fetch_payload(&fetch, &cdx, &starts, &abs, "image")? {
-                write_thumbnail(thumbs_dir, crawl_id, &bytes)?;
+                write_thumbnail(&thumb_file(thumbs_dir, crawl_id), &bytes)?;
                 return Ok(true);
             }
         }
@@ -163,7 +154,7 @@ where
 
     if let Some(rec) = best {
         if let Some(bytes) = fetch_record_bytes(&fetch, &starts, rec)? {
-            write_thumbnail(thumbs_dir, crawl_id, &bytes)?;
+            write_thumbnail(&thumb_file(thumbs_dir, crawl_id), &bytes)?;
             return Ok(true);
         }
     }
@@ -309,20 +300,21 @@ mod tests {
     }
 
     #[test]
-    fn set_manual_writes_and_pins() {
+    fn set_manual_writes_downscaled_jpeg() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let thumbs = tmp.path().join("thumbs");
+        // A committable pinned destination under a collection dir.
+        let dest = tmp.path().join("collections/c/crawls/abc123.jpg");
         let src = tmp.path().join("pic.png");
         std::fs::write(&src, png_bytes(30, 20)).unwrap();
 
-        assert!(!is_pinned(&thumbs, "abc123"));
-        set_manual(&thumbs, "abc123", &src).unwrap();
-        assert!(thumb_file(&thumbs, "abc123").exists(), "thumbnail written");
-        assert!(is_pinned(&thumbs, "abc123"), "marked pinned");
+        set_manual(&dest, &src).unwrap();
+        assert!(
+            dest.exists(),
+            "pinned thumbnail written (parent dir created)"
+        );
 
         // it's a valid, downscaled JPEG
-        let out = image::load_from_memory(&std::fs::read(thumb_file(&thumbs, "abc123")).unwrap())
-            .unwrap();
+        let out = image::load_from_memory(&std::fs::read(&dest).unwrap()).unwrap();
         assert!(out.width() <= THUMB_MAX_EDGE && out.height() <= THUMB_MAX_EDGE);
     }
 
@@ -348,18 +340,26 @@ mod tests {
         // so the fetch source is never read (a dummy file stands in for it).
         let tmp = tempfile::TempDir::new().unwrap();
         let thumbs = tmp.path().join("thumbs");
+        let pinned = tmp.path().join("collections/c/crawls/pinned1.jpg");
         let src = tmp.path().join("pic.png");
         std::fs::write(&src, png_bytes(24, 16)).unwrap();
-        set_manual(&thumbs, "pinned1", &src).unwrap();
-        let before = std::fs::read(thumb_file(&thumbs, "pinned1")).unwrap();
+        set_manual(&pinned, &src).unwrap();
+        let before = std::fs::read(&pinned).unwrap();
 
         let dummy = tmp.path().join("dummy.bin");
         std::fs::write(&dummy, b"not a wacz").unwrap();
         let fetch = crate::http_range::FileFetch::open(&dummy).unwrap();
-        let wrote = generate(fetch, &thumbs, "pinned1", "https://ex.com/").unwrap();
+        let wrote = generate(fetch, &thumbs, "pinned1", "https://ex.com/", &pinned).unwrap();
 
-        assert!(!wrote, "generate() should skip a pinned crawl");
-        let after = std::fs::read(thumb_file(&thumbs, "pinned1")).unwrap();
+        assert!(
+            !wrote,
+            "generate() should skip a crawl with a committed pin"
+        );
+        assert!(
+            !thumb_file(&thumbs, "pinned1").exists(),
+            "no auto cache written for a pinned crawl"
+        );
+        let after = std::fs::read(&pinned).unwrap();
         assert_eq!(before, after, "the pinned thumbnail must be left untouched");
     }
 }

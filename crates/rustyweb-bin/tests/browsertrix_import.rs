@@ -100,8 +100,8 @@ fn router(base: String) -> Router {
         )
 }
 
-/// Read one of the manifest's JSON arrays under `<home>/index` (the manifest is
-/// split into `waczs.json` and `collections.json`, each a top-level array).
+/// Read the derived `waczs.json` array under `<home>/index` (collection
+/// descriptive metadata lives in `<home>/collections/*.md` finding aids).
 fn manifest_array(home: &Path, file: &str) -> Vec<Value> {
     let text = std::fs::read_to_string(home.join("index").join(file)).unwrap();
     serde_json::from_str::<Value>(&text)
@@ -142,8 +142,8 @@ fn import_a_collection_then_skip_on_rerun() {
 
     // WACZ landed under archive/, in the item's subdirectory.
     assert!(
-        home.path().join("archive/item1/simple.wacz").exists(),
-        "downloaded WACZ should be under <home>/archive/<item-id>/"
+        home.path().join("archive/news/item1/simple.wacz").exists(),
+        "downloaded WACZ should be under <home>/archive/<collection-slug>/<item-id>/"
     );
 
     // Manifest records the crawl, with Browsertrix provenance.
@@ -152,12 +152,17 @@ fn import_a_collection_then_skip_on_rerun() {
     assert_eq!(waczs[0]["browsertrix"]["item_id"], "item1");
     assert_eq!(waczs[0]["browsertrix"]["resource_hash"], "sha256:deadbeef");
     // No --into was passed, so importing the Browsertrix "News" collection
-    // should auto-create a matching rustyweb collection (not scatter singletons).
+    // should auto-create a matching rustyweb finding aid (not scatter singletons).
+    let news_md = home.path().join("collections/news/README.md");
     assert!(
-        manifest_array(home.path(), "collections.json")
-            .iter()
-            .any(|c| c["name"] == "News"),
-        "importing a collection should group its crawls into a same-named rustyweb collection"
+        news_md.exists(),
+        "importing a collection should create a collections/news/README.md finding aid"
+    );
+    assert!(
+        std::fs::read_to_string(&news_md)
+            .unwrap()
+            .contains("name: News"),
+        "the finding aid front-matter should carry the collection name"
     );
 
     // Re-run: the crawl is already imported, so it's skipped (no duplicate).
@@ -173,4 +178,42 @@ fn import_a_collection_then_skip_on_rerun() {
         1,
         "re-run must not add a duplicate crawl"
     );
+}
+
+#[test]
+fn whole_org_import_defaults_the_collection_to_the_org_name() {
+    // No --collection and no --into: every crawl still belongs to a collection,
+    // so the import falls back to the org name ("Demo" -> slug "demo") rather
+    // than scattering singletons.
+    let base = start_mock();
+    let home = TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rustyweb"))
+        .args(["import", "browsertrix"])
+        .args(["--host", &base])
+        .args(["--org", "demo"])
+        .arg("--home")
+        .arg(home.path())
+        .env("BROWSERTRIX_USER", "u")
+        .env("BROWSERTRIX_PASSWORD", "p")
+        .env_remove("BROWSERTRIX_TOKEN")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "import failed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Filed under the org-named collection, both on disk and as a finding aid.
+    assert!(
+        home.path().join("archive/demo/item1/simple.wacz").exists(),
+        "WACZ should land under archive/<org-slug>/"
+    );
+    assert!(
+        home.path().join("collections/demo/README.md").exists(),
+        "a finding aid for the org-named collection should be created"
+    );
+    let waczs = manifest_array(home.path(), "waczs.json");
+    assert_eq!(waczs.len(), 1);
+    assert_eq!(waczs[0]["collection"], "demo");
 }

@@ -18,6 +18,10 @@ pub struct WaczMetadata {
     pub software: Option<String>,
     /// The collection's main page URL, if declared (WACZ 1.1.1 `mainPageUrl`).
     pub main_page_url: Option<String>,
+    /// Topical keywords (Frictionless Data Package `keywords`).
+    pub keywords: Vec<String>,
+    /// License labels (Frictionless Data Package `licenses`; title/name/path).
+    pub licenses: Vec<String>,
     pub seed_pages: Vec<SeedPage>,
 }
 
@@ -65,6 +69,13 @@ pub(crate) fn read_datapackage_from<R: std::io::Read + std::io::Seek>(
         /// Epoch-millisecond modification time; a fallback for `created`.
         mtime: Option<i64>,
     }
+    /// A Frictionless `licenses` entry — any of the fields may be absent.
+    #[derive(Deserialize, Default)]
+    struct License {
+        name: Option<String>,
+        title: Option<String>,
+        path: Option<String>,
+    }
     #[derive(Deserialize, Default)]
     struct DataPackage {
         title: Option<String>,
@@ -74,6 +85,11 @@ pub(crate) fn read_datapackage_from<R: std::io::Read + std::io::Seek>(
         software: Option<String>,
         #[serde(rename = "mainPageUrl")]
         main_page_url: Option<String>,
+        /// Frictionless Data Package extension fields (WACZ spec-blessed).
+        #[serde(default)]
+        keywords: Vec<String>,
+        #[serde(default)]
+        licenses: Vec<License>,
         #[serde(default)]
         metadata: Option<Metadata>,
     }
@@ -94,6 +110,17 @@ pub(crate) fn read_datapackage_from<R: std::io::Read + std::io::Seek>(
             meta.modified = clean(dp.modified.or(nested.modified));
             meta.software = clean(dp.software.or(nested.software));
             meta.main_page_url = clean(dp.main_page_url.or(nested.main_page_url));
+            meta.keywords = dp
+                .keywords
+                .into_iter()
+                .filter_map(|k| clean(Some(k)))
+                .collect();
+            // Prefer a license's title, then its SPDX name, then its path/URL.
+            meta.licenses = dp
+                .licenses
+                .into_iter()
+                .filter_map(|l| clean(l.title.or(l.name).or(l.path)))
+                .collect();
         }
     }
 
@@ -875,5 +902,36 @@ mod tests {
     fn read_warcinfo_returns_none_when_absent() {
         // simple.wacz has no warcinfo record.
         assert!(read_warcinfo(&fixture("simple.wacz")).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_datapackage_reads_modified_keywords_and_licenses() {
+        use std::io::Write;
+        // A datapackage.json carrying the Frictionless extension fields the
+        // finding-aid work newly reads (keywords/licenses) plus `modified`.
+        let dp = r#"{
+            "profile": "data-package",
+            "title": "Test",
+            "modified": "2026-05-01T00:00:00Z",
+            "keywords": ["climate", "policy", ""],
+            "licenses": [
+                {"name": "CC-BY-4.0", "path": "https://creativecommons.org/licenses/by/4.0/"},
+                {"title": "Custom terms"}
+            ]
+        }"#;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("datapackage.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(dp.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+        let meta = read_datapackage_from(std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(meta.modified.as_deref(), Some("2026-05-01T00:00:00Z"));
+        // Blank keyword is dropped by `clean`.
+        assert_eq!(meta.keywords, vec!["climate", "policy"]);
+        // License label prefers title, else name.
+        assert_eq!(meta.licenses, vec!["CC-BY-4.0", "Custom terms"]);
     }
 }

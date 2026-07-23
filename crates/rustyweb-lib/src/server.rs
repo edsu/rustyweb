@@ -75,6 +75,7 @@ pub fn router_with_resolver(
         .route("/collection/{id}", get(collection_page))
         .route("/crawl/{id}", get(crawl_page))
         .route("/thumb/{id}", get(thumb_handler))
+        .route("/collection-thumb/{id}", get(collection_thumb_handler))
         .route("/files/{id}", get(serve_file))
         .route("/replay/viewer", get(replay_viewer))
         .route("/api/search", get(search_api))
@@ -164,10 +165,13 @@ async fn homepage(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 // Capture date range (temporal span is meaningful at the
                 // collection level; per-tool software lives on the WACZ page).
                 date_range: members_capture_range(&members),
-                // Representative image: the first member crawl that has one.
-                thumb: members
-                    .iter()
-                    .find_map(|w| thumb_href(&state.index_dir, &w.id)),
+                // Representative image: a curator-set collection thumbnail if
+                // present, else the first member crawl that has one.
+                thumb: collection_thumb_href(&state.home, &c.id).or_else(|| {
+                    members.iter().find_map(|w| {
+                        thumb_href(&state.home, &state.index_dir, &w.collection, &w.id)
+                    })
+                }),
                 // Which source kinds the members span — both true = mixed.
                 has_local: members.iter().any(|w| !w.source.is_remote()),
                 has_remote: members.iter().any(|w| w.source.is_remote()),
@@ -522,6 +526,9 @@ async fn collection_page(
     if let Some(r) = &range {
         meta.push(views::MetaRow::new("Capture dates", r.clone()));
     }
+    if let Some(q) = capture_quality(&merged_status_counts(&members)) {
+        meta.push(views::MetaRow::new("Capture quality", q));
+    }
     let created = c.created.get(..10).unwrap_or(&c.created);
     meta.push(views::MetaRow::new("Created", created));
 
@@ -533,7 +540,7 @@ async fn collection_page(
             present: w.is_present(&state.home),
             remote: w.source.is_remote(),
             provenance: provenance_summary(w),
-            thumb: thumb_href(&state.index_dir, &w.id),
+            thumb: thumb_href(&state.home, &state.index_dir, &w.collection, &w.id),
         })
         .collect();
 
@@ -545,14 +552,19 @@ async fn collection_page(
         .unwrap_or_default();
     let facets = scoped_facet_sections(&overview, &format!("collection:{id}"));
 
-    views::collection(
-        &c.name,
-        c.description.as_deref(),
-        &meta,
-        &facets,
-        &member_items,
-    )
-    .into_response()
+    let page = views::CollectionPage {
+        name: c.name.clone(),
+        description: c.description.clone(),
+        narrative: c.narrative.as_deref().map(crate::markdown::render),
+        creator: c.creator.clone(),
+        dates: c.dates.clone(),
+        rights: c.rights.clone(),
+        subjects: c.subjects.clone(),
+        meta,
+        facets,
+        members: member_items,
+    };
+    views::collection(&page).into_response()
 }
 
 /// Build the scoped facet sections for a detail page. Each dimension becomes a
@@ -665,6 +677,9 @@ async fn crawl_page(
             "Source",
             format!("Browsertrix ({host})"),
         ));
+        if let Some(rating) = bt.review_status {
+            provenance.push(views::MetaRow::new("Review", review_label(rating)));
+        }
         if !bt.item_id.is_empty() {
             provenance.push(views::MetaRow::mono("Browsertrix item", bt.item_id.clone()));
         }
@@ -681,6 +696,21 @@ async fn crawl_page(
     if let Some(rb) = &c.robots {
         provenance.push(views::MetaRow::new("Robots", rb.clone()));
     }
+    if let Some(h) = &c.hostname {
+        provenance.push(views::MetaRow::mono("Crawl host", h.clone()));
+    }
+    if let Some(p) = &c.is_part_of {
+        provenance.push(views::MetaRow::new("Part of", p.clone()));
+    }
+    if let Some(ct) = &c.conforms_to {
+        provenance.push(views::MetaRow::mono("Conforms to", ct.clone()));
+    }
+    if !c.keywords.is_empty() {
+        provenance.push(views::MetaRow::new("Keywords", c.keywords.join(", ")));
+    }
+    if !c.licenses.is_empty() {
+        provenance.push(views::MetaRow::new("License", c.licenses.join(", ")));
+    }
     if let Some(n) = c.nested_waczs {
         provenance.push(views::MetaRow::new(
             "Multi-WACZ",
@@ -693,15 +723,24 @@ async fn crawl_page(
     if let Some(n) = c.page_count {
         provenance.push(views::MetaRow::new("Pages", n.to_string()));
     }
+    if let Some(q) = capture_quality(&c.status_counts) {
+        provenance.push(views::MetaRow::new("Capture quality", q));
+    }
     if let Some(range) = capture_range(c) {
         provenance.push(views::MetaRow::new("Capture dates", range));
+    }
+    if let Some(m) = &c.modified {
+        let m = m.get(..10).unwrap_or(m);
+        provenance.push(views::MetaRow::new("WACZ modified", m.to_string()));
     }
 
     let page = views::CrawlPage {
         crumb,
         name: c.name.clone(),
         description: c.description.clone(),
-        thumb: thumb_href(&state.index_dir, &id),
+        note: crate::collections::read_crawl_note(&state.home, &c.collection, &id)
+            .map(|n| crate::markdown::render(&n)),
+        thumb: thumb_href(&state.home, &state.index_dir, &c.collection, &id),
         replay_href,
         // Fetched from a remote host at replay time, not stored in <home>/archive.
         remote: c.source.is_remote(),
@@ -948,21 +987,26 @@ async fn asset_handler(
     serve_embedded_asset(SiteAssets::get(&path), &path, &headers)
 }
 
-/// The path to a crawl's cached thumbnail, if one was generated at index time.
-fn thumb_path(index_dir: &Path, crawl_id: &str) -> PathBuf {
-    index_dir.join("thumbs").join(format!("{crawl_id}.jpg"))
+/// The on-disk path to a crawl's thumbnail, preferring a curator's committed
+/// pinned image (`collections/<slug>/crawls/<id>.jpg`) over the auto-selected
+/// cache (`index/thumbs/<id>.jpg`). `None` if neither exists.
+fn thumb_path(home: &Path, index_dir: &Path, collection: &str, crawl_id: &str) -> Option<PathBuf> {
+    let pinned = crate::collections::pinned_thumb_path(home, collection, crawl_id);
+    if pinned.is_file() {
+        return Some(pinned);
+    }
+    let auto = index_dir.join("thumbs").join(format!("{crawl_id}.jpg"));
+    auto.is_file().then_some(auto)
 }
 
-/// The `/thumb/{id}` href for a crawl, or `None` if it has no cached thumbnail
-/// (the UI then shows a CSS placeholder). `id` is a crawl id.
-fn thumb_href(index_dir: &Path, crawl_id: &str) -> Option<String> {
-    thumb_path(index_dir, crawl_id)
-        .exists()
-        .then(|| format!("/thumb/{crawl_id}"))
+/// The `/thumb/{id}` href for a crawl, or `None` if it has no thumbnail (the UI
+/// then shows a CSS placeholder). `id` is a crawl id.
+fn thumb_href(home: &Path, index_dir: &Path, collection: &str, crawl_id: &str) -> Option<String> {
+    thumb_path(home, index_dir, collection, crawl_id).map(|_| format!("/thumb/{crawl_id}"))
 }
 
-/// Serve a crawl's cached representative thumbnail (a small JPEG under
-/// `<home>/index/thumbs`). 404 when the crawl has none.
+/// Serve a crawl's representative thumbnail (a committed pinned image under the
+/// collection, else the auto cache under `index/thumbs`). 404 when it has none.
 async fn thumb_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -972,7 +1016,44 @@ async fn thumb_handler(
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match std::fs::read(thumb_path(&state.index_dir, &id)) {
+    // Resolve the crawl's collection (needed for the committed pinned path).
+    let collection = Manifest::open(&state.index_dir)
+        .ok()
+        .and_then(|m| m.wacz_by_id(&id).map(|w| w.collection.clone()))
+        .unwrap_or_default();
+    let Some(path) = thumb_path(&state.home, &state.index_dir, &collection, &id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "image/jpeg"),
+                (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// The `/collection-thumb/{slug}` href for a collection, if a curator committed
+/// one at `collections/<slug>/thumbnail.jpg`.
+fn collection_thumb_href(home: &Path, slug: &str) -> Option<String> {
+    crate::collections::collection_thumb_path(home, slug)
+        .is_file()
+        .then(|| format!("/collection-thumb/{slug}"))
+}
+
+/// Serve a collection's curator-set representative thumbnail. 404 when unset.
+async fn collection_thumb_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match std::fs::read(crate::collections::collection_thumb_path(&state.home, &id)) {
         Ok(bytes) => (
             [
                 (axum::http::header::CONTENT_TYPE, "image/jpeg"),
@@ -1106,6 +1187,66 @@ fn capture_range(c: &Wacz) -> Option<String> {
     }
 }
 
+/// A compact "capture quality" summary of an HTTP status histogram: total
+/// captures, the share that succeeded (2xx/3xx), and the notable failing codes.
+/// The derived DACS Appraisal signal — surfaces the 404/403/504 "absences" that
+/// a clean-looking crawl can hide.
+fn capture_quality(counts: &std::collections::BTreeMap<u16, u64>) -> Option<String> {
+    let total: u64 = counts.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let ok: u64 = counts
+        .iter()
+        .filter(|(c, _)| (200..400).contains(*c))
+        .map(|(_, n)| n)
+        .sum();
+    let ok_pct = (ok as f64 / total as f64 * 100.0).round() as u64;
+    let mut s = format!("{total} captures, {ok_pct}% ok");
+    // Notable failing codes (>= 400), most frequent first.
+    let mut bad: Vec<(u16, u64)> = counts
+        .iter()
+        .filter(|(c, _)| **c >= 400)
+        .map(|(c, n)| (*c, *n))
+        .collect();
+    bad.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    if !bad.is_empty() {
+        let parts: Vec<String> = bad
+            .iter()
+            .take(4)
+            .map(|(c, n)| format!("{c}×{n}"))
+            .collect();
+        s.push_str(" — ");
+        s.push_str(&parts.join(", "));
+    }
+    Some(s)
+}
+
+/// Map a Browsertrix QA review rating (1–5) to its label, with the raw value —
+/// a DACS Appraisal signal ("this crawl was reviewed and judged …").
+fn review_label(rating: u8) -> String {
+    let word = match rating {
+        5 => "Excellent",
+        4 => "Good",
+        3 => "Fair",
+        2 => "Poor",
+        1 => "Bad",
+        _ => "Reviewed",
+    };
+    format!("{word} ({rating}/5)")
+}
+
+/// Merge the per-crawl status histograms across a collection's members.
+fn merged_status_counts(members: &[&Wacz]) -> std::collections::BTreeMap<u16, u64> {
+    let mut agg = std::collections::BTreeMap::new();
+    for w in members {
+        for (code, n) in &w.status_counts {
+            *agg.entry(*code).or_insert(0) += *n;
+        }
+    }
+    agg
+}
+
 /// The deduped union of software across a collection's member WACZs.
 fn collection_software(members: &[&Wacz]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -1202,6 +1343,23 @@ fn format_timestamp(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_quality_summarizes_status_histogram() {
+        use std::collections::BTreeMap;
+        let mut c = BTreeMap::new();
+        c.insert(200u16, 96u64);
+        c.insert(301, 2);
+        c.insert(404, 1);
+        c.insert(504, 1);
+        let s = capture_quality(&c).unwrap();
+        // 2xx+3xx are "ok": (96+2)/100 = 98%.
+        assert!(s.starts_with("100 captures, 98% ok"), "{s}");
+        // Failing codes surfaced, most frequent first.
+        assert!(s.contains("404×1") && s.contains("504×1"), "{s}");
+        // Empty histogram → nothing to show.
+        assert!(capture_quality(&BTreeMap::new()).is_none());
+    }
 
     #[test]
     fn active_filters_extracts_facet_tokens_only() {
