@@ -26,7 +26,7 @@ fn index_into(home: &Path, name: &str) {
     std::fs::create_dir_all(&archive).unwrap();
     let dest = archive.join(name);
     std::fs::copy(fixture(name), &dest).unwrap();
-    rustyweb_lib::index::index_path(&dest, home, None).unwrap();
+    rustyweb_lib::index::index_path(&dest, home, None, "test").unwrap();
 }
 
 // ── Indexing ──────────────────────────────────────────────────────────────────
@@ -400,9 +400,11 @@ async fn homepage_shows_collection_name() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let cname = manifest.collections[0].name.clone();
     assert!(
-        text.contains("simple"),
-        "homepage should show collection name: {text}"
+        text.contains(&cname),
+        "homepage should show the collection name {cname:?}: {text}"
     );
     assert!(
         text.contains("aria-label=\"Local\""),
@@ -414,7 +416,7 @@ async fn homepage_shows_collection_name() {
 async fn homepage_card_links_to_collection_page() {
     let tmp = make_index(&["simple.wacz"]);
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
-    let id = manifest.waczs[0].id.clone();
+    let cid = manifest.collections[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
     let resp = app
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
@@ -423,8 +425,8 @@ async fn homepage_card_links_to_collection_page() {
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(
-        html.contains(&format!("href=\"/collection/{id}\"")),
-        "homepage card title should link to the collection page"
+        html.contains(&format!("href=\"/collection/{cid}\"")),
+        "homepage card title should link to the collection page (/collection/{cid})"
     );
 }
 
@@ -783,7 +785,7 @@ async fn home_directory_is_portable() {
     let archive = home_a.join("archive");
     std::fs::create_dir_all(&archive).unwrap();
     std::fs::copy(fixture("simple.wacz"), archive.join("simple.wacz")).unwrap();
-    rustyweb_lib::index::index_path(&archive.join("simple.wacz"), &home_a, None).unwrap();
+    rustyweb_lib::index::index_path(&archive.join("simple.wacz"), &home_a, None, "test").unwrap();
 
     // The source is stored relative to home (portable), not absolute.
     let manifest = Manifest::open(&home_a.join("index")).unwrap();
@@ -876,7 +878,7 @@ async fn index_from_http_url_and_link_directly() {
     // index_location uses a blocking HTTP client; run it off the async runtime.
     let (url_c, dir_c) = (url.clone(), tmp.path().to_path_buf());
     tokio::task::spawn_blocking(move || {
-        rustyweb_lib::index::index_location(&url_c, &dir_c, None, None, false, None, None).unwrap();
+        rustyweb_lib::index::index_location(&url_c, &dir_c, None, "test", false, None, None).unwrap();
     })
     .await
     .unwrap();

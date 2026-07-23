@@ -60,10 +60,10 @@ pub trait SourceResolver: Send + Sync {
     fn resolve(&self, source: &Source) -> Result<String>;
 }
 
-/// Index a local WACZ file (which must live under `<home>/archive`) under the
-/// given home dir. Thin wrapper over [`index_location`].
-pub fn index_path(path: &Path, home: &Path, name: Option<&str>) -> Result<()> {
-    index_location(&path.to_string_lossy(), home, name, None, false, None, None)
+/// Index a local WACZ file (which must live under `<home>/archive`) into the
+/// given collection. Thin wrapper over [`index_location`].
+pub fn index_path(path: &Path, home: &Path, name: Option<&str>, collection: &str) -> Result<()> {
+    index_location(&path.to_string_lossy(), home, name, collection, false, None, None)
 }
 
 /// Index a WACZ from a location into the home directory's `index/`. The location
@@ -83,7 +83,7 @@ pub fn index_location(
     location: &str,
     home: &Path,
     name: Option<&str>,
-    collection: Option<&str>,
+    collection: &str,
     download: bool,
     concurrency: Option<usize>,
     progress: Option<&dyn IndexProgress>,
@@ -108,7 +108,7 @@ pub fn index_location_with_resolver(
     location: &str,
     home: &Path,
     name: Option<&str>,
-    collection: Option<&str>,
+    collection: &str,
     // Download a remote WACZ into <home>/archive and index it as a local file
     // instead of streaming it in place.
     download: bool,
@@ -134,18 +134,17 @@ pub fn index_location_with_resolver(
 
     let mut manifest = Manifest::open(&index_dir)?;
 
-    // Resolve `--collection NAME` to (id, name); `None` => a singleton per WACZ.
-    let group = collection.map(|cn| (crate::collections::slugify(cn), cn.to_string()));
+    // Every crawl belongs to a collection (its id is the slug of the name).
+    let group = (crate::collections::slugify(collection), collection.to_string());
 
     for source in &sources {
-        let c = group.as_ref().map(|(id, n)| (id.as_str(), n.as_str()));
         let (wacz_name, pages) = index_one(
             source,
             home,
             &mut manifest,
             &search,
             name,
-            c,
+            (group.0.as_str(), group.1.as_str()),
             download,
             concurrency,
             resolver,
@@ -268,7 +267,7 @@ pub fn reindex(
             &mut manifest,
             &search,
             Some(name),
-            Some((collection_id, collection_name)),
+            (collection_id, collection_name),
             false,
             concurrency,
             resolver,
@@ -473,9 +472,9 @@ fn index_one(
     manifest: &mut Manifest,
     search: &Mutex<SearchIndex>,
     name: Option<&str>,
-    // The collection (id, display name) this WACZ joins. `None` makes the WACZ
-    // its own singleton collection (id == WACZ id, name == WACZ name).
-    collection: Option<(&str, &str)>,
+    // The collection (id, display name) this WACZ joins — always set; every
+    // crawl belongs to a collection (no singletons).
+    collection: (&str, &str),
     // Download a remote WACZ into <home>/archive and index it as a local file
     // (durable copy, whole-file fixity, offline replay) instead of streaming.
     download: bool,
@@ -574,12 +573,8 @@ fn index_one(
         .or_else(|| meta.title.clone().filter(|t| !t.trim().is_empty()))
         .unwrap_or_else(|| source_display_name(&effective_source));
 
-    // Resolve the curated collection this WACZ joins: the one given, else a
-    // singleton of its own (id == WACZ id, name == WACZ name).
-    let (collection_id, collection_name) = match collection {
-        Some((cid, cname)) => (cid.to_string(), cname.to_string()),
-        None => (id.clone(), display_name.clone()),
-    };
+    // The curated collection this WACZ joins (always supplied by the caller).
+    let (collection_id, collection_name) = (collection.0.to_string(), collection.1.to_string());
 
     // Drop this WACZ's prior documents so re-indexing upserts, not appends.
     search.lock().unwrap().delete_collection(&id);
@@ -1805,7 +1800,7 @@ mod tests {
         std::fs::create_dir_all(&archive).unwrap();
         let dest = archive.join(name);
         std::fs::copy(fixture(name), &dest).unwrap();
-        index_path(&dest, home, display).unwrap();
+        index_path(&dest, home, display, "test").unwrap();
         dest
     }
 
@@ -1959,7 +1954,7 @@ mod tests {
         std::fs::create_dir_all(&archive).unwrap();
         let path = archive.join("nested.wacz");
         std::fs::write(&path, &outer).unwrap();
-        index_path(&path, tmp.path(), None).unwrap();
+        index_path(&path, tmp.path(), None, "test").unwrap();
 
         // One manifest entry (approach A: flatten), with the inner crawl's pages
         // and provenance surfaced on it.
@@ -2006,7 +2001,7 @@ mod tests {
         // stable identity into a fresh presigned URL — the error should say so.
         let tmp = TempDir::new().unwrap();
         let loc = "browsertrix|https://app.browsertrix.com|o1|item-1|x-0.wacz";
-        let err = index_location(loc, tmp.path(), None, None, false, None, None)
+        let err = index_location(loc, tmp.path(), None, "test", false, None, None)
             .err()
             .unwrap()
             .to_string();
@@ -2028,7 +2023,7 @@ mod tests {
             &dest.to_string_lossy(),
             tmp.path(),
             None,
-            Some("My Project"),
+            "My Project",
             false,
             None,
             None,
@@ -2057,7 +2052,7 @@ mod tests {
         let stray = elsewhere.path().join("simple.wacz");
         std::fs::copy(fixture("simple.wacz"), &stray).unwrap();
 
-        let err = index_path(&stray, home.path(), None)
+        let err = index_path(&stray, home.path(), None, "test")
             .expect_err("indexing a WACZ outside the archive folder should fail");
         let msg = format!("{err:#}");
         assert!(
@@ -2073,7 +2068,8 @@ mod tests {
         std::fs::create_dir_all(&archive).unwrap();
 
         let err =
-            index_path(&archive, tmp.path(), None).expect_err("indexing a directory should fail");
+            index_path(&archive, tmp.path(), None, "test")
+                .expect_err("indexing a directory should fail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("directory"),
@@ -2258,7 +2254,7 @@ mod tests {
             local_warcs_streamable(&path).unwrap(),
             "stored WARC should take the CDX-guided path"
         );
-        index_path(&path, tmp.path(), None).unwrap();
+        index_path(&path, tmp.path(), None, "test").unwrap();
 
         let idx =
             crate::search::SearchIndex::open(tmp.path().join("index").join("full_text").as_path())
@@ -2365,7 +2361,7 @@ mod tests {
         std::fs::create_dir_all(&archive).unwrap();
         let path = archive.join("crawl.wacz");
         std::fs::write(&path, &wacz).unwrap();
-        index_path(&path, tmp.path(), None).unwrap();
+        index_path(&path, tmp.path(), None, "test").unwrap();
 
         let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
         let id = &manifest.waczs[0].id;
@@ -2492,7 +2488,7 @@ mod tests {
         std::fs::create_dir_all(&archive).unwrap();
         let path = archive.join("crawl.wacz");
         std::fs::write(&path, &wacz).unwrap();
-        index_path(&path, tmp.path(), None).unwrap();
+        index_path(&path, tmp.path(), None, "test").unwrap();
 
         let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
         let id = &manifest.waczs[0].id;
@@ -2609,7 +2605,7 @@ mod tests {
         std::fs::create_dir_all(&archive).unwrap();
         let path = archive.join("crawl.wacz");
         std::fs::write(&path, &wacz).unwrap();
-        index_path(&path, tmp.path(), None).unwrap();
+        index_path(&path, tmp.path(), None, "test").unwrap();
 
         let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
         let id = &manifest.waczs[0].id;
@@ -2714,7 +2710,7 @@ mod tests {
         std::fs::create_dir_all(&archive).unwrap();
         let path = archive.join("crawl.wacz");
         std::fs::write(&path, &wacz).unwrap();
-        index_path(&path, tmp.path(), None).unwrap();
+        index_path(&path, tmp.path(), None, "test").unwrap();
 
         let manifest = Manifest::open(&tmp.path().join("index")).unwrap();
         let id = &manifest.waczs[0].id;

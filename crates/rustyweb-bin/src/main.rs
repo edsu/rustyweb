@@ -603,6 +603,24 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(2);
             }
+
+            // Every crawl belongs to a collection. Rather than invent a
+            // singleton per WACZ, we ask the curator to say what this is part of
+            // — the deliberate "stop and think" moment (index a glob into one
+            // collection to decide it once).
+            let Some(collection) = collection.as_deref() else {
+                eprintln!(
+                    "index needs --collection <NAME>: every crawl belongs to a curated\n\
+                     collection. For example:\n\
+                     \n\
+                     \x20 rustyweb index archive/*.wacz --collection \"Ukraine Cultural Heritage\"\n\
+                     \n\
+                     Pick a name that says what these crawls are a part of and why you're\n\
+                     keeping them; you can describe it further with: rustyweb collection set"
+                );
+                std::process::exit(2);
+            };
+
             // A progress bar makes a slow streaming index (each remote page
             // record is a separate HTTP range request) visible. Shown only on an
             // interactive stderr and not under -v (see `show_bar` above).
@@ -629,7 +647,7 @@ async fn main() -> Result<()> {
                     location,
                     &home,
                     name.as_deref(),
-                    collection.as_deref(),
+                    collection,
                     download,
                     concurrency,
                     progress,
@@ -1037,13 +1055,15 @@ fn run_browsertrix(
         None => None,
     };
 
-    // Where imports land as a rustyweb collection: an explicit --into wins;
-    // otherwise, importing a Browsertrix collection yields a rustyweb collection
-    // of the same name (so a collection import isn't scattered into singletons);
-    // otherwise each crawl is its own collection.
-    let into = opts
+    // Where imports land as a rustyweb collection (every crawl belongs to one):
+    // an explicit --into wins; otherwise importing a Browsertrix collection
+    // yields a rustyweb collection of the same name; otherwise (a whole-org or
+    // single-crawl import) fall back to the org name — a meaningful collecting
+    // body — rather than scattering singletons.
+    let into: &str = opts
         .into
-        .or(selected_collection.as_ref().map(|c| c.name.as_str()));
+        .or(selected_collection.as_ref().map(|c| c.name.as_str()))
+        .unwrap_or(&org.name);
 
     // Selection is server-side (a collection or a single item); the review
     // filter is applied client-side so we can report what was skipped.
