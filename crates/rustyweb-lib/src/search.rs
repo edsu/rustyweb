@@ -252,6 +252,13 @@ impl SearchIndex {
         // and gives the spinner something to tick.
         const BATCH: usize = 32;
         let target = target_segments.max(1);
+        // Take exclusive control of merging. Otherwise, as soon as our first
+        // explicit merge finishes, Tantivy's default LogMergePolicy (triggered
+        // on merge completion) schedules *background* merges over the remaining
+        // segments — which then race our next explicit merge and consume its
+        // segments out from under it ("couldn't find segment in SegmentManager").
+        self.writer_mut()
+            .set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
         let before = self.index.searchable_segment_ids()?.len();
         if let Some(p) = progress {
             p.begin("optimize");
@@ -277,7 +284,7 @@ impl SearchIndex {
             self.writer_mut()
                 .merge(&ids)
                 .wait()
-                .context("merging segments (out of disk space?)")?;
+                .context("merging segments while optimizing the index")?;
             if let Some(p) = progress {
                 p.phase(&format!("{} segments", n - (take - 1)));
             }
