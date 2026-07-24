@@ -229,6 +229,82 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Number of searchable segments. A healthy index has a handful; hundreds
+    /// means background merges haven't kept up (e.g. they failed on a full
+    /// disk), which slows *every* query — a search fans out across all segments.
+    pub fn segment_count(&self) -> Result<usize> {
+        Ok(self.index.searchable_segment_ids()?.len())
+    }
+
+    /// Compact the index by merging segments down toward `target_segments`
+    /// (clamped to ≥ 1), so queries fan out across far fewer segments. Merges
+    /// smallest-first in bounded batches, waiting for each merge before starting
+    /// the next, so peak transient disk stays ~one merged batch rather than a
+    /// second copy of the whole index (a merge writes the new segment before the
+    /// inputs are freed). A smaller `target` compacts more but raises that peak
+    /// (~index_size / target). Needs a writer. Returns `(before, after)` counts.
+    pub fn optimize(
+        &mut self,
+        target_segments: usize,
+        progress: Option<&dyn crate::index::IndexProgress>,
+    ) -> Result<(usize, usize)> {
+        // Segments merged per round: bounds each merge's size (hence peak disk)
+        // and gives the spinner something to tick.
+        const BATCH: usize = 32;
+        let target = target_segments.max(1);
+        let before = self.index.searchable_segment_ids()?.len();
+        if let Some(p) = progress {
+            p.begin("optimize");
+            p.phase(&format!("{before} segments"));
+        }
+
+        let mut prev = usize::MAX;
+        loop {
+            // Re-read each round: a merge replaces its inputs with one segment.
+            let mut metas = self.index.searchable_segment_metas()?;
+            let n = metas.len();
+            // Stop at the target, or if a round made no progress (defensive:
+            // never spin, even if a merge unexpectedly didn't reduce the count).
+            if n <= target || n >= prev {
+                break;
+            }
+            prev = n;
+            // Smallest-first keeps early merges cheap; merge enough to move
+            // toward `target`, capped by BATCH so one merge can't blow up disk.
+            metas.sort_by_key(|m| m.num_docs());
+            let take = (n - target + 1).clamp(2, BATCH);
+            let ids: Vec<_> = metas.iter().take(take).map(|m| m.id()).collect();
+            self.writer_mut()
+                .merge(&ids)
+                .wait()
+                .context("merging segments (out of disk space?)")?;
+            if let Some(p) = progress {
+                p.phase(&format!("{} segments", n - (take - 1)));
+            }
+        }
+
+        // Delete the now-orphaned input segment files and persist the tidy meta.
+        self.writer_mut()
+            .garbage_collect_files()
+            .wait()
+            .context("garbage-collecting merged segment files")?;
+        self.writer_mut().commit().context("committing optimize")?;
+        let after = self.index.searchable_segment_ids()?.len();
+        if let Some(p) = progress {
+            p.finish();
+        }
+        Ok((before, after))
+    }
+
+    /// Disable Tantivy's automatic segment merging on this writer, so each
+    /// `commit()` leaves its own segment. Tests use this to build a deliberately
+    /// fragmented index to exercise [`Self::optimize`].
+    #[cfg(test)]
+    fn disable_auto_merge(&mut self) {
+        self.writer_mut()
+            .set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+    }
+
     /// Facet counts across the whole archive (a match-all query), for homepage
     /// browse entry points. Runs only the aggregation — no result fetching or
     /// URL grouping — so it is cheap.
@@ -1127,6 +1203,69 @@ mod tests {
             <body>x</body></html>"#;
         let t = extract_html_text(html);
         assert_eq!(t.author, "Grace Hopper");
+    }
+
+    #[test]
+    fn optimize_merges_segments_and_preserves_search() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.disable_auto_merge(); // each commit -> its own segment
+        for i in 0..4 {
+            let url = format!("https://ex.com/{i}");
+            let cid = format!("c{i}");
+            idx.index_page(&Page {
+                url: &url,
+                title: "Snowfall",
+                body: "snow in the mountains",
+                crawl_id: &cid,
+                crawl_name: "C",
+                ..Default::default()
+            })
+            .unwrap();
+            idx.commit().unwrap();
+        }
+        let before = idx.segment_count().unwrap();
+        assert!(
+            before >= 4,
+            "expected a fragmented index, got {before} segments"
+        );
+
+        let (b, after) = idx.optimize(1, None).unwrap();
+        assert_eq!(b, before);
+        assert_eq!(after, 1, "should compact to a single segment");
+        assert_eq!(idx.segment_count().unwrap(), 1);
+        // All four docs survive the merge and are still searchable.
+        assert_eq!(idx.search("snow", 10).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn optimize_respects_target_and_is_a_noop_when_already_small() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        idx.disable_auto_merge();
+        for i in 0..5 {
+            let cid = format!("c{i}");
+            idx.index_page(&Page {
+                url: "https://ex.com/x",
+                title: "T",
+                body: "body",
+                crawl_id: &cid,
+                crawl_name: "C",
+                ..Default::default()
+            })
+            .unwrap();
+            idx.commit().unwrap();
+        }
+        assert!(idx.segment_count().unwrap() >= 5);
+        // Compact toward 2, then optimizing again is a no-op (already ≤ target).
+        let (_, after) = idx.optimize(2, None).unwrap();
+        assert_eq!(after, 2);
+        let (before2, after2) = idx.optimize(2, None).unwrap();
+        assert_eq!(
+            (before2, after2),
+            (2, 2),
+            "already-compact index is untouched"
+        );
     }
 
     #[test]
