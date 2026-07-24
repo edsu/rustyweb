@@ -131,7 +131,7 @@ pub fn index_location_with_resolver(
     // instead of streaming it in place.
     download: bool,
     // Concurrent record fetches for CDX-guided streaming; `None` = per-source
-    // default (16 remote, CPU count local).
+    // default (4 remote, CPU count local).
     concurrency: Option<usize>,
     // Resolves a Browsertrix source to a fresh presigned URL (binary-provided).
     resolver: Option<&dyn SourceResolver>,
