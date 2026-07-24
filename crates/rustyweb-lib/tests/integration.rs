@@ -630,7 +630,6 @@ async fn browsertrix_replay_without_credentials_is_unavailable() {
 async fn collection_page_lists_members() {
     let tmp = make_index(&["a.wacz"]);
     let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
-    // Singleton collection: its id equals the WACZ's id.
     let coll_id = manifest.collections[0].id.clone();
     let wacz_id = manifest.waczs[0].id.clone();
     let app = rustyweb_lib::server::router(tmp.path()).unwrap();
@@ -658,6 +657,70 @@ async fn collection_page_lists_members() {
     assert!(
         html.contains("aria-label=\"Local\""),
         "member cards should show a source pill"
+    );
+}
+
+#[tokio::test]
+async fn collection_page_flags_missing_minimum_fields() {
+    // a.wacz's datapackage seeds only `dates` (no description/keywords/
+    // contributors/licenses), so the About block renders but the DACS minimum —
+    // Scope & Content, Creator, Access & Use — is still missing and prompted,
+    // even though the collection isn't wholly empty.
+    let tmp = make_index(&["a.wacz"]);
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    let coll_id = manifest.collections[0].id.clone();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    let resp = app
+        .oneshot(
+            Request::get(format!("/collection/{coll_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("Still needed:"),
+        "should prompt for the gaps: {html}"
+    );
+    for f in ["Scope", "Creator", "Access"] {
+        assert!(
+            html.contains(f),
+            "missing minimum field {f:?} should be listed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collection_page_nudge_lists_only_still_missing_minimum() {
+    // With a creator supplied, the "still needed" prompt names only the remaining
+    // DACS-minimum gaps (Scope & Content, Access & Use) — not Creator.
+    let tmp = make_index(&["a.wacz"]); // collection "test"
+    rustyweb_lib::index::set_collection(
+        tmp.path(),
+        "test",
+        &rustyweb_lib::collections::CollectionFields {
+            creator: Some("Someone".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let app = rustyweb_lib::server::router(tmp.path()).unwrap();
+    let resp = app
+        .oneshot(
+            Request::get("/collection/test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    // `&` renders escaped; the exact joined list proves Creator isn't included.
+    assert!(
+        html.contains("Still needed: Scope &amp; Content, Access &amp; Use"),
+        "nudge should list only the missing minimum fields: {html}"
     );
 }
 

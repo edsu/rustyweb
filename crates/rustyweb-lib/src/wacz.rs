@@ -22,6 +22,9 @@ pub struct WaczMetadata {
     pub keywords: Vec<String>,
     /// License labels (Frictionless Data Package `licenses`; title/name/path).
     pub licenses: Vec<String>,
+    /// Collecting org/person, if declared (Frictionless `contributors` titles,
+    /// else the top-level `organization`).
+    pub creator: Option<String>,
     pub seed_pages: Vec<SeedPage>,
 }
 
@@ -76,6 +79,12 @@ pub(crate) fn read_datapackage_from<R: std::io::Read + std::io::Seek>(
         title: Option<String>,
         path: Option<String>,
     }
+    /// A Frictionless `contributors` entry (`title` is the display name).
+    #[derive(Deserialize, Default)]
+    struct Contributor {
+        title: Option<String>,
+        organization: Option<String>,
+    }
     #[derive(Deserialize, Default)]
     struct DataPackage {
         title: Option<String>,
@@ -90,6 +99,9 @@ pub(crate) fn read_datapackage_from<R: std::io::Read + std::io::Seek>(
         keywords: Vec<String>,
         #[serde(default)]
         licenses: Vec<License>,
+        #[serde(default)]
+        contributors: Vec<Contributor>,
+        organization: Option<String>,
         #[serde(default)]
         metadata: Option<Metadata>,
     }
@@ -121,6 +133,16 @@ pub(crate) fn read_datapackage_from<R: std::io::Read + std::io::Seek>(
                 .into_iter()
                 .filter_map(|l| clean(l.title.or(l.name).or(l.path)))
                 .collect();
+            // Creator: the top-level `organization`, else the contributors'
+            // titles (or their organizations), joined.
+            meta.creator = clean(dp.organization).or_else(|| {
+                let names: Vec<String> = dp
+                    .contributors
+                    .into_iter()
+                    .filter_map(|c| clean(c.title.or(c.organization)))
+                    .collect();
+                (!names.is_empty()).then(|| names.join(", "))
+            });
         }
     }
 
@@ -917,7 +939,8 @@ mod tests {
             "licenses": [
                 {"name": "CC-BY-4.0", "path": "https://creativecommons.org/licenses/by/4.0/"},
                 {"title": "Custom terms"}
-            ]
+            ],
+            "contributors": [{"title": "Jane Curator"}, {"organization": "Web Archive Co"}]
         }"#;
         let mut buf = Vec::new();
         {
@@ -933,5 +956,27 @@ mod tests {
         assert_eq!(meta.keywords, vec!["climate", "policy"]);
         // License label prefers title, else name.
         assert_eq!(meta.licenses, vec!["CC-BY-4.0", "Custom terms"]);
+        // Creator from contributors' titles (falling back to their organization).
+        assert_eq!(
+            meta.creator.as_deref(),
+            Some("Jane Curator, Web Archive Co")
+        );
+    }
+
+    #[test]
+    fn read_datapackage_creator_prefers_top_level_organization() {
+        use std::io::Write;
+        let dp = r#"{"profile":"data-package","title":"T","organization":"SUCHO",
+            "contributors":[{"title":"Ignored"}]}"#;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("datapackage.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(dp.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+        let meta = read_datapackage_from(std::io::Cursor::new(buf)).unwrap();
+        assert_eq!(meta.creator.as_deref(), Some("SUCHO"));
     }
 }

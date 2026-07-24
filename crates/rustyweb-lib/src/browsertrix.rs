@@ -142,24 +142,46 @@ pub struct User {
 }
 
 /// An organization the user belongs to. `id` is the `oid` used in item URLs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Org {
     pub id: String,
     #[serde(default)]
     pub slug: String,
     #[serde(default)]
     pub name: String,
+    /// Public-profile description of the org, if set.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The org's public website, if set (`publicUrl` on the profile).
+    #[serde(rename = "publicUrl", default)]
+    pub website: Option<String>,
 }
 
 /// A Browsertrix collection (a named group of crawls). The API's item filters
-/// take the `id` (a UUID), not the slug.
-#[derive(Debug, Clone, Deserialize)]
+/// take the `id` (a UUID), not the slug. The descriptive fields (`description`,
+/// `caption`, `tags`, date range) come back on the `collections` list endpoint,
+/// so they cost no extra request; they seed the rustyweb collection's finding aid.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Collection {
     pub id: String,
     #[serde(default)]
     pub slug: String,
     #[serde(default)]
     pub name: String,
+    /// Long "About" text (rich text / Markdown) — the scope narrative.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Short one-line summary shown under the title.
+    #[serde(default)]
+    pub caption: Option<String>,
+    /// Free-text keyword tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Capture date range across the collection's crawls (ISO dates).
+    #[serde(rename = "dateEarliest", default)]
+    pub date_earliest: Option<String>,
+    #[serde(rename = "dateLatest", default)]
+    pub date_latest: Option<String>,
 }
 
 /// An archived item — a crawl or an upload — from `all-crawls`.

@@ -16,6 +16,16 @@ use crate::warc::{iter_records, WarcRecord, Warcinfo};
 pub fn index_dir(home: &Path) -> PathBuf {
     home.join("index")
 }
+
+/// The 4-digit year prefix of an ISO-8601-ish date string (`2022-…` → `2022`),
+/// or `None` if the first four characters aren't all digits. Used to turn a
+/// datapackage `created` / a Browsertrix date range into a coverage-year for the
+/// finding aid. Panic-safe on short/multibyte input.
+pub fn year_prefix(s: &str) -> Option<String> {
+    s.get(..4)
+        .filter(|y| y.chars().all(|c| c.is_ascii_digit()))
+        .map(str::to_string)
+}
 pub fn archive_dir(home: &Path) -> PathBuf {
     home.join("archive")
 }
@@ -341,6 +351,26 @@ pub fn set_collection(
     let id = manifest.apply_fields(name, fields, &now);
     manifest.save()?;
     info!(collection = %id, "collection metadata updated");
+    Ok(id)
+}
+
+/// Auto-seed a collection's finding-aid metadata from ingest (WACZ datapackage,
+/// Browsertrix API): fills only fields that are still empty, never clobbering a
+/// curator's edits (see [`crate::collections::Manifest::seed_fields`]). A no-op
+/// when `fields` is empty. Returns the collection id.
+pub fn seed_collection(
+    home: &Path,
+    name: &str,
+    fields: &crate::collections::CollectionFields,
+) -> Result<String> {
+    let index_dir = index_dir(home);
+    std::fs::create_dir_all(&index_dir)
+        .with_context(|| format!("creating index dir {}", index_dir.display()))?;
+    let mut manifest = Manifest::open(&index_dir)?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let id = crate::collections::slugify(name);
+    manifest.seed_fields(&id, name, fields, &now);
+    manifest.save()?;
     Ok(id)
 }
 
@@ -855,6 +885,25 @@ fn index_one(
         }
     }
     manifest.ensure_collection(&collection_id, &collection_name, &date_indexed);
+
+    // Seed the collection's finding aid from this WACZ's datapackage — fill-gaps,
+    // so only empty fields are set: the first indexed WACZ with a value wins and
+    // a curator's edits are never overwritten. A single crawl's `description`
+    // isn't really the whole collection's scope, but a draft beats a blank and
+    // invites the curator to refine it.
+    let year = meta.created.as_deref().and_then(year_prefix);
+    let seed = crate::collections::CollectionFields {
+        narrative: meta.description.clone(),
+        subjects: (!meta.keywords.is_empty()).then(|| meta.keywords.clone()),
+        dates: year,
+        creator: meta.creator.clone(),
+        rights: (!meta.licenses.is_empty()).then(|| meta.licenses.join(", ")),
+        ..Default::default()
+    };
+    if !seed.is_empty() {
+        manifest.seed_fields(&collection_id, &collection_name, &seed, &date_indexed);
+    }
+
     // Preserve Browsertrix import provenance (set out-of-band by the importer)
     // across a reindex, which otherwise rebuilds the entry from scratch.
     let browsertrix = manifest.wacz_by_id(&id).and_then(|w| w.browsertrix.clone());
@@ -2228,6 +2277,75 @@ mod tests {
             m.waczs[0].source,
             Source::File(PathBuf::from("archive/my-coll/simple.wacz"))
         );
+    }
+
+    #[test]
+    fn index_seeds_collection_finding_aid_from_the_wacz() {
+        // Indexing a WACZ pre-seeds its collection's finding aid (fill-gaps) from
+        // the datapackage. a.wacz declares created 2026-…, so `dates` is seeded.
+        let tmp = TempDir::new().unwrap();
+        index_fixture("a.wacz", tmp.path(), None); // collection "test"
+        let m = Manifest::open(&tmp.path().join("index")).unwrap();
+        assert_eq!(
+            m.collection_by_id("test").unwrap().dates.as_deref(),
+            Some("2026"),
+            "collection dates seeded from the WACZ datapackage `created` year"
+        );
+    }
+
+    #[test]
+    fn reindex_does_not_rewrite_an_already_seeded_finding_aid() {
+        // Once a collection's finding aid is seeded, a reindex must not rewrite it
+        // (no new empty field to fill) — so a curator's hand formatting / comments
+        // survive.
+        let tmp = TempDir::new().unwrap();
+        index_fixture("a.wacz", tmp.path(), None); // collection "test", seeds `dates`
+        let readme = tmp.path().join("collections/test/README.md");
+        // Curator adds a YAML comment, keeping the seeded field.
+        let edited = std::fs::read_to_string(&readme)
+            .unwrap()
+            .replace("name: test", "name: test  # hand-labelled");
+        std::fs::write(&readme, &edited).unwrap();
+
+        reindex(tmp.path(), None, None, None).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&readme).unwrap(),
+            edited,
+            "reindex must leave an already-seeded finding aid byte-for-byte intact"
+        );
+    }
+
+    #[test]
+    fn reindex_after_rename_does_not_spawn_a_phantom_collection() {
+        // Editing the display `name:` must not create a second collection on the
+        // next reindex — seeding is keyed on the stable id, not the slug of name.
+        let tmp = TempDir::new().unwrap();
+        index_fixture("a.wacz", tmp.path(), None); // id "test"
+        let readme = tmp.path().join("collections/test/README.md");
+        let renamed = std::fs::read_to_string(&readme)
+            .unwrap()
+            .replace("name: test", "name: Test Archive");
+        std::fs::write(&readme, renamed).unwrap();
+
+        reindex(tmp.path(), None, None, None).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path().join("collections"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(entries.len(), 1, "no phantom collection dir: {entries:?}");
+        assert!(!tmp.path().join("collections/test-archive").exists());
+    }
+
+    #[test]
+    fn year_prefix_extracts_or_rejects() {
+        assert_eq!(year_prefix("2022-01-02T00:00:00Z").as_deref(), Some("2022"));
+        assert_eq!(year_prefix("2022").as_deref(), Some("2022"));
+        assert_eq!(year_prefix("not-a-date"), None);
+        assert_eq!(year_prefix("22"), None); // too short, no panic
+        assert_eq!(year_prefix(""), None);
     }
 
     #[test]
