@@ -30,3 +30,5 @@
 
 # Title-page image generated from images/*.svg at build time (see Makefile)
 /images/*.pdf
+
+.DS_Store
