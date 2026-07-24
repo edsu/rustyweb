@@ -238,11 +238,12 @@ impl SearchIndex {
 
     /// Compact the index by merging segments down toward `target_segments`
     /// (clamped to ≥ 1), so queries fan out across far fewer segments. Merges
-    /// smallest-first in bounded batches, waiting for each merge before starting
-    /// the next, so peak transient disk stays ~one merged batch rather than a
-    /// second copy of the whole index (a merge writes the new segment before the
-    /// inputs are freed). A smaller `target` compacts more but raises that peak
-    /// (~index_size / target). Needs a writer. Returns `(before, after)` counts.
+    /// smallest-first in bounded batches, waiting for each merge before the next.
+    /// A merge writes the new segment before its inputs are freed, so it needs
+    /// transient free disk ≈ the size of the largest segment it produces — i.e.
+    /// roughly `index_size / target`. A smaller `target` compacts more but raises
+    /// that peak (`target` = 1 needs ~a second copy of the whole index). Needs a
+    /// writer. Returns `(before, after)` counts.
     pub fn optimize(
         &mut self,
         target_segments: usize,
@@ -1216,6 +1217,12 @@ mod tests {
     fn optimize_merges_segments_and_preserves_search() {
         let tmp = TempDir::new().unwrap();
         let mut idx = SearchIndex::open(tmp.path()).unwrap();
+        // NOTE: this pre-sets NoMergePolicy to build a fragmented index, which
+        // also means it does NOT cover optimize's own NoMergePolicy guard
+        // against the auto-merger race (the writer is already NoMerge here). That
+        // race needs the default policy + many segments to reproduce and is hard
+        // to trigger deterministically, so it's verified by reasoning + the live
+        // 1557→8 run, not by this test.
         idx.disable_auto_merge(); // each commit -> its own segment
         for i in 0..4 {
             let url = format!("https://ex.com/{i}");
