@@ -61,14 +61,20 @@ to `.beads/issues.jsonl` which *is* committed). Work is organized into epics wit
 numbered child tasks (e.g. `rustyweb-streaming-index-r0n.7`). Close tasks as their
 work lands, and file follow-ups rather than expanding a PR's scope.
 
-**Bundle tracker changes into ONE PR.** `br` auto-flushes the *entire* DB to
+**Beads commits are handled out of band by the maintainer.** Run `br` operations
+freely (create/close/comment on issues), but **do not commit `.beads/issues.jsonl`**
+— leave it dirty in the working tree; Ed commits it separately (typically straight
+to `main`). Keep it out of your feature branches and PRs. If you need to move
+branches while it's dirty, stash just that file (`git stash push .beads/issues.jsonl`)
+and restore it after. This side-steps the bundling problem below.
+
+Why the maintainer batches it: `br` auto-flushes the *entire* DB to
 `.beads/issues.jsonl` on every write, so whichever branch commits the JSONL sweeps
 in *all* pending tracker changes — not just "this branch's" issue. Splitting beads
 changes across parallel PRs therefore doesn't work: the first to merge carries
-everything, and the rest conflict on the single JSONL file (and are usually already
-redundant). Do all the `br` operations for a batch, then make a single JSONL
-commit/PR. The DB is the source of truth if things get out of sync (`br sync
---status`; `br sync --flush-only` exports DB → JSONL).
+everything, and the rest conflict on the single JSONL file. The DB is the source of
+truth if things get out of sync (`br sync --status`; `br sync --flush-only` exports
+DB → JSONL).
 
 ## Code review checklist
 
