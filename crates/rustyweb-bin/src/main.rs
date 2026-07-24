@@ -227,6 +227,14 @@ enum ImportCmd {
         #[arg(long)]
         stream: bool,
 
+        /// Number of records to fetch concurrently while CDX-guided indexing
+        /// each WACZ (chiefly `--stream`, but the download path fetches records
+        /// too). Default: 4 for remote sources (raise it, e.g. 16, for object
+        /// stores like S3), CPU count for local files. Capped at 64 per host as
+        /// a proactive politeness ceiling.
+        #[arg(long, value_name = "N")]
+        concurrency: Option<usize>,
+
         /// Re-download and re-index items even if they were already imported
         /// (otherwise already-synced items are skipped).
         #[arg(long)]
@@ -833,6 +841,7 @@ async fn main() -> Result<()> {
                 limit,
                 dry_run,
                 stream,
+                concurrency,
                 force,
                 verbose: _,
             } => {
@@ -849,6 +858,7 @@ async fn main() -> Result<()> {
                     limit,
                     dry_run,
                     stream,
+                    concurrency,
                     force,
                 };
                 let result = run_browsertrix(&host, org.as_deref(), &home, &opts, progress);
@@ -1024,6 +1034,9 @@ struct ImportOpts<'a> {
     /// Stream-index without downloading (index-only footprint); replay
     /// re-resolves a fresh presigned URL on demand.
     stream: bool,
+    /// Concurrent record fetches while CDX-guided indexing each WACZ; `None`
+    /// = per-source default (4 remote, CPU count local).
+    concurrency: Option<usize>,
     force: bool,
 }
 
@@ -1215,7 +1228,7 @@ fn run_browsertrix(
                     Some(&item.name),
                     into,
                     false,
-                    None,
+                    opts.concurrency,
                     Some(&resolver),
                     progress,
                 );
@@ -1235,7 +1248,7 @@ fn run_browsertrix(
                     Some(&item.name),
                     into,
                     false,
-                    None,
+                    opts.concurrency,
                     progress,
                 );
                 drop(quiet);
