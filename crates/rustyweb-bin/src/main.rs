@@ -128,6 +128,27 @@ enum Commands {
         #[arg(short = 'v', long)]
         verbose: bool,
     },
+    /// Compact the search index (merge segments) so queries are fast again,
+    /// without re-fetching sources. A search fans out across every segment, so
+    /// an index fragmented into many small segments (e.g. after ingest merges
+    /// failed on a full disk) is slow; this merges them back down. Much cheaper
+    /// than `reindex`. Needs some free disk (a merge writes the new segment
+    /// before freeing the inputs).
+    Optimize {
+        /// rustyweb home directory (holds archive/ and index/).
+        #[arg(long, default_value = ".")]
+        home: PathBuf,
+
+        /// Target number of segments to compact down to (≥1). Lower = fewer
+        /// segments (faster queries) but higher peak disk during the merge
+        /// (~index size / this). Default 8 balances the two.
+        #[arg(long, value_name = "N", default_value_t = 8)]
+        max_segments: usize,
+
+        /// Verbose logging (debug level). Replaces the progress spinner.
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
     /// Search indexed WACZ files for CDX records matching a URL.
     SearchUrl {
         /// URL to search for (exact match against archived URLs).
@@ -748,6 +769,32 @@ async fn main() -> Result<()> {
                 }
             }
             result?;
+        }
+
+        Commands::Optimize {
+            home,
+            max_segments,
+            verbose: _,
+        } => {
+            // Segment merges have no per-record total, so the indeterminate
+            // spinner (begin/phase/finish) is the right fit — same gating as
+            // the other commands (interactive, not -v).
+            let bar = show_bar.then(BarProgress::new);
+            let progress = bar
+                .as_ref()
+                .map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
+            let result = rustyweb_lib::index::optimize(&home, max_segments, progress);
+            match result {
+                Ok((before, after)) => {
+                    eprintln!("compacted index: {before} → {after} segment(s)");
+                }
+                Err(e) => {
+                    if let Some(b) = &bar {
+                        b.clear();
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         Commands::SearchUrl { url, home } => {

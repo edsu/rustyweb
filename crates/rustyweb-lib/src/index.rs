@@ -201,6 +201,30 @@ pub fn index_location_with_resolver(
     Ok(())
 }
 
+/// Compact the search index in place by merging segments toward
+/// `target_segments` — **without** re-streaming any sources, so it's far
+/// cheaper than [`reindex`] when the index has fragmented into many small
+/// segments (e.g. after ingest merges failed on a full disk). A search fans out
+/// across every segment, so fewer segments = faster queries. `target_segments`
+/// (≥ 1) trades compaction against peak transient disk (~index_size / target).
+/// Returns `(segments_before, segments_after)`.
+pub fn optimize(
+    home: &Path,
+    target_segments: usize,
+    progress: Option<&dyn IndexProgress>,
+) -> Result<(usize, usize)> {
+    let full_text = index_dir(home).join("full_text");
+    if !full_text.join("meta.json").exists() {
+        anyhow::bail!(
+            "no search index at {} — nothing to optimize (run `rustyweb index` first)",
+            full_text.display()
+        );
+    }
+    let mut search = crate::search::SearchIndex::open(&full_text)
+        .context("opening the search index to optimize")?;
+    search.optimize(target_segments, progress)
+}
+
 /// Rebuild the full-text index from the sources already recorded in
 /// `collections.json`, preserving the manifest (including each collection's
 /// display name).

@@ -89,6 +89,34 @@ fn index_wacz_writes_manifest_with_metadata() {
     );
 }
 
+#[test]
+fn optimize_compacts_in_place_and_keeps_search_working() {
+    let tmp = make_index(&["simple.wacz"]);
+    // Compact the existing index — no sources are re-read.
+    let (before, after) = rustyweb_lib::index::optimize(tmp.path(), 8, None).unwrap();
+    assert!(
+        after >= 1 && after <= before,
+        "before={before} after={after}"
+    );
+    // The manifest is untouched (no source re-read) and the index still answers.
+    let manifest = rustyweb_lib::collections::Manifest::open(&tmp.path().join("index")).unwrap();
+    assert_eq!(manifest.waczs.len(), 1);
+    let idx = rustyweb_lib::search::SearchIndex::open_read_only(
+        tmp.path().join("index").join("full_text").as_path(),
+    )
+    .unwrap();
+    assert!(!idx.search("example", 10).unwrap().is_empty());
+}
+
+#[test]
+fn optimize_errors_clearly_when_there_is_no_index() {
+    let tmp = TempDir::new().unwrap();
+    let err = rustyweb_lib::index::optimize(tmp.path(), 8, None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no search index"), "unexpected error: {err}");
+}
+
 // ── Search API ────────────────────────────────────────────────────────────────
 
 #[tokio::test]

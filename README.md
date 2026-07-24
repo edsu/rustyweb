@@ -347,6 +347,7 @@ Notes:
 ```
 rustyweb index           [--home <DIR>] [--name <NAME>] --collection <NAME> [-f|--from-file <FILE>] [--download] [--concurrency <N>] [-v|--verbose] <PATH|URL>...
 rustyweb reindex         [--home <DIR>] [--concurrency <N>] [-v|--verbose]
+rustyweb optimize        [--home <DIR>] [--max-segments <N>] [-v|--verbose]
 rustyweb serve           [--home <DIR>] [--bind <ADDR>]
 rustyweb collection set  [--home <DIR>] <NAME> [--creator <TEXT>] [--dates <TEXT>] [--rights <TEXT>] [--subject <SUBJECT>]... [--narrative <MD> | --narrative-file <FILE>] [--thumbnail <FILE>] [--description <TEXT>] [--curator <TEXT>]
 rustyweb collection list [--home <DIR>]
@@ -408,6 +409,14 @@ derived siblings under it.
   re-streams every source, so it can take a while); `-v`/`--verbose` swaps the bar
   for debug logs. (If you try to `index` or `serve` against an index built by an
   older version, rustyweb tells you to run this.)
+- **`optimize`** - compacts the search index by merging its Tantivy *segments*
+  down toward `--max-segments` (default 8), **without re-fetching sources** — so
+  it's much cheaper than `reindex`. Every search fans out across all segments, so
+  an index that has fragmented into hundreds of tiny segments (which happens when
+  Tantivy's background merges fail — classically on a full disk) gets slow;
+  `optimize` merges them back down. A lower `--max-segments` compacts more but
+  needs more free disk during the merge (roughly index size ÷ target). Reports the
+  `before → after` segment count.
 - **`serve`** - opens the index read-only and starts the HTTP server (so you can
   `index` while it runs). Defaults to `127.0.0.1:8080`.
 - **`search-url`** - a debugging aid: reads the CDX index *inside* each WACZ and
