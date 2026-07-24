@@ -586,6 +586,44 @@ async fn browsertrix_replay_redirects_to_a_freshly_resolved_url() {
 }
 
 #[tokio::test]
+async fn public_browsertrix_replay_redirects_via_resolver() {
+    // A public Browsertrix source (as `import --public --stream` records) is
+    // remote too: /files/{id} re-resolves a fresh presigned URL and redirects.
+    let tmp = make_index(&["a.wacz"]);
+    let id = {
+        let index_dir = tmp.path().join("index");
+        let mut m = rustyweb_lib::collections::Manifest::open(&index_dir).unwrap();
+        m.waczs[0].source = rustyweb_lib::collections::Source::BrowsertrixPublic {
+            host: "https://app.browsertrix.com".into(),
+            org: "o1".into(),
+            collection: "col-uuid".into(),
+            resource: "a.wacz".into(),
+        };
+        let id = m.waczs[0].id.clone();
+        m.save().unwrap();
+        id
+    };
+    let resolver: std::sync::Arc<dyn rustyweb_lib::index::SourceResolver> = std::sync::Arc::new(
+        FakeResolver("https://files.example/pub.wacz?sig=fresh".into()),
+    );
+    let app = rustyweb_lib::server::router_with_resolver(tmp.path(), Some(resolver)).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/files/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        resp.headers().get("location").unwrap(),
+        "https://files.example/pub.wacz?sig=fresh"
+    );
+}
+
+#[tokio::test]
 async fn browsertrix_crawl_page_flags_remote_hosting() {
     let tmp = make_index(&["a.wacz"]);
     let id = make_browsertrix_source(&tmp);

@@ -42,22 +42,66 @@ fn router(base: String) -> Router {
     let wacz = std::fs::read(fixture("simple.wacz")).unwrap();
     let size = wacz.len();
 
-    // replay.json points the WACZ resource back at this mock's /files endpoint.
-    let replay = move || {
+    // A replay.json body pointing the WACZ resource back at this mock's /files
+    // endpoint. `crawl_id` lets the public path dedup per crawl.
+    let replay_body = {
         let base = base.clone();
-        async move {
-            Json(json!({
+        move || {
+            json!({
                 "resources": [{
                     "name": "simple.wacz",
                     "path": format!("{base}/files/simple.wacz"),
                     "hash": "sha256:deadbeef",
                     "size": size,
+                    "crawlId": "crawlA",
                 }]
-            }))
+            })
         }
+    };
+    // Authenticated per-item replay.json.
+    let replay = {
+        let replay_body = replay_body.clone();
+        move || {
+            let body = replay_body();
+            async move { Json(body) }
+        }
+    };
+    // Public collection-scoped replay.json (unauthenticated).
+    let public_replay = {
+        let replay_body = replay_body.clone();
+        move || {
+            let body = replay_body();
+            async move { Json(body) }
+        }
+    };
+    // Public collections listing: org profile + one public collection.
+    let public_collections = || async {
+        Json(json!({
+            "org": {"id": "o1", "slug": "demo", "name": "Demo"},
+            "collections": [{
+                "id": "col-uuid",
+                "oid": "o1",
+                "slug": "news",
+                "name": "News",
+                "description": "Public scope note.",
+                "caption": "A public news collection",
+                "tags": ["news"],
+                "dateEarliest": "2022-01-01T00:00:00Z",
+                "dateLatest": "2023-12-31T00:00:00Z",
+                "allowPublicDownload": true
+            }]
+        }))
     };
 
     Router::new()
+        .route(
+            "/api/public/orgs/{slug}/collections",
+            get(public_collections),
+        )
+        .route(
+            "/api/orgs/{oid}/collections/{cid}/public/replay.json",
+            get(public_replay),
+        )
         .route(
             "/api/auth/jwt/login",
             post(|| async { Json(json!({"access_token": "tok", "token_type": "bearer"})) }),
@@ -211,6 +255,59 @@ fn import_a_collection_then_skip_on_rerun() {
         after.contains("MY OWN WORDS."),
         "re-import must not overwrite a hand-edited narrative: {after}"
     );
+}
+
+#[test]
+fn public_import_needs_no_credentials() {
+    // --public uses the unauthenticated API: no BROWSERTRIX_* env vars at all.
+    let base = start_mock();
+    let home = TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rustyweb"))
+        .args(["import", "browsertrix", "--public"])
+        .args(["--host", &base])
+        .args(["--org", "demo"])
+        .args(["--collection", "news"])
+        .arg("--home")
+        .arg(home.path())
+        .env_remove("BROWSERTRIX_USER")
+        .env_remove("BROWSERTRIX_PASSWORD")
+        .env_remove("BROWSERTRIX_TOKEN")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "public import failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // WACZ landed under archive/<collection>/<crawl-id>/ (crawlId from replay.json).
+    assert!(
+        home.path().join("archive/news/crawlA/simple.wacz").exists(),
+        "downloaded public WACZ should be under archive/news/crawlA/"
+    );
+
+    // Finding aid seeded from the *public* collection + org metadata.
+    let aid = std::fs::read_to_string(home.path().join("collections/news/README.md"))
+        .expect("public import should create collections/news/README.md");
+    assert!(aid.contains("name: News"), "front-matter name: {aid}");
+    assert!(aid.contains("creator: Demo"), "org -> creator: {aid}");
+    assert!(
+        aid.contains("A public news collection"),
+        "caption -> description: {aid}"
+    );
+    assert!(
+        aid.contains("Public scope note."),
+        "description -> narrative: {aid}"
+    );
+    assert!(
+        aid.contains("2022\u{2013}2023"),
+        "date range -> dates: {aid}"
+    );
+
+    let waczs = manifest_array(home.path(), "waczs.json");
+    assert_eq!(waczs.len(), 1);
+    assert_eq!(waczs[0]["browsertrix"]["item_id"], "crawlA");
 }
 
 #[test]

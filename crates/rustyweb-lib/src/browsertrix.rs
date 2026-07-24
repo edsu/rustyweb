@@ -144,6 +144,10 @@ pub struct User {
 /// An organization the user belongs to. `id` is the `oid` used in item URLs.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Org {
+    /// The org id (`oid`). Absent from the *public* org profile (which isn't
+    /// keyed by id), so it defaults to empty there — the public collection
+    /// objects carry their own `oid`.
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub slug: String,
@@ -152,8 +156,9 @@ pub struct Org {
     /// Public-profile description of the org, if set.
     #[serde(default)]
     pub description: Option<String>,
-    /// The org's public website, if set (`publicUrl` on the profile).
-    #[serde(rename = "publicUrl", default)]
+    /// The org's public website, if set — `publicUrl` on the authenticated org,
+    /// `url` on the public profile.
+    #[serde(default, rename = "publicUrl", alias = "url")]
     pub website: Option<String>,
 }
 
@@ -166,6 +171,10 @@ pub struct Collection {
     pub id: String,
     #[serde(default)]
     pub slug: String,
+    /// The org id (`oid`) this collection belongs to. Present on the *public*
+    /// collections listing, where it's needed to build the replay.json URL.
+    #[serde(default)]
+    pub oid: Option<String>,
     #[serde(default)]
     pub name: String,
     /// Long "About" text (rich text / Markdown) — the scope narrative.
@@ -258,6 +267,16 @@ struct ReplayJson {
     resources: Vec<Resource>,
 }
 
+/// The `/api/public/orgs/{slug}/collections` payload: the org's public profile
+/// plus its publicly listed collections.
+#[derive(Debug, Deserialize)]
+struct PublicCollections {
+    #[serde(default)]
+    org: Org,
+    #[serde(default = "Vec::new")]
+    collections: Vec<Collection>,
+}
+
 // ── Client ───────────────────────────────────────────────────────────────────
 
 /// An authenticated Browsertrix API client. Generic over the [`Transport`] so
@@ -287,6 +306,18 @@ impl Client<UreqTransport> {
             page_size: PAGE_SIZE,
         }
     }
+
+    /// A client for Browsertrix's **public** (unauthenticated) endpoints — no
+    /// login, no token. Used to import a collection an org has published for
+    /// anyone to view. Only the `public_*` methods are meaningful on it.
+    pub fn public(host: &str) -> Self {
+        Self {
+            transport: UreqTransport::default(),
+            host: host.trim_end_matches('/').to_string(),
+            token: String::new(),
+            page_size: PAGE_SIZE,
+        }
+    }
 }
 
 impl<T: Transport> Client<T> {
@@ -311,6 +342,17 @@ impl<T: Transport> Client<T> {
             token: login.access_token,
             page_size: PAGE_SIZE,
         })
+    }
+
+    /// Build a token-less **public** client on a caller-provided transport, so
+    /// the public endpoints can be unit-tested against canned responses.
+    pub fn public_with(transport: T, host: &str) -> Self {
+        Self {
+            transport,
+            host: host.trim_end_matches('/').to_string(),
+            token: String::new(),
+            page_size: PAGE_SIZE,
+        }
     }
 
     /// Override the pagination page size (mainly for tests).
@@ -344,6 +386,31 @@ impl<T: Transport> Client<T> {
     /// resolve a user-supplied slug/name to the UUID the item filters require.
     pub fn collections(&self, oid: &str) -> Result<Vec<Collection>> {
         self.list(&format!("/api/orgs/{oid}/collections"), &[])
+    }
+
+    /// The **public** collections of an org (by its slug), from the
+    /// unauthenticated public API, together with the org's public profile
+    /// (whose name seeds the finding aid's creator). Unlike the authenticated
+    /// listing, this endpoint isn't paginated — one response holds them all.
+    pub fn public_collections(&self, org_slug: &str) -> Result<(Org, Vec<Collection>)> {
+        let env: PublicCollections =
+            self.get_json_noauth(&format!("/api/public/orgs/{org_slug}/collections"))?;
+        Ok((env.org, env.collections))
+    }
+
+    /// The **public** WACZ resources of a collection: presigned, range-capable
+    /// URLs from its public `replay.json`. Available for any public collection,
+    /// independent of the bulk-download toggle (`allowPublicDownload`, which
+    /// only gates the combined `/download`).
+    pub fn public_collection_resources(
+        &self,
+        oid: &str,
+        collection_id: &str,
+    ) -> Result<Vec<Resource>> {
+        let replay: ReplayJson = self.get_json_noauth(&format!(
+            "/api/orgs/{oid}/collections/{collection_id}/public/replay.json"
+        ))?;
+        Ok(replay.resources)
     }
 
     /// Archived items (crawls + uploads) in an org, across every page, narrowed
@@ -411,8 +478,17 @@ impl<T: Transport> Client<T> {
 
     /// GET a JSON endpoint (path begins with `/`), authenticated, and parse it.
     fn get_json<D: DeserializeOwned>(&self, path: &str) -> Result<D> {
+        self.get_json_bearer(path, Some(&self.token))
+    }
+
+    /// GET + parse a JSON endpoint without a bearer token — for the public API.
+    fn get_json_noauth<D: DeserializeOwned>(&self, path: &str) -> Result<D> {
+        self.get_json_bearer(path, None)
+    }
+
+    fn get_json_bearer<D: DeserializeOwned>(&self, path: &str, bearer: Option<&str>) -> Result<D> {
         let url = format!("{}{path}", self.host);
-        let (status, body) = self.transport.get(&url, Some(&self.token))?;
+        let (status, body) = self.transport.get(&url, bearer)?;
         if !(200..300).contains(&status) {
             bail!("GET {url} failed (HTTP {status}): {}", body_snippet(&body));
         }
@@ -681,6 +757,41 @@ mod tests {
         let mut buf = String::new();
         r.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "WACZ-BYTES");
+    }
+
+    #[test]
+    fn public_collections_parse_without_login() {
+        // No login route is registered — the public client must not call it.
+        let t = FakeTransport::default().with(
+            "https://bt.example/api/public/orgs/usgov/collections",
+            200,
+            r#"{"org":{"id":"o9","slug":"usgov","name":"US Gov Web Archive"},
+                "collections":[{"id":"c1","oid":"o9","slug":"eop","name":"EOP",
+                                "description":"Scope note","allowPublicDownload":true}]}"#,
+        );
+        let c = Client::public_with(t, HOST);
+        let (org, colls) = c.public_collections("usgov").unwrap();
+        assert_eq!(org.name, "US Gov Web Archive");
+        assert_eq!(colls.len(), 1);
+        assert_eq!(colls[0].id, "c1");
+        assert_eq!(colls[0].oid.as_deref(), Some("o9"));
+        assert_eq!(colls[0].slug, "eop");
+    }
+
+    #[test]
+    fn public_collection_resources_parse() {
+        let t = FakeTransport::default().with(
+            "https://bt.example/api/orgs/o9/collections/c1/public/replay.json",
+            200,
+            r#"{"resources":[{"name":"eop-2021.wacz","path":"https://files/eop.wacz?sig=1",
+                             "hash":"sha256:cc","size":99,"crawlId":"crawl-7"}]}"#,
+        );
+        let c = Client::public_with(t, HOST);
+        let res = c.public_collection_resources("o9", "c1").unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].path, "https://files/eop.wacz?sig=1");
+        assert_eq!(res[0].crawl_id, "crawl-7");
+        assert_eq!(res[0].size, 99);
     }
 
     #[test]
