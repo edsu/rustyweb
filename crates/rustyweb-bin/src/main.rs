@@ -182,6 +182,13 @@ enum ImportCmd {
         #[arg(long, default_value = ".")]
         home: PathBuf,
 
+        /// Import a PUBLIC collection anyone can view, without credentials:
+        /// skips login and uses Browsertrix's public API. Requires --org (the
+        /// public org's slug); --collection picks one, else all its public
+        /// collections. Any BROWSERTRIX_* env vars are ignored in this mode.
+        #[arg(long)]
+        public: bool,
+
         /// Import only this Browsertrix collection (its id, slug, or name).
         /// Default: the whole org.
         #[arg(long, conflicts_with = "crawl")]
@@ -833,6 +840,7 @@ async fn main() -> Result<()> {
                 host,
                 org,
                 home,
+                public,
                 collection,
                 crawl,
                 into,
@@ -850,6 +858,7 @@ async fn main() -> Result<()> {
                     .as_ref()
                     .map(|b| b as &dyn rustyweb_lib::index::IndexProgress);
                 let opts = ImportOpts {
+                    public,
                     collection: collection.as_deref(),
                     crawl: crawl.as_deref(),
                     into: into.as_deref(),
@@ -1019,6 +1028,9 @@ fn run_search_url(url: &str, home: &std::path::Path) -> Result<()> {
 /// expire in ~48 h, so they're an ingest artifact, not a replay source.
 /// Options for a Browsertrix import (from the `browsertrix` subcommand).
 struct ImportOpts<'a> {
+    /// Use the unauthenticated public API (no login) — import a collection the
+    /// org has published for anyone to view.
+    public: bool,
     /// Import only this Browsertrix collection (its id); `None` = whole org.
     collection: Option<&'a str>,
     /// Import only this archived item by id; `None` = all selected.
@@ -1061,6 +1073,10 @@ fn run_browsertrix(
     progress: Option<&dyn rustyweb_lib::index::IndexProgress>,
 ) -> Result<()> {
     use rustyweb_lib::browsertrix::ItemQuery;
+
+    if opts.public {
+        return run_browsertrix_public(host, org, home, opts, progress);
+    }
 
     let client = connect(host)?;
     let host = client.host().to_string();
@@ -1294,6 +1310,207 @@ fn run_browsertrix(
     Ok(())
 }
 
+/// Import a **public** Browsertrix collection — one an org has published for
+/// anyone to view — without credentials, via the unauthenticated public API:
+/// list the org's public collections, then pull each collection's WACZs from
+/// its public `replay.json` and download + index them like the authenticated
+/// path. Downloading a durable copy is the only mode here — `--stream` would
+/// need replay to re-resolve public presigned URLs (a follow-up).
+fn run_browsertrix_public(
+    host: &str,
+    org: Option<&str>,
+    home: &std::path::Path,
+    opts: &ImportOpts,
+    progress: Option<&dyn rustyweb_lib::index::IndexProgress>,
+) -> Result<()> {
+    use rustyweb_lib::browsertrix::Client;
+
+    let Some(org_slug) = org else {
+        anyhow::bail!("--public needs --org <slug> (the public org's slug, e.g. `usgov-archive`)");
+    };
+    if opts.crawl.is_some() {
+        anyhow::bail!("--crawl isn't supported with --public; select a --collection instead");
+    }
+
+    let client = Client::public(host);
+    let host = client.host().to_string();
+    let (org_meta, colls) = client
+        .public_collections(org_slug)
+        .with_context(|| format!("listing public collections for org \"{org_slug}\""))?;
+    if colls.is_empty() {
+        eprintln!("no public collections found for org \"{org_slug}\".");
+        return Ok(());
+    }
+
+    // A specific --collection, else every public collection in the org.
+    let selected: Vec<rustyweb_lib::browsertrix::Collection> = match opts.collection {
+        Some(sel) => vec![resolve_collection(&colls, sel)?],
+        None => colls,
+    };
+
+    if opts.dry_run {
+        println!(
+            "{} public collection(s) to import from \"{org_slug}\":",
+            selected.len()
+        );
+        for c in &selected {
+            println!("  {:<24} {}", c.slug, c.name);
+        }
+        return Ok(());
+    }
+
+    let mut seen = load_imported(home);
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    // Re-resolves a public source to a fresh presigned URL for `--stream`
+    // (index-only) mode; unused when downloading.
+    let resolver = BrowsertrixResolver::new();
+
+    'collections: for coll in &selected {
+        // Each Browsertrix collection becomes a rustyweb collection. --into only
+        // makes sense when importing a single collection; otherwise use each
+        // collection's own name.
+        let into: &str = opts
+            .into
+            .filter(|_| selected.len() == 1)
+            .unwrap_or(coll.name.as_str());
+
+        // The public replay.json is addressed by org id; it rides on each
+        // collection, with the org profile as a fallback.
+        let oid = coll.oid.as_deref().unwrap_or(org_meta.id.as_str());
+        if oid.is_empty() {
+            anyhow::bail!(
+                "public collection \"{}\" has no org id; cannot resolve its WACZs",
+                coll.slug
+            );
+        }
+        let resources = client
+            .public_collection_resources(oid, &coll.id)
+            .with_context(|| format!("resolving public WACZs for \"{}\"", coll.slug))?;
+        if resources.is_empty() {
+            eprintln!("collection \"{}\" has no public WACZs; skipping", coll.slug);
+            continue;
+        }
+
+        let archive =
+            rustyweb_lib::index::archive_dir(home).join(rustyweb_lib::collections::slugify(into));
+        std::fs::create_dir_all(&archive)
+            .with_context(|| format!("creating archive dir {}", archive.display()))?;
+        eprintln!(
+            "importing {} WACZ(s) from \"{}\" into {}…",
+            resources.len(),
+            coll.name,
+            home.display()
+        );
+
+        for (i, res) in resources.iter().enumerate() {
+            // --limit caps how many WACZs this run imports (0 = no cap) — handy
+            // for sampling a large public collection (some have dozens of WACZs).
+            if opts.limit != 0 && imported >= opts.limit {
+                break 'collections;
+            }
+            // A public collection's resources are per-crawl; dedup on the crawl
+            // id (falling back to the filename when the API omits it).
+            let item_id = if res.crawl_id.is_empty() {
+                res.name.clone()
+            } else {
+                res.crawl_id.clone()
+            };
+            let key = (host.clone(), item_id.clone(), res.hash.clone());
+            if !opts.force && seen.contains(&key) {
+                skipped += 1;
+                continue;
+            }
+
+            let size = if res.size > 0 {
+                format!(" ({})", rustyweb_lib::server::human_size(res.size))
+            } else {
+                String::new()
+            };
+            let display = res.name.trim_end_matches(".wacz");
+
+            let crawl_id = if opts.stream {
+                // Index-only: record a public Browsertrix source (stable identity)
+                // and stream it; replay/reindex re-resolve a fresh public URL.
+                let source = rustyweb_lib::collections::Source::BrowsertrixPublic {
+                    host: host.clone(),
+                    org: oid.to_string(),
+                    collection: coll.id.clone(),
+                    resource: res.name.clone(),
+                };
+                eprintln!("↻ streaming {}{size}", res.name);
+                let quiet = gag::Gag::stdout().ok();
+                let indexed = rustyweb_lib::index::index_location_with_resolver(
+                    &source.location(),
+                    home,
+                    Some(display),
+                    into,
+                    false,
+                    opts.concurrency,
+                    Some(&resolver),
+                    progress,
+                );
+                drop(quiet);
+                indexed.with_context(|| format!("streaming {}", res.name))?;
+                rustyweb_lib::collections::wacz_id(&source)
+            } else {
+                // Each crawl's WACZ lands in its own subdir so shared filenames
+                // can't collide (mirrors the authenticated path).
+                let item_dir = archive.join(safe_component(&item_id));
+                std::fs::create_dir_all(&item_dir)
+                    .with_context(|| format!("creating {}", item_dir.display()))?;
+                let filename = safe_wacz_filename(&res.name, &format!("resource-{i}"));
+                let dest = item_dir.join(&filename);
+                eprintln!("↓ downloading {filename}{size}");
+                download_wacz(&res.path, &dest)?;
+                let quiet = gag::Gag::stdout().ok();
+                let indexed = rustyweb_lib::index::index_location(
+                    &dest.to_string_lossy(),
+                    home,
+                    Some(display),
+                    into,
+                    false,
+                    opts.concurrency,
+                    progress,
+                );
+                drop(quiet);
+                indexed.with_context(|| format!("indexing {}", dest.display()))?;
+                let abs = dest.canonicalize().unwrap_or(dest.clone());
+                rustyweb_lib::collections::wacz_id(&rustyweb_lib::collections::Source::for_file(
+                    &abs, home,
+                ))
+            };
+
+            // Public replay.json carries no QA rating, so provenance records the
+            // Browsertrix identity without a review status.
+            rustyweb_lib::index::set_browsertrix_provenance_by_id(
+                home, &crawl_id, &host, &item_id, &res.hash, None,
+            )
+            .context("recording provenance")?;
+            seen.insert(key);
+            imported += 1;
+        }
+
+        // Seed the finding aid from the public org + collection metadata
+        // (fill-gaps, so a re-sync never clobbers curator edits).
+        let fields = browsertrix_collection_fields(&org_meta, Some(coll));
+        if !fields.is_empty() {
+            rustyweb_lib::index::seed_collection(home, into, &fields)
+                .context("seeding collection metadata")?;
+        }
+    }
+
+    eprintln!(
+        "done: imported {imported} WACZ(s){}",
+        if skipped > 0 {
+            format!(", skipped {skipped} already up to date")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
 /// Build the finding-aid seed for the rustyweb collection from Browsertrix
 /// metadata: the org is the collecting body (→ `creator`), and the selected
 /// Browsertrix collection (when one was chosen) supplies scope/abstract/subjects/
@@ -1506,29 +1723,64 @@ impl BrowsertrixResolver {
     }
 }
 
+impl BrowsertrixResolver {
+    /// Re-resolve a **public** collection resource to a fresh presigned URL with
+    /// no credentials: hit the collection's public replay.json and match the
+    /// resource by filename. A new public client per call is cheap (no login).
+    fn try_resolve_public(
+        &self,
+        host: &str,
+        org: &str,
+        collection: &str,
+        resource: &str,
+    ) -> Result<String> {
+        let client = rustyweb_lib::browsertrix::Client::public(host);
+        let resources = client.public_collection_resources(org, collection)?;
+        resources
+            .into_iter()
+            .find(|r| r.name == resource)
+            .map(|r| r.path)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "WACZ resource {resource:?} not found in public collection {collection}"
+                )
+            })
+    }
+}
+
 impl rustyweb_lib::index::SourceResolver for BrowsertrixResolver {
     fn resolve(&self, source: &rustyweb_lib::collections::Source) -> Result<String> {
-        let rustyweb_lib::collections::Source::Browsertrix {
-            host,
-            org,
-            item,
-            resource,
-        } = source
-        else {
-            anyhow::bail!("resolver only handles Browsertrix sources");
-        };
-        match self.try_resolve(host, org, item, resource) {
-            Ok(url) => Ok(url),
-            // The cached login may have gone stale (Browsertrix JWTs expire well
-            // under a long-lived server's lifetime). Drop it and retry once with
-            // a fresh login before giving up. Any non-auth failure just fails
-            // again and surfaces here.
-            Err(first) => {
-                tracing::debug!(%host, error = %first, "Browsertrix resolve failed; re-authenticating and retrying");
-                self.clients.lock().unwrap().remove(host);
-                self.try_resolve(host, org, item, resource)
-                    .with_context(|| format!("resolving Browsertrix item {item}"))
-            }
+        use rustyweb_lib::collections::Source;
+        match source {
+            Source::Browsertrix {
+                host,
+                org,
+                item,
+                resource,
+            } => match self.try_resolve(host, org, item, resource) {
+                Ok(url) => Ok(url),
+                // The cached login may have gone stale (Browsertrix JWTs expire
+                // well under a long-lived server's lifetime). Drop it and retry
+                // once with a fresh login before giving up. Any non-auth failure
+                // just fails again and surfaces here.
+                Err(first) => {
+                    tracing::debug!(%host, error = %first, "Browsertrix resolve failed; re-authenticating and retrying");
+                    self.clients.lock().unwrap().remove(host);
+                    self.try_resolve(host, org, item, resource)
+                        .with_context(|| format!("resolving Browsertrix item {item}"))
+                }
+            },
+            // Public sources need no credentials and no cached client, so resolve
+            // directly (a stale presigned URL just means fetching a fresh one).
+            Source::BrowsertrixPublic {
+                host,
+                org,
+                collection,
+                resource,
+            } => self
+                .try_resolve_public(host, org, collection, resource)
+                .with_context(|| format!("resolving public Browsertrix collection {collection}")),
+            _ => anyhow::bail!("resolver only handles Browsertrix sources"),
         }
     }
 }

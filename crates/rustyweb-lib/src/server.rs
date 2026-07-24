@@ -845,7 +845,11 @@ async fn serve_file(
     }
     // A Browsertrix source has no stable URL (its presigned URLs expire), so
     // re-resolve a fresh one (cached) and redirect wabac.js to it.
-    if let crate::collections::Source::Browsertrix { .. } = &col.source {
+    if matches!(
+        &col.source,
+        crate::collections::Source::Browsertrix { .. }
+            | crate::collections::Source::BrowsertrixPublic { .. }
+    ) {
         return browsertrix_redirect(&state, col);
     }
     // File source: resolve relative paths against home.
@@ -1147,7 +1151,9 @@ fn viewer_source(col: &Wacz) -> String {
     match &col.source {
         // A Browsertrix source is served through /files/{id}, which re-resolves a
         // fresh presigned URL and 302-redirects to it (its stored URL expires).
-        crate::collections::Source::File(_) | crate::collections::Source::Browsertrix { .. } => {
+        crate::collections::Source::File(_)
+        | crate::collections::Source::Browsertrix { .. }
+        | crate::collections::Source::BrowsertrixPublic { .. } => {
             format!("/files/{}", col.id)
         }
         crate::collections::Source::Url(u) => u.clone(),

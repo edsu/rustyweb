@@ -35,12 +35,36 @@ pub enum Source {
         item: String,
         resource: String,
     },
+    /// A WACZ resource inside a **public** Browsertrix collection, re-resolvable
+    /// without credentials. Public presigned URLs also expire, but the fresh URL
+    /// comes from the *collection*-scoped public `replay.json`
+    /// (`/api/orgs/{org}/collections/{collection}/public/replay.json`), so we
+    /// store the collection id rather than an archived-item id. Stored as
+    /// `browsertrix-public|host|org|collection|resource`.
+    BrowsertrixPublic {
+        host: String,
+        org: String,
+        collection: String,
+        resource: String,
+    },
 }
 
 impl Source {
     /// Parse a location string: `browsertrix|…` is a Browsertrix resource,
     /// `http://`/`https://` a URL, else a file path.
     pub fn parse(s: &str) -> Self {
+        // Check the more specific `browsertrix-public|` prefix first.
+        if let Some(rest) = s.strip_prefix("browsertrix-public|") {
+            let p: Vec<&str> = rest.splitn(4, '|').collect();
+            if p.len() == 4 {
+                return Source::BrowsertrixPublic {
+                    host: p[0].to_string(),
+                    org: p[1].to_string(),
+                    collection: p[2].to_string(),
+                    resource: p[3].to_string(),
+                };
+            }
+        }
         if let Some(rest) = s.strip_prefix("browsertrix|") {
             // host|org|item|resource — split into exactly 4; the resource is the
             // remainder, so a `|` in a filename (unheard of from Browsertrix)
@@ -76,7 +100,7 @@ impl Source {
     pub fn as_file(&self) -> Option<&Path> {
         match self {
             Source::File(p) => Some(p.as_path()),
-            Source::Url(_) | Source::Browsertrix { .. } => None,
+            Source::Url(_) | Source::Browsertrix { .. } | Source::BrowsertrixPublic { .. } => None,
         }
     }
 
@@ -91,6 +115,12 @@ impl Source {
                 item,
                 resource,
             } => format!("browsertrix|{host}|{org}|{item}|{resource}"),
+            Source::BrowsertrixPublic {
+                host,
+                org,
+                collection,
+                resource,
+            } => format!("browsertrix-public|{host}|{org}|{collection}|{resource}"),
         }
     }
 
@@ -110,7 +140,7 @@ impl Source {
         match self {
             Source::File(p) if p.is_absolute() => Some(p.clone()),
             Source::File(p) => Some(home.join(p)),
-            Source::Url(_) | Source::Browsertrix { .. } => None,
+            Source::Url(_) | Source::Browsertrix { .. } | Source::BrowsertrixPublic { .. } => None,
         }
     }
 }
@@ -992,6 +1022,38 @@ mod tests {
         assert!(s.as_file().is_none());
         assert!(!s.is_url());
         // A stable id (independent of the presigned URL, which changes each time).
+        assert_eq!(wacz_id(&s), wacz_id(&Source::parse(&encoded)));
+    }
+
+    #[test]
+    fn browsertrix_public_source_roundtrips() {
+        let s = Source::BrowsertrixPublic {
+            host: "https://app.browsertrix.com".into(),
+            org: "o9".into(),
+            collection: "col-uuid".into(),
+            resource: "crawl-20250101-abc-0.wacz".into(),
+        };
+        let encoded = s.location();
+        assert_eq!(
+            encoded,
+            "browsertrix-public|https://app.browsertrix.com|o9|col-uuid|crawl-20250101-abc-0.wacz"
+        );
+        assert_eq!(Source::parse(&encoded), s);
+        assert!(s.is_remote());
+        assert!(s.as_file().is_none());
+        assert!(!s.is_url());
+        assert!(s.resolve(std::path::Path::new("/home")).is_none());
+        // Distinct from the private variant with the same host/resource, and a
+        // stable id across a parse round-trip.
+        assert_ne!(
+            wacz_id(&s),
+            wacz_id(&Source::Browsertrix {
+                host: "https://app.browsertrix.com".into(),
+                org: "o9".into(),
+                item: "col-uuid".into(),
+                resource: "crawl-20250101-abc-0.wacz".into(),
+            })
+        );
         assert_eq!(wacz_id(&s), wacz_id(&Source::parse(&encoded)));
     }
 

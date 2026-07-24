@@ -480,7 +480,7 @@ fn resolve_sources(
 ) -> Result<Vec<Source>> {
     match Source::parse(location) {
         url @ Source::Url(_) => Ok(vec![url]),
-        bt @ Source::Browsertrix { .. } => Ok(vec![bt]),
+        bt @ (Source::Browsertrix { .. } | Source::BrowsertrixPublic { .. }) => Ok(vec![bt]),
         Source::File(p) => Ok(vec![place_local_wacz(&p, home, collection_slug, manifest)?]),
     }
 }
@@ -681,17 +681,19 @@ fn index_one(
                 (None, Some(p))
             }
         }
-        // A Browsertrix resource: resolve a fresh presigned URL (they expire) and
-        // stream it. The recorded source stays the stable Browsertrix identity,
-        // so the id is stable across re-imports and replay re-resolves later.
-        bt @ Source::Browsertrix { .. } => {
+        // A Browsertrix resource (private or public): resolve a fresh presigned
+        // URL (they expire) and stream it. The recorded source stays the stable
+        // Browsertrix identity, so the id is stable across re-imports and replay
+        // re-resolves later.
+        bt @ (Source::Browsertrix { .. } | Source::BrowsertrixPublic { .. }) => {
             if let Some(p) = progress {
                 p.phase("resolving");
             }
             let resolver = resolver.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "indexing a Browsertrix source needs credentials to resolve a fresh \
-                     URL — set BROWSERTRIX_USER + BROWSERTRIX_PASSWORD (or BROWSERTRIX_TOKEN)"
+                    "indexing a Browsertrix source needs a resolver to fetch a fresh URL \
+                     (a private source needs BROWSERTRIX_USER + BROWSERTRIX_PASSWORD or \
+                     BROWSERTRIX_TOKEN; a public source is resolved without credentials)"
                 )
             })?;
             let url = resolver
@@ -1035,10 +1037,12 @@ fn source_display_name(source: &Source) -> String {
             let base = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(u);
             base.strip_suffix(".wacz").unwrap_or(base).to_string()
         }
-        Source::Browsertrix { resource, .. } => resource
-            .strip_suffix(".wacz")
-            .unwrap_or(resource)
-            .to_string(),
+        Source::Browsertrix { resource, .. } | Source::BrowsertrixPublic { resource, .. } => {
+            resource
+                .strip_suffix(".wacz")
+                .unwrap_or(resource)
+                .to_string()
+        }
     }
 }
 
